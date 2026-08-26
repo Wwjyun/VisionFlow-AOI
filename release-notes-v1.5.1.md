@@ -5,7 +5,8 @@
 ## 本版重點
 
 - 延續 v1.5.0 的 `503-CS-SN-1` 與 `506-CS-SN-1`：固定一般二值化門檻 `200`、中心與四邊 MASK、多邊形偵測、面積尺寸限制，以及工程外參／管理內參分層。
-- 內建九個傳統 CV Detector 與 YOLOX Detector。
+- 新增 `401-CS-SN-1`：Gray → Adaptive Mean 一般二值化（設定 block `156`、有效 block `157`、C `-56`）→ 四邊 MASK → 輪廓；抓到即 NG、未抓到即 PASS。
+- 內建十個傳統 CV Detector 與 YOLOX Detector。
 - CUDA DLL 維持 ABI v1 與 detector-neutral primitive／linear plan／DAG／resident ROI 架構，不新增 detector 專屬 CUDA workflow。
 - `gpu.mode=auto` 在 CUDA 不可用時可依設定完整回退 CPU；strict `gpu.mode=cuda` 要求 CUDA 成功，不會靜默 fallback。
 
