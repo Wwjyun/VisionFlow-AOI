@@ -10,7 +10,7 @@ VisionFlow AOI 不只是單一 Detector 範例，而是一套可實際延伸的�
 - PySide6 桌面 GUI。
 - YAML 配方載入、驗證、編輯與儲存。
 - 固定網格、模板定位網格、輪廓及模板比對四種切圖方式。
-- `202-CS-SN-1`、`203-AS-SN-1`、`401-AS-SN-1`、`401-CS-AP-1`、`401-CS-AP-2`、`503-CS-SN-1`、`505-AS-SN-1`、`506-CS-SN-1`、`900-CS-AP-1` 九個傳統電腦視覺 Detector，以及 ONNX Runtime `yolox` Detector。
+- `202-CS-SN-1`、`203-AS-SN-1`、`401-AS-SN-1`、`401-CS-AP-1`、`401-CS-AP-2`、`401-CS-SN-1`、`503-CS-SN-1`、`505-AS-SN-1`、`506-CS-SN-1`、`900-CS-AP-1` 十個傳統電腦視覺 Detector，以及 ONNX Runtime `yolox` Detector。
 - 單張檢測、批次資料夾檢測及新檔案監控。
 - OP、Engineer、Admin 三種 GUI 操作模式。
 - Overlay、NG 小圖、缺陷 CSV、矩陣 CSV、JSON 與輪替日誌。
@@ -157,6 +157,7 @@ AOI_CVbased/
 |   |-- detector_401.py             # 401-AS-SN-1 負極旋轉矩形檢測
 |   |-- detector_401_1.py           # 401-CS-AP-1 自適應圓形輪廓檢測
 |   |-- detector_401_2.py           # 401-CS-AP-2 白像素比例檢測
+|   |-- detector_401_cs_sn_1.py     # 401-CS-SN-1 自適應輪廓檢測
 |   |-- detector_503_cs_sn_1.py     # 503-CS-SN-1 固定二值化多邊形檢測
 |   |-- detector_505_as_sn_1.py     # 505-AS-SN-1 固定反相多邊形檢測
 |   |-- detector_506_cs_sn_1.py     # 506-CS-SN-1 固定二值化多邊形檢測
@@ -413,7 +414,7 @@ tile:
 
 所有 Detector 都繼承 `BaseDetector`，並輸出統一格式，包含 Detector ID、PASS／NG、分數、缺陷類型、區域座標、面積及 metadata。如此 Reporter、Aggregator 與 GUI 不需要知道個別演算法細節。
 
-目前正式 registry 共 10 個 Detector：
+目前正式 registry 共 11 個 Detector：
 
 | 正式 ID | GUI 用途 | 舊 Recipe ID |
 |---|---|---|
@@ -422,6 +423,7 @@ tile:
 | `401-AS-SN-1` | 反相矩形 NG 檢測 | `401` |
 | `401-CS-AP-1` | 圓形 NG 檢測 | `401-1` |
 | `401-CS-AP-2` | 白色比例 NG 檢測 | `401-2` |
+| `401-CS-SN-1` | 自適應輪廓檢測 | 不適用 |
 | `503-CS-SN-1` | 固定二值化多邊形檢測 | 不適用 |
 | `505-AS-SN-1` | 固定反相多邊形檢測 | 不適用 |
 | `506-CS-SN-1` | 固定二值化多邊形檢測 | 不適用 |
@@ -446,6 +448,7 @@ Recipe Designer 會依共同 parameter schema 將每個 Detector 參數分成兩
 | `401-AS-SN-1` | ROI 內縮、最小／最大面積 | blur、adaptive threshold、反相、morphology、contour mode |
 | `401-CS-AP-1` | ROI 內縮、最小／最大面積 | threshold、blur、morphology、縮放、圓度與填充比 |
 | `401-CS-AP-2` | ROI 內縮、最小／最大面積 | threshold、blur、contour mode、白像素比例 |
+| `401-CS-SN-1` | 四邊內縮、最小／最大面積 | 邊緣屏蔽、Adaptive Mean block／C／反相／最大值及輪廓模式 |
 | `503-CS-SN-1` | 中心屏蔽半寬／半高、四邊內縮、最小／最大面積 | 中心／邊緣屏蔽開關、中心定位、固定 threshold／反相／最大值、輪廓模式及多邊形近似設定 |
 | `505-AS-SN-1` | 四邊內縮、最小／最大面積 | 邊緣屏蔽、固定 threshold／反相／最大值、輪廓模式及多邊形近似設定 |
 | `506-CS-SN-1` | 中心屏蔽半寬／半高、四邊內縮、最小／最大面積 | 中心／邊緣屏蔽開關、中心定位、固定 threshold／反相／最大值、輪廓模式及多邊形近似設定 |
@@ -471,6 +474,15 @@ Recipe Designer 會依共同 parameter schema 將每個 Detector 參數分成兩
 - 預設四邊屏蔽：共同內縮 `0`，左 `15`、右 `26`、上 `50`、下 `20`；各邊實際值為共同內縮與個別值兩者的較大值。工程模式可調整內縮尺寸，停用屏蔽則需要管理模式。
 - 面積：`min_area`／`max_area` 預設皆為 `0`，代表不限制；只排除面積為零的輪廓。
 - 缺陷類型：`203_as_ap_1_contour_ng`
+
+### `401-CS-SN-1`：自適應輪廓檢測
+
+- 檔案：`detectors/detector_401_cs_sn_1.py`
+- 預設流程：Gray → Adaptive Mean 一般二值化 → 四邊排除屏蔽 → `RETR_LIST` contours；不使用 Gaussian blur 或形態學，抓到任一符合面積條件的輪廓即 NG，沒有輪廓即 PASS。
+- 調參值：Adaptive block 保存為 `156`、C 為 `-56`；依調參工具與 OpenCV 契約，偶數 block 在執行時自動轉成下一個奇數，因此有效 block 為 `157`。metadata 同時保存設定值與有效值。
+- 四邊屏蔽預設啟用，共同／左／右／上／下內縮預設皆為 `0`，可由 Recipe Designer 分別調整；各邊實際值為共同內縮與個別值兩者的較大值。
+- 面積：`min_area`／`max_area` 預設皆為 `0`，代表不限制；只排除面積為零的輪廓。
+- 缺陷類型：`401_cs_sn_1_contour_ng`
 
 ### `503-CS-SN-1`：固定二值化多邊形檢測
 

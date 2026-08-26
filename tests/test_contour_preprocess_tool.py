@@ -18,6 +18,7 @@ from contour_preprocess_tool.engine import ContourProcessingEngine
 from contour_preprocess_tool.recipe_io import TuningRecipeDocument, TuningRecipeStore
 from contour_preprocess_tool.viewer import FullResolutionImageViewer
 from detectors.detector_203_as_ap_1 import Detector203AsAp1
+from detectors.detector_401_cs_sn_1 import Detector401CsSn1
 
 
 def detector_203_tool_params() -> dict:
@@ -99,6 +100,25 @@ def detector_203_tool_params() -> dict:
     }
 
 
+def detector_401_cs_sn_1_tool_params() -> dict:
+    params = detector_203_tool_params()
+    params.update(
+        {
+            "gaussian_enabled": False,
+            "recipe_steps": ["Grayscale", "Threshold"],
+            "threshold_method": "Adaptive Mean",
+            "adaptive_block": 156,
+            "adaptive_c": -56.0,
+            "morph_enabled": False,
+            "edge_mask_left": 2,
+            "edge_mask_right": 3,
+            "edge_mask_top": 4,
+            "edge_mask_bottom": 5,
+        }
+    )
+    return params
+
+
 class ContourProcessingEngineTests(unittest.TestCase):
     def test_release_version(self):
         self.assertEqual(__version__, "1.0.0")
@@ -150,6 +170,37 @@ class ContourProcessingEngineTests(unittest.TestCase):
         self.assertEqual(
             tool_result.stats["processing_resolution"],
             {"width": 181, "height": 137, "source": "original_full_resolution"},
+        )
+
+    def test_detector_401_cs_sn_1_matches_tuning_engine_mask_and_contours(self):
+        image = np.random.default_rng(4010818).integers(
+            0, 256, size=(179, 193, 3), dtype=np.uint8
+        )
+        params = detector_401_cs_sn_1_tool_params()
+        tool_result = ContourProcessingEngine().process(image, params)
+        detector = Detector401CsSn1(
+            params={
+                "edge_mask_enabled": True,
+                "edge_inset_left": 2,
+                "edge_inset_right": 3,
+                "edge_inset_top": 4,
+                "edge_inset_bottom": 5,
+            }
+        )
+
+        np.testing.assert_array_equal(tool_result.mask, detector._make_binary(image))
+        detector_result = detector.run(image)
+        self.assertEqual(tool_result.stats["contour"], len(detector_result["defects"]))
+        self.assertEqual(
+            tool_result.stats["detections"],
+            [
+                {
+                    "shape": "contour",
+                    "bbox": defect["bbox_local"],
+                    "area": defect["area"],
+                }
+                for defect in detector_result["defects"]
+            ],
         )
 
 
