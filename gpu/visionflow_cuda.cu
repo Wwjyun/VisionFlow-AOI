@@ -214,7 +214,10 @@ int reserve_device(
     return VF_CUDA_OK;
 }
 
-int prepare_gaussian_weights(int kernel, int* radius_out) {
+int prepare_gaussian_weights(
+    int kernel,
+    int* radius_out,
+    cudaStream_t stream = nullptr) {
     if (radius_out == nullptr || kernel < 3 || kernel % 2 == 0 || kernel > MAX_GAUSSIAN_KERNEL) {
         return VF_CUDA_INVALID_ARGUMENT;
     }
@@ -252,8 +255,16 @@ int prepare_gaussian_weights(int kernel, int* radius_out) {
         }
         weights[radius] = static_cast<uint16_t>(GAUSSIAN_FIXED_SCALE - side_sum * 2);
     }
-    cudaError_t error = cudaMemcpyToSymbol(
-        gaussian_weights, weights.data(), static_cast<size_t>(kernel) * sizeof(uint16_t));
+    const size_t weight_bytes = static_cast<size_t>(kernel) * sizeof(uint16_t);
+    cudaError_t error = stream == nullptr
+        ? cudaMemcpyToSymbol(gaussian_weights, weights.data(), weight_bytes)
+        : cudaMemcpyToSymbolAsync(
+            gaussian_weights,
+            weights.data(),
+            weight_bytes,
+            0,
+            cudaMemcpyHostToDevice,
+            stream);
     if (error != cudaSuccess) return visionflow_cuda::runtime_error(error);
     *radius_out = radius;
     return VF_CUDA_OK;
@@ -964,7 +975,8 @@ static int execute_linear_plan_device(
                 context->timing_has_gaussian = true;
                 cudaEventRecord(context->timing_events[TIMING_GAUSSIAN_START], context->stream);
                 int radius = 0;
-                int result = prepare_gaussian_weights(op.int_params[0], &radius);
+                int result = prepare_gaussian_weights(
+                    op.int_params[0], &radius, context->stream);
                 if (result != VF_CUDA_OK) return result;
                 gaussian_horizontal_kernel<<<grid2d(width, height), dim3(BLOCK_X, BLOCK_Y), 0, context->stream>>>(
                     current, context->gaussian_buffer, width, height, channels, radius);
@@ -1084,7 +1096,8 @@ static int execute_dag_plan_device(
                 context->timing_has_gaussian = true;
                 cudaEventRecord(context->timing_events[TIMING_GAUSSIAN_START], context->stream);
                 int radius = 0;
-                int result = prepare_gaussian_weights(op.int_params[0], &radius);
+                int result = prepare_gaussian_weights(
+                    op.int_params[0], &radius, context->stream);
                 if (result != VF_CUDA_OK) return result;
                 gaussian_horizontal_kernel<<<grid2d(width, height), dim3(BLOCK_X, BLOCK_Y), 0, context->stream>>>(
                     input, context->gaussian_buffer, width, height, channels, radius);
@@ -1890,7 +1903,9 @@ VF_CUDA_API int vf_preprocess_401_2_u8(
     size_t source_count = pixel_count * static_cast<size_t>(sc);
 
     int radius = 0;
-    int result = prepare_gaussian_weights(gaussian_kernel, &radius);
+    PersistentContext* persistent = static_cast<PersistentContext*>(context);
+    int result = prepare_gaussian_weights(
+        gaussian_kernel, &radius, persistent->stream);
     if (result != VF_CUDA_OK) return result;
     int adaptive_radius = 0, padded_width = 0, padded_height = 0;
     size_t padded_count = 0;
@@ -1904,7 +1919,6 @@ VF_CUDA_API int vf_preprocess_401_2_u8(
         &padded_count);
     if (result != VF_CUDA_OK) return result;
 
-    PersistentContext* persistent = static_cast<PersistentContext*>(context);
     result = reserve_device(
         &persistent->u8[0], &persistent->u8_capacity[0], source_count, &persistent->allocation_count);
     if (result == VF_CUDA_OK) {
