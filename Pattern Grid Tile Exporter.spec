@@ -1,7 +1,7 @@
 # -*- mode: python ; coding: utf-8 -*-
 
 a = Analysis(
-    ['export_pattern_grid_tiles.py'],
+    ['tools/export_pattern_grid_tiles.py'],
     pathex=[],
     binaries=[],
     datas=[],

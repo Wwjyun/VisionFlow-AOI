@@ -126,6 +126,8 @@ AOI_CVbased/
 |   |-- release-notes/              # 依產品與版本命名的發行說明
 |   |-- reports/                    # 技術評估與階段報告
 |   `-- packaging/                  # 會複製進發行工件的純文字說明
+|-- tools/                          # 四支獨立後處理／切圖工具原始碼
+|-- release_artifacts/              # 本機版本化 ZIP（ZIP 不納入 Git）
 |-- weekly_reports/                 # 星期四至星期三週報
 |-- .github/workflows/              # Windows CI 與 RTX 3090 runtime workflow
 |-- core/
@@ -347,7 +349,7 @@ tile:
 
 ```powershell
 # 不帶參數會開啟 PySide6 GUI
-.\env\Scripts\python.exe export_pattern_grid_tiles.py
+.\env\Scripts\python.exe -m tools.export_pattern_grid_tiles
 ```
 
 GUI 不顯示影像預覽，只提供輸入／輸出路徑、recipe、Pattern 模板、搜尋範圍、網格偏移、列欄數、ROI 大小、間距、匹配門檻與批次選項。Recipe 載入後會把參數填回欄位供修改，切圖在背景執行，並保存上次使用的路徑與參數。
@@ -355,7 +357,7 @@ GUI 不顯示影像預覽，只提供輸入／輸出路徑、recipe、Pattern �
 命令列批次模式仍可使用：
 
 ```powershell
-.\env\Scripts\python.exe export_pattern_grid_tiles.py `
+.\env\Scripts\python.exe -m tools.export_pattern_grid_tiles `
   --input-dir "D:\images" `
   --output-dir "D:\tiles" `
   --recipe "D:\configs\pattern_grid.yaml"
@@ -686,7 +688,7 @@ outputs/
 
 Recipe Designer 的「精度 (µm/px)」會儲存在 `output.pixel_size_um_per_px`。填入 `n` 時，CSV 的 `area` 會以 `area_px × n²` 換算為 `um^2`；留空或舊 recipe 未含此欄位時維持像素面積。`area_unit` 欄會分別標示 `um^2` 或 `px^2`。Detector 的面積篩選參數仍使用 px²，因此不影響 PASS／NG 判定。
 
-可另外執行 `.\env\Scripts\python.exe export_ng_tiles_by_area.py` 開啟「NG Tile 面積分類工具」。選擇包含 `csv/` 與 `ng_tiles/` 的根資料夾，逐行輸入 `200-400`、`401-500` 等區間後，工具會往下搜尋 CSV，依 `tile_id` 對應並複製 NG Tile 至 `area_classified/<面積區間>/`。同一 Tile 有多筆缺陷時可選最大值、總和或最小值；預設採最大面積。原始 CSV 與圖片不會被移動，未落入區間的圖片預設放入 `_未落入區間/`；若同一根資料夾混有 px² 與 µm²，輸出會先分為 `px2/` 與 `um2/`，避免不同單位混在一起。
+可另外執行 `.\env\Scripts\python.exe -m tools.export_ng_tiles_by_area` 開啟「NG Tile 面積分類工具」。選擇包含 `csv/` 與 `ng_tiles/` 的根資料夾，逐行輸入 `200-400`、`401-500` 等區間後，工具會往下搜尋 CSV，依 `tile_id` 對應並複製 NG Tile 至 `area_classified/<面積區間>/`。同一 Tile 有多筆缺陷時可選最大值、總和或最小值；預設採最大面積。原始 CSV 與圖片不會被移動，未落入區間的圖片預設放入 `_未落入區間/`；若同一根資料夾混有 px² 與 µm²，輸出會先分為 `px2/` 與 `um2/`，避免不同單位混在一起。
 
 若要建立可獨立攜帶的單檔 Windows EXE，可執行 `.\build_ng_tile_area_tool.ps1`。輸出位於 `dist\NG-Tile-Area-Tool\`；此後處理工具不執行 AOI Detector，也不需要 CUDA DLL。發布檔採獨立的 `ng-tile-area-tool-vX.Y.Z` Tag，不與 VisionFlow AOI 主程式的 `vX.Y.Z` Tag 混用。
 
@@ -801,17 +803,17 @@ CUDA 詳細架構及操作請參考 [`gpu/README.md`](gpu/README.md)，完整實
 .\build_contour_preprocess_tool.ps1 -Version 1.0.0
 ```
 
-輸出目錄為 `dist\Traditional-CV-Tuning-Tool`；發佈 ZIP 命名為 `Traditional-CV-Tuning-Tool-vX.Y.Z-windows-x64.zip`，Tag 使用 `cv-tuning-tool-vX.Y.Z`。此工具的 OpenCV 處理為 CPU 路徑，不含 CUDA DLL；OpenGL 僅用於完整解析度 Qt 預覽並保留 raster fallback。
+輸出目錄為 `dist\Traditional-CV-Tuning-Tool`；發佈 ZIP 存放為 `release_artifacts\Traditional-CV-Tuning-Tool-vX.Y.Z-windows-x64.zip`，Tag 使用 `cv-tuning-tool-vX.Y.Z`。此工具的 OpenCV 處理為 CPU 路徑，不含 CUDA DLL；OpenGL 僅用於完整解析度 Qt 預覽並保留 raster fallback。
 
 其餘後處理／切圖工具：
 
 ```powershell
-.\env\Scripts\python.exe export_scatter_plots.py
-.\env\Scripts\python.exe export_matrix_summary.py
+.\env\Scripts\python.exe -m tools.export_scatter_plots
+.\env\Scripts\python.exe -m tools.export_matrix_summary
 ```
 
-- `export_scatter_plots.py`：從 JSON／CSV 報告匯出散佈圖摘要。
-- `export_matrix_summary.py`：整合多個矩陣 CSV 為彙總報表。
+- `tools/export_scatter_plots.py`：從 JSON／CSV 報告匯出散佈圖摘要。
+- `tools/export_matrix_summary.py`：整合多個矩陣 CSV 為彙總報表。
 
 兩者獨立於主 Pipeline，讓後處理工具可自行演進。
 
@@ -832,7 +834,7 @@ CUDA 詳細架構及操作請參考 [`gpu/README.md`](gpu/README.md)，完整實
 .\build_utility_tools.ps1 -Version 1.0.0
 ```
 
-輸出為 `VisionFlow-Utility-Tools-v1.0.0-windows-x64.zip`，內含四支獨立 EXE、`README.txt` 與 `VERSION.txt`。工具合集使用 `utility-tools-vX.Y.Z` Tag，不與主程式 `vX.Y.Z` 或既有 `ng-tile-area-tool-vX.Y.Z` Tag 混用；成品目前未進行程式碼簽章，發佈說明必須明確標示 Windows SmartScreen 可能顯示未知發行者。
+輸出為 `release_artifacts\VisionFlow-Utility-Tools-v1.0.0-windows-x64.zip`，內含四支獨立 EXE、`README.txt` 與 `VERSION.txt`。工具合集使用 `utility-tools-vX.Y.Z` Tag，不與主程式 `vX.Y.Z` 或既有 `ng-tile-area-tool-vX.Y.Z` Tag 混用；成品目前未進行程式碼簽章，發佈說明必須明確標示 Windows SmartScreen 可能顯示未知發行者。
 
 ## 建立 Windows 執行檔
 
@@ -858,10 +860,10 @@ Start-Process -FilePath '.\dist\VisionFlow AOI\VisionFlow AOI.exe' -ArgumentList
 
 `build_exe.ps1` 使用受版控的 `VisionFlow AOI.spec`，不會在每次建置時覆寫 CUDA DLL 的條件式收錄規則；建置時會將 commit/dirty provenance 嵌入 bundle。
 
-發行檔命名格式：
+發行檔集中存放於 `release_artifacts/`，命名格式：
 
 ```text
-VisionFlow-AOI-vX.Y.Z-windows-x64.zip
+release_artifacts\VisionFlow-AOI-vX.Y.Z-windows-x64.zip
 ```
 
 ## 驗證
@@ -870,7 +872,7 @@ VisionFlow-AOI-vX.Y.Z-windows-x64.zip
 
 ```powershell
 .\env\Scripts\python.exe -m unittest discover -s tests -v
-.\env\Scripts\python.exe -m compileall main.py gui_launcher.py export_ng_tiles_by_area.py export_pattern_grid_tiles.py export_matrix_summary.py export_scatter_plots.py contour_preprocess_tool core detectors gui gpu
+.\env\Scripts\python.exe -m compileall main.py gui_launcher.py tools contour_preprocess_tool core detectors gui gpu
 .\env\Scripts\python.exe gpu\preflight_cuda_build.py
 git diff --check
 ```

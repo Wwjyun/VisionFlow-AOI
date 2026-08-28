@@ -10,7 +10,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PySide6.QtWidgets import QApplication
 
-from export_ng_tiles_by_area import (
+from tools.export_ng_tiles_by_area import (
     DEFAULT_RANGES,
     NgTileAreaClassifierWindow,
     TOOL_VERSION,

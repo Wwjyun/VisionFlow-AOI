@@ -23,7 +23,8 @@ foreach ($buildScript in $buildScripts) {
 
 $bundleName = "VisionFlow-Utility-Tools-v$Version-windows-x64"
 $bundleRoot = Join-Path $PSScriptRoot "dist\$bundleName"
-$zipPath = Join-Path $PSScriptRoot "$bundleName.zip"
+$releaseRoot = Join-Path $PSScriptRoot "release_artifacts"
+$zipPath = Join-Path $releaseRoot "$bundleName.zip"
 if (Test-Path -LiteralPath $bundleRoot) {
     throw "Bundle directory already exists: $bundleRoot"
 }
@@ -61,6 +62,7 @@ $resolvedTools = foreach ($tool in $tools) {
     }
 }
 
+New-Item -ItemType Directory -Force -Path $releaseRoot | Out-Null
 New-Item -ItemType Directory -Path $bundleRoot | Out-Null
 foreach ($tool in $resolvedTools) {
     Copy-Item -LiteralPath $tool.Source -Destination (Join-Path $bundleRoot $tool.Name)

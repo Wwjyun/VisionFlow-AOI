@@ -33,10 +33,7 @@ jobs:
           python -m compileall
           main.py
           gui_launcher.py
-          export_matrix_summary.py
-          export_ng_tiles_by_area.py
-          export_pattern_grid_tiles.py
-          export_scatter_plots.py
+          tools
           core
           detectors
           gui

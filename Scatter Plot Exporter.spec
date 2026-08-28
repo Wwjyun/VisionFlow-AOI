@@ -1,7 +1,7 @@
 # -*- mode: python ; coding: utf-8 -*-
 
 a = Analysis(
-    ['export_scatter_plots.py'],
+    ['tools/export_scatter_plots.py'],
     pathex=[],
     binaries=[],
     datas=[],

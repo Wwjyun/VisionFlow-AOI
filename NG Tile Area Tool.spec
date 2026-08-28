@@ -1,7 +1,7 @@
 # -*- mode: python ; coding: utf-8 -*-
 
 a = Analysis(
-    ['export_ng_tiles_by_area.py'],
+    ['tools/export_ng_tiles_by_area.py'],
     pathex=[],
     binaries=[],
     datas=[],

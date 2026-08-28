@@ -1,7 +1,7 @@
 # -*- mode: python ; coding: utf-8 -*-
 
 a = Analysis(
-    ['export_matrix_summary.py'],
+    ['tools/export_matrix_summary.py'],
     pathex=[],
     binaries=[],
     datas=[],

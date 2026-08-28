@@ -14,7 +14,7 @@ import yaml
 from PySide6.QtCore import QEventLoop, QSettings, QTimer
 from PySide6.QtWidgets import QApplication
 
-from export_pattern_grid_tiles import (
+from tools.export_pattern_grid_tiles import (
     PatternGridBatchWindow,
     build_tile_config,
     build_parser,

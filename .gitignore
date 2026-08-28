@@ -16,6 +16,7 @@ tmp_validation_gui.png
 build/
 dist/
 
+# Local versioned release packages live under release_artifacts/.
 *.zip
 /gpu/cuda_build_preflight.json
 /gpu/test_cuda_api.exe

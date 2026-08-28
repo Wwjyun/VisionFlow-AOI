@@ -27,7 +27,7 @@ Separate a local package request from a published release. Do not create tags or
 1. Run `build_exe.ps1` from the repository root.
 2. Verify `dist\VisionFlow AOI\VisionFlow AOI.exe`, bundled recipes, required Qt/runtime files, and presence/absence of `gpu\visionflow_cuda.dll` according to the intended package.
 3. Smoke-test the packaged application on the available machine. Record any GPU/no-GPU matrix that still requires another computer.
-4. Create `VisionFlow-AOI-vX.Y.Z-windows-x64.zip` from the whole distribution folder, never the executable alone.
+4. Create `release_artifacts\VisionFlow-AOI-vX.Y.Z-windows-x64.zip` from the whole distribution folder, never the executable alone.
 5. Calculate and report SHA-256 plus artifact size. Do not overwrite an existing same-version package without explicit approval.
 
 ## Choose the publication transport
@@ -55,7 +55,7 @@ $publishScript = Join-Path $codexRoot 'skills\aoi-release\scripts\publish_github
 & $publishScript `
   -Repository 'Wwjyun/AOI_CVBased' `
   -Tag 'vX.Y.Z' `
-  -AssetPath '.\VisionFlow-AOI-vX.Y.Z-windows-x64.zip' `
+  -AssetPath '.\release_artifacts\VisionFlow-AOI-vX.Y.Z-windows-x64.zip' `
   -ReleaseName 'VisionFlow AOI vX.Y.Z' `
   -BodyPath '.\docs\release-notes\visionflow-aoi-vX.Y.Z.md' `
   -ExpectedCommit '<full-commit-sha>' `

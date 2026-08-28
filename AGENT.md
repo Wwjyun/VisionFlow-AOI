@@ -13,7 +13,7 @@ Primary entry points:
 - Packaged GUI entry/smoke: `gui_launcher.py` and `VisionFlow AOI.exe --smoke-test`
 - Windows package build: `build_exe.ps1` using the tracked `VisionFlow AOI.spec`
 - Traditional-CV tuning reference: `contour_preprocess_tool/` (run with `python -m contour_preprocess_tool`; build the independent EXE with `build_contour_preprocess_tool.ps1`)
-- Standalone utilities: `export_ng_tiles_by_area.py`, `export_pattern_grid_tiles.py`, `export_matrix_summary.py`, and `export_scatter_plots.py`
+- Standalone utilities: `tools/export_ng_tiles_by_area.py`, `tools/export_pattern_grid_tiles.py`, `tools/export_matrix_summary.py`, and `tools/export_scatter_plots.py`
 - Utility bundle build: `build_utility_tools.ps1`; individual utility builds use their dedicated `build_*_exporter.ps1` or `build_ng_tile_area_tool.ps1` entry point
 - CUDA build: `gpu/build_cuda_dll.ps1`
 - CUDA validation: `gpu/validate_cuda_dll.py`
@@ -37,7 +37,8 @@ The normal development machine may not have `nvcc`, CMake, or an NVIDIA GPU. Nev
 
 ## Module ownership
 
-- Top-level entry points: keep CLI orchestration in `main.py`, packaged startup/smoke in `gui_launcher.py`, main packaging in `build_exe.ps1` and `VisionFlow AOI.spec`, and standalone utilities in `export_*.py` with their dedicated spec/build scripts.
+- Top-level entry points: keep CLI orchestration in `main.py`, packaged startup/smoke in `gui_launcher.py`, and main packaging in `build_exe.ps1` and `VisionFlow AOI.spec`.
+- `tools/`: standalone post-processing and tile-export utility sources; each tool keeps its dedicated root-level spec/build entry point.
 - `core/`: pipeline, recipe loading/building, tiling, aggregation, reporting, profiling, batch/monitor processing, result schemas/compaction, GPU sessions/bridge, preprocessing plans and executors.
 - `detectors/`: detector-specific feature extraction, geometry, filtering, and result metadata.
 - `gpu/`: CUDA C ABI, kernels, persistent contexts, build scripts, native smoke tests, and CPU/GPU validation.
@@ -47,6 +48,7 @@ The normal development machine may not have `nvcc`, CMake, or an NVIDIA GPU. Nev
 - `.github/workflows/`: CI only; keep GPU runtime jobs isolated from ordinary hosted runners.
 - `docs/`: durable project documentation; keep release notes in `docs/release-notes/`, technical and project reports in `docs/reports/`, and text files copied into release artifacts in `docs/packaging/`.
 - `weekly_reports/`: Thursday-to-Wednesday progress reports; keep this directory separate because the weekly-report workflow depends on its stable path.
+- `release_artifacts/`: local versioned release ZIPs; keep the directory index tracked but never commit the ZIP contents.
 - `cuda_practice/`: independent learning/device-check programs; do not make production runtime depend on them.
 - `design_handoff_aoi_gui/`: design reference only; production UI behavior belongs in `gui/`.
 
@@ -138,7 +140,7 @@ Before finishing, always run:
 
 ```powershell
 .\env\Scripts\python.exe -m unittest discover -s tests -v
-.\env\Scripts\python.exe -m compileall main.py gui_launcher.py export_ng_tiles_by_area.py export_pattern_grid_tiles.py export_matrix_summary.py export_scatter_plots.py contour_preprocess_tool core detectors gui gpu
+.\env\Scripts\python.exe -m compileall main.py gui_launcher.py tools contour_preprocess_tool core detectors gui gpu
 .\env\Scripts\python.exe gpu\preflight_cuda_build.py
 git diff --check
 ```

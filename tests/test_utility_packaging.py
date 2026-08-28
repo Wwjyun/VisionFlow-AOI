@@ -11,19 +11,19 @@ class UtilityPackagingContractTests(unittest.TestCase):
     def test_every_standalone_tool_has_a_one_file_spec_and_build_script(self):
         contracts = {
             "NG Tile Area Tool.spec": (
-                "export_ng_tiles_by_area.py",
+                "tools/export_ng_tiles_by_area.py",
                 "build_ng_tile_area_tool.ps1",
             ),
             "Pattern Grid Tile Exporter.spec": (
-                "export_pattern_grid_tiles.py",
+                "tools/export_pattern_grid_tiles.py",
                 "build_pattern_grid_tile_exporter.ps1",
             ),
             "Matrix Summary Exporter.spec": (
-                "export_matrix_summary.py",
+                "tools/export_matrix_summary.py",
                 "build_matrix_summary_exporter.ps1",
             ),
             "Scatter Plot Exporter.spec": (
-                "export_scatter_plots.py",
+                "tools/export_scatter_plots.py",
                 "build_scatter_plot_exporter.ps1",
             ),
         }
@@ -39,10 +39,10 @@ class UtilityPackagingContractTests(unittest.TestCase):
 
     def test_all_tools_expose_noninteractive_smoke_mode(self):
         for entry_point in (
-            "export_ng_tiles_by_area.py",
-            "export_pattern_grid_tiles.py",
-            "export_matrix_summary.py",
-            "export_scatter_plots.py",
+            "tools/export_ng_tiles_by_area.py",
+            "tools/export_pattern_grid_tiles.py",
+            "tools/export_matrix_summary.py",
+            "tools/export_scatter_plots.py",
         ):
             with self.subTest(entry_point=entry_point):
                 source = (ROOT / entry_point).read_text(encoding="utf-8")
@@ -58,6 +58,7 @@ class UtilityPackagingContractTests(unittest.TestCase):
         self.assertIn("[ValidatePattern('^\\d+\\.\\d+\\.\\d+$')]", build)
         self.assertIn("Release ZIP already exists", build)
         self.assertIn("Compress-Archive -LiteralPath $bundleRoot", build)
+        self.assertIn("release_artifacts", build)
         self.assertIn(r"docs\packaging\UTILITY_TOOLS_README.txt", build)
         for name in (
             "NG-Tile-Area-Tool.exe",
@@ -68,6 +69,7 @@ class UtilityPackagingContractTests(unittest.TestCase):
             self.assertIn(name, build)
         self.assertIn("CPU-only", readme)
         self.assertIn("未進行程式碼簽章", readme)
+        self.assertTrue((ROOT / "release_artifacts" / "README.md").is_file())
 
     def test_ng_tile_builder_uses_the_packaging_document_source(self):
         build = (ROOT / "build_ng_tile_area_tool.ps1").read_text(encoding="utf-8")
