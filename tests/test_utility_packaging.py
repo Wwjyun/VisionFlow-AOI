@@ -51,11 +51,14 @@ class UtilityPackagingContractTests(unittest.TestCase):
 
     def test_bundle_builder_refuses_overwrite_and_keeps_cpu_only_scope(self):
         build = (ROOT / "build_utility_tools.ps1").read_text(encoding="utf-8")
-        readme = (ROOT / "UTILITY_TOOLS_README.txt").read_text(encoding="utf-8")
+        readme = (ROOT / "docs" / "packaging" / "UTILITY_TOOLS_README.txt").read_text(
+            encoding="utf-8"
+        )
 
         self.assertIn("[ValidatePattern('^\\d+\\.\\d+\\.\\d+$')]", build)
         self.assertIn("Release ZIP already exists", build)
         self.assertIn("Compress-Archive -LiteralPath $bundleRoot", build)
+        self.assertIn(r"docs\packaging\UTILITY_TOOLS_README.txt", build)
         for name in (
             "NG-Tile-Area-Tool.exe",
             "Pattern-Grid-Tile-Exporter.exe",
@@ -65,6 +68,14 @@ class UtilityPackagingContractTests(unittest.TestCase):
             self.assertIn(name, build)
         self.assertIn("CPU-only", readme)
         self.assertIn("未進行程式碼簽章", readme)
+
+    def test_ng_tile_builder_uses_the_packaging_document_source(self):
+        build = (ROOT / "build_ng_tile_area_tool.ps1").read_text(encoding="utf-8")
+
+        self.assertIn(r"docs\packaging\NG_TILE_AREA_TOOL_README.txt", build)
+        self.assertTrue(
+            (ROOT / "docs" / "packaging" / "NG_TILE_AREA_TOOL_README.txt").is_file()
+        )
 
 
 if __name__ == "__main__":

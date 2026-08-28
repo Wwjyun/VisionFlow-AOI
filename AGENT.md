@@ -45,6 +45,8 @@ The normal development machine may not have `nvcc`, CMake, or an NVIDIA GPU. Nev
 - `recipes/`: YAML configuration and production defaults.
 - `tests/`: automated correctness, fallback, routing, and regression tests.
 - `.github/workflows/`: CI only; keep GPU runtime jobs isolated from ordinary hosted runners.
+- `docs/`: durable project documentation; keep release notes in `docs/release-notes/`, technical and project reports in `docs/reports/`, and text files copied into release artifacts in `docs/packaging/`.
+- `weekly_reports/`: Thursday-to-Wednesday progress reports; keep this directory separate because the weekly-report workflow depends on its stable path.
 - `cuda_practice/`: independent learning/device-check programs; do not make production runtime depend on them.
 - `design_handoff_aoi_gui/`: design reference only; production UI behavior belongs in `gui/`.
 

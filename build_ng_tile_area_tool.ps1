@@ -12,7 +12,7 @@ if (-not (Test-Path $spec)) {
 
 $distRoot = Join-Path $PSScriptRoot "dist\NG-Tile-Area-Tool"
 $workRoot = Join-Path $PSScriptRoot "build\ng_tile_area_tool"
-$readme = Join-Path $PSScriptRoot "NG_TILE_AREA_TOOL_README.txt"
+$readme = Join-Path $PSScriptRoot "docs\packaging\NG_TILE_AREA_TOOL_README.txt"
 
 Push-Location $PSScriptRoot
 try {

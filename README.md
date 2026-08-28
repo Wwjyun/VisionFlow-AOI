@@ -20,7 +20,7 @@ VisionFlow AOI 不只是單一 Detector 範例，而是一套可實際延伸的�
 - 打包版非互動 smoke，涵蓋 bundled Recipe／MainWindow、CPU-only、缺少 DLL 時的安全 fallback、strict CUDA 失敗，以及 bundled YOLOX registry／ONNX Runtime CPU 推論。
 - 可選 CUDA DLL、CPU fallback、效能觀測及 CPU/GPU 前處理抽象層。
 
-目前 CUDA DLL 已在 RTX 3090 完成既有 ABI／plan／runtime 驗證並用於 CUDA-enabled 發行包；仍待完成的重點包括：建立正式標註資料集、五份 production recipes 的完整 CPU/GPU 等價驗收、後續 CUDA 原始碼變更的 RTX 3090 重編與實測、長時間穩定度與可信效能 baseline，以及有 GPU 的打包版驗收。詳細進度以 [`Todo.md`](Todo.md) 為準。
+目前 CUDA DLL 已在 RTX 3090 完成既有 ABI／plan／runtime 驗證並用於 CUDA-enabled 發行包；仍待完成的重點包括：建立正式標註資料集、五份 production recipes 的完整 CPU/GPU 等價驗收、後續 CUDA 原始碼變更的 RTX 3090 重編與實測、長時間穩定度與可信效能 baseline，以及有 GPU 的打包版驗收。詳細進度以 [`Todo.md`](Todo.md) 為準，release notes、技術報告與打包說明則集中在 [`docs/`](docs/) 文件索引。
 
 ## 設計目標
 
@@ -122,6 +122,11 @@ AOI_CVbased/
 |-- requirements.in / requirements.lock.txt
 |-- AGENT.md                        # Codex／維護者工作規範
 |-- Todo.md                         # 唯一專案工作清單
+|-- docs/                           # Release notes、報告與打包說明
+|   |-- release-notes/              # 依產品與版本命名的發行說明
+|   |-- reports/                    # 技術評估與階段報告
+|   `-- packaging/                  # 會複製進發行工件的純文字說明
+|-- weekly_reports/                 # 星期四至星期三週報
 |-- .github/workflows/              # Windows CI 與 RTX 3090 runtime workflow
 |-- core/
 |   |-- pipeline.py                 # 檢測流程協調
@@ -464,7 +469,7 @@ Recipe Designer 會依共同 parameter schema 將每個 Detector 參數分成兩
 - 自動面積：預設最小值為 `max(5, int(0.000001 × H × W))`，最大值為 `int(0.05 × H × W)`；工程模式可調固定像素值與影像面積比例。候選邊界距離、局部背景 Ring 外擴範圍／倍率也屬尺寸外參。
 - 屏蔽：中心半寬 `100`／半高 `630`，並使用共同 `0`、左 `15`、右 `26`、上 `50`、下 `20` 邊緣內縮；排除像素不產生候選，也不納入局部背景 ring。
 - 關閉屏蔽時，候選 mask、MAD、sigma、門檻、bbox、面積、CNR 與排序均與參考 commit 的自動 CNR 實作一致。
-- 詳細邏輯、公式、固定二值化比較及光衰容忍度評估：[`DETECTOR_202_1_AUTO_CNR_EVALUATION.md`](DETECTOR_202_1_AUTO_CNR_EVALUATION.md)
+- 詳細邏輯、公式、固定二值化比較及光衰容忍度評估：[`DETECTOR_202_1_AUTO_CNR_EVALUATION.md`](docs/reports/DETECTOR_202_1_AUTO_CNR_EVALUATION.md)
 - 缺陷類型：`202-1_auto_cnr_ng`
 
 ### `203-AS-SN-1`：自適應反相輪廓檢測

@@ -57,7 +57,7 @@ $publishScript = Join-Path $codexRoot 'skills\aoi-release\scripts\publish_github
   -Tag 'vX.Y.Z' `
   -AssetPath '.\VisionFlow-AOI-vX.Y.Z-windows-x64.zip' `
   -ReleaseName 'VisionFlow AOI vX.Y.Z' `
-  -BodyPath '.\release-notes-vX.Y.Z.md' `
+  -BodyPath '.\docs\release-notes\visionflow-aoi-vX.Y.Z.md' `
   -ExpectedCommit '<full-commit-sha>' `
   -ExpectedSha256 '<sha256>' `
   -PreflightOnly

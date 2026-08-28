@@ -66,7 +66,7 @@ foreach ($tool in $resolvedTools) {
     Copy-Item -LiteralPath $tool.Source -Destination (Join-Path $bundleRoot $tool.Name)
 }
 
-$readme = Join-Path $PSScriptRoot "UTILITY_TOOLS_README.txt"
+$readme = Join-Path $PSScriptRoot "docs\packaging\UTILITY_TOOLS_README.txt"
 if (-not (Test-Path -LiteralPath $readme)) {
     throw "Utility README not found: $readme"
 }
