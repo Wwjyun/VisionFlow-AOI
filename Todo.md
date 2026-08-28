@@ -341,6 +341,36 @@
 - [ ] AI 與傳統 CV 共用 GPU scheduler、VRAM budget、warm-up、metrics 與 fallback policy。
 - [ ] 避免 GUI、monitor、batch worker 各自載入一份大型模型。
 
+### 分類式 AI Detector（TensorRT 純推論）規劃
+
+#### 系統邊界與模型交付
+
+- [x] 固定責任邊界：資料集建立、標註、PyTorch／Transformers 訓練、資料增強、模型評估、門檻校準、ONNX 匯出與 TensorRT engine 建置／驗證全部由 VisionFlow 之外的獨立模型工具負責；VisionFlow 不嵌入訓練、微調、資料集生成、訓練圖表或 checkpoint 管理功能，只接收已驗證模型包並執行推論。
+- [ ] 定義版本化分類模型包與 schema；至少包含 CPU correctness reference `model.onnx`、`manifest.json`，以及可選且已驗證的 TensorRT engine。量產包不攜帶 PyTorch `safetensors`、訓練程式或 Transformers 訓練相依套件。
+- [ ] `manifest.json` 至少保存穩定 `model_id`、模型名稱／版本、ONNX SHA-256、class ID／名稱、PASS 類別、輸入／輸出節點、固定輸入尺寸、BGR/RGB、resize／crop／padding／插值、pixel scale、mean/std、logits／probability 語意、允許 backend／precision、模型來源與 acceptance 報告版本；Recipe 只保存 `model_id` 與受控判定參數，不保存任意絕對路徑。
+- [ ] TensorRT engine cache key 與相容性檢查必須綁定 ONNX SHA-256、前處理／類別 manifest、precision、input profile、GPU compute capability、TensorRT／CUDA 版本；不相容、反序列化失敗或 checksum 錯誤時不得載入舊 engine。engine 不是 CPU reference，也不得只因檔名含 `fp16` 就宣稱 FP16。
+- [ ] 外部模型工具必須明確以 TensorRT `FP16` builder 設定產生 FP16 engine，保留 FP32 baseline，並輸出 ONNX↔TensorRT raw logits／probability、Top-1／PASS-NG、精度、效能與模型包 SHA-256 驗證報告；INT8 另需校正集版本與精度報告。
+
+#### Detector、判定與共用 runtime
+
+- [ ] 定義分類 Detector 正式 ID／繁中名稱、輸入語意為目前 tile／ROI 的 BGR `uint8` 影像、固定 preprocessing contract、PASS/NG 規則、defect type、confidence、deterministic ordering 與容差；分類結果只代表整個 ROI，若輸出 bbox 必須使用完整 ROI 並在 metadata 標示 `localization=roi_level`，不得誤報為模型已定位瑕疵。
+- [ ] PASS/NG 不只使用 argmax：由 manifest 定義 PASS 類別，Recipe 管理內參提供正常品門檻、目標 NG 類別／各類門檻與低信心處置；不確定區間須保守判 NG 或使用既有可追溯狀態，正式語意在實作前固定並加入 golden tests。
+- [ ] 將現有 `AiModelSessionManager` 擴充為 detector-neutral 分類 session，而不是在 Detector、GUI、batch 或 monitor 內另建 runtime；同模型／backend／precision／input shape 只載入一次，共用 warm-up、bounded queue、LRU cache、明確 `close()`、安全 invalidation、GPU scheduler、VRAM budget 與 capability／performance metrics。
+- [ ] 建立 manifest-driven 共用分類前處理與後處理；CPU reference、ONNX Runtime CUDA 與 TensorRT 必須使用完全相同的色彩、幾何、插值、正規化、NCHW、Softmax 與類別對照語意。DL inference 不強制塞入傳統 CV `PreprocessPlan`，但不得在各 worker 複製不同實作。
+- [ ] 沿用 `gpu.mode=cpu|auto|cuda` 與 `fallback_to_cpu`：`cpu` 只載入 ONNX Runtime CPU；`auto` 在缺少 TensorRT、engine 不相容、初始化／OOM／推論失敗時，使用同一 ONNX 與相同前後處理完整重跑整個分類 Detector；`cuda` 明確失敗且禁止 silent CPU fallback。execution metadata 與 GUI 必須顯示實際 backend、precision、device 與 fallback reason。
+- [ ] 支援固定輸入尺寸的 ROI batch inference，依 engine optimization profile 安全分批；量測 batch 1／4／8／16／全部 ROI 的 cold/warm median、P95、吞吐、H2D/D2H、peak VRAM 與 pipeline end-to-end，不得只以單張 kernel latency 決定預設值。
+- [ ] 結果 metadata 保存 model ID/version/SHA-256、requested/actual backend、precision、device、原始／模型 input shape、完整 preprocessing contract、class ID/name、各類 probability、使用門檻、低信心處置、batch size、load/warm-up/inference/postprocess 耗時與 fallback reason；Reporter／sidecar／JSON compaction 不得遺失必要追溯欄位。
+- [ ] Recipe Designer 依 `ParameterSpec.parameter_group` 將模型、PASS／NG 類別、confidence、backend、precision 與低信心策略列為管理內參；只有實體 ROI／尺寸接受條件可列工程外參。模型遺失、manifest／checksum 錯誤、類別或 backend 不相容時使用繁中 inline notice 並阻止儲存。
+
+#### 驗證與量產導入門檻
+
+- [ ] 先建立可散佈的小型分類 ONNX fixture，覆蓋 registry／manifest、前處理 pixel equivalence、logits／Softmax、PASS／NG、低信心、完整 ROI bbox、metadata、Recipe round trip、Unicode 路徑、空／灰階／非方形／極小 ROI、錯誤 shape／class count 與 deterministic ordering。
+- [ ] 定義 ONNX Runtime CPU 為分類 correctness reference；分別驗證 ONNX Runtime CUDA、TensorRT FP32、TensorRT FP16 的 raw logits／probability、Top-1、PASS/NG 與門檻邊界容差。任何 class、PASS/NG、數量或排序不等價都不得預設啟用 GPU／FP16。
+- [ ] 使用真實 AOI 人工標註 acceptance set，依產品、lot、日期、機台／相機與光源切分，避免同一生成器或近重複樣本跨 train/test；至少輸出正常品過殺率、所有缺陷合併漏檢率、各缺陷 precision／recall／F1、confusion matrix、confidence calibration 與 Wilson CI。合成資料與隨機同分布 100% accuracy 不可作為量產驗收。
+- [ ] 先確認分類適用範圍：輸入必須是已定位且語意單一的元件／ROI；若同一 ROI 可能同時有多個缺陷、需要精確座標或大圖搜尋，改採 object detection／segmentation，不以 ROI-level classifier 取代定位模型。
+- [ ] 在 RTX 3090 以 production 模型完成 warm-up 5 後 10／100／1000 張與模型切換／停止測試；確認 session/load count、VRAM 平台、queue、GUI 回應、無 crash/OOM/stale result，並與 ONNX Runtime CPU／CUDA 比較端到端效能。未達精度、穩定性或至少 1.5 倍目標加速時維持 CPU／GPU 預設關閉。
+- [ ] 驗證 CLI、GUI 單張、batch、monitor、Reporter、NG tile／sidecar、PyInstaller CPU-compatible 與 CUDA-enabled package；無 NVIDIA GPU 可用 ONNX CPU，engine 缺少／不相容可安全 fallback，strict CUDA 明確失敗，且 VisionFlow 發行包不包含任何訓練功能。
+
 ## 最終驗收門檻
 
 - [x] CPU-only 是完整受支援模式，沒有 CUDA/NVIDIA GPU 仍可啟動 GUI、CLI、batch 與 monitor。
@@ -353,6 +383,7 @@
 - [ ] 加速不得犧牲 GUI 回應、打包啟動、結果追溯、錯誤訊息或 CPU fallback。
 
 ## 完成紀錄
+- [x] 2026-08-28：完成分類式 AI Detector 的 TensorRT 純推論規劃；固定 VisionFlow 只接收已驗證模型包並執行推論，資料集、標註、PyTorch／Transformers 訓練、評估、門檻校準、ONNX 匯出與 TensorRT engine 建置／驗證全部留在外部模型工具。新增版本化 ONNX／manifest／可選 engine 交付契約、engine 相容鍵、ROI-level 分類與 PASS/NG／低信心語意、detector-neutral 共用 session、CPU／auto／strict CUDA fallback、batch／metadata／Recipe Designer、真實 AOI acceptance set、FP32／FP16 等價、RTX 3090 1000 張穩定性及 PyInstaller 驗收待辦；除責任邊界決策外，其餘實作與硬體項目皆保持未勾選。完整 308 tests、compileall、CUDA source／ABI preflight 與 `git diff --check` 通過；本次只修改 `Todo.md`，未變更 runtime、Detector、Recipe、GUI、CUDA source／header／ABI／DLL，未執行分類模型 RTX runtime 或量產精度驗收。
 - [x] 2026-08-28：整理本機發行工件與獨立工具原始碼；將根目錄 9 份既有版本化 ZIP 原封不動移至 `release_artifacts/`，新增索引並讓 Utility Tools 合集後續直接輸出至該資料夾；四支 `export_*.py` 移入 `tools/` package，改以 `python -m tools...` 執行，同步更新 imports、PyInstaller specs、build、CI、README、AGENT、release skill、歷史紀錄與 packaging contract tests。四支原始碼及重新打包 EXE 的 `--smoke-test` 均 exit 0，驗證 ZIP 結構與 CPU 說明正確；完整 308 tests、compileall、CUDA preflight、skill validator 與 `git diff --check` 通過。驗證用 `v0.0.0` ZIP／合集目錄已刪除，9 份正式 ZIP 保持原檔名與內容，未修改 CUDA source／header／ABI／DLL，亦未移動或提交既有未追蹤簡報、圖表、課程及架構圖產物。
 - [x] 2026-08-28：整理 repository 文件結構；新增 `docs/README.md` 索引，將 8 份 release notes 依產品與版本統一移至 `docs/release-notes/`、4 份技術／階段報告移至 `docs/reports/`、2 份會收錄進發行工件的純文字說明移至 `docs/packaging/`。同步更新 README、AGENT、歷史紀錄、`aoi-release` skill 範例、Utility／NG Tile 建置腳本與 packaging contract tests；四支 Utility Tools 重建及 packaged `--smoke-test` exit 0，驗證 ZIP 內 README 正確，完整 308 tests、compileall、CUDA preflight、skill validator 與 `git diff --check` 通過。根目錄保留執行／開發入口與固定的 `weekly_reports/` 契約，未移動或提交既有未追蹤簡報與架構圖產物。
 - [x] 2026-08-27：正式發布 VisionFlow AOI `v1.5.1` CUDA-enabled Windows x64；annotated tag 精準指向乾淨 release commit `805bfcb`（含 `401-CS-SN-1` 與 CUDA Gaussian weight stream ordering 修正）且該 commit 位於 `origin/main`。以 CUDA 13.3、MSVC x64、`sm_86` 在 RTX 3090 重編 DLL，C++ ABI smoke、exports/dependencies、primitive／linear plan／DAG／resident ROI、5 份 production Recipe 共 10 個合成 PASS/NG CPU/GPU 等價、10 個傳統 Detector 共 20 個 PASS/NG CPU/GPU 等價、1000 次 stress、benchmark、crossover 與 morphology profile 均通過；完整 307 tests、compileall、CUDA preflight、GUI offscreen smoke、PyInstaller 及獨立解壓 packaged smoke 亦通過。GitHub Release 為非草稿、非 prerelease、latest，僅含 `VisionFlow-AOI-v1.5.1-windows-x64.zip` 一項資產；ZIP 為 126,315,190 bytes、SHA-256 `EBA27ABB1B46469C386231B34C132545D5FAFA09DB96EC45CAC143F68A6375E6`，內含 6 份 Recipe 與 1 份 CUDA DLL（SHA-256 `D388CE5445C9E5761FA91387E2AB824449AF81AB5239CF42C61D3BB0BA5B6373`）。GitHub 回傳的資產大小／digest 與重新下載後的獨立驗證一致，下載版 packaged `--smoke-test` exit 0。
