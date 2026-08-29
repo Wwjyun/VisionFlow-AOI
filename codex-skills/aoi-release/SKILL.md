@@ -53,7 +53,7 @@ Use the bundled script from the repository root:
 $codexRoot = if ($env:CODEX_HOME) { $env:CODEX_HOME } else { Join-Path $env:USERPROFILE '.codex' }
 $publishScript = Join-Path $codexRoot 'skills\aoi-release\scripts\publish_github_release.ps1'
 & $publishScript `
-  -Repository 'Wwjyun/AOI_CVBased' `
+  -Repository 'Wwjyun/VisionFlow-AOI' `
   -Tag 'vX.Y.Z' `
   -AssetPath '.\release_artifacts\VisionFlow-AOI-vX.Y.Z-windows-x64.zip' `
   -ReleaseName 'VisionFlow AOI vX.Y.Z' `
