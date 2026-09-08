@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -21,12 +22,23 @@ class TileDefectDistributionTests(unittest.TestCase):
             summary_path = self._write_summary(
                 Path(temporary) / "run" / "csv" / "summary.csv",
                 [
-                    {"image_name": "a.png", "tile_id": "r0000_c0001", "detector_id": "401", "defect_type": "scratch"},
-                    {"image_name": "a.png", "tile_id": "r0000_c0001", "detector_id": "401", "defect_type": "dent"},
-                    {"image_name": "b.png", "tile_id": "r0000_c0001", "detector_id": "401", "defect_type": "scratch"},
-                    {"image_name": "b.png", "tile_id": "r0001_c0000", "detector_id": "202", "defect_type": "spot"},
-                    {"image_name": "b.png", "tile_id": "r0001_c0000", "detector_id": "401", "defect_type": "spot"},
+                    {"image_name": "a.png", "tile_id": "r0000_c0001", "detector_id": "401", "defect_type": "scratch", "area": "10", "area_unit": "px^2", "score": "0.8"},
+                    {"image_name": "a.png", "tile_id": "r0000_c0001", "detector_id": "401", "defect_type": "dent", "area": "20", "area_unit": "px^2", "score": "0.7"},
+                    {"image_name": "b.png", "tile_id": "r0000_c0001", "detector_id": "401", "defect_type": "scratch", "area": "30", "area_unit": "px^2", "score": "0.9"},
+                    {"image_name": "b.png", "tile_id": "r0001_c0000", "detector_id": "202", "defect_type": "spot", "area": "40", "area_unit": "px^2", "score": "1"},
+                    {"image_name": "b.png", "tile_id": "r0001_c0000", "detector_id": "401", "defect_type": "spot", "area": "50", "area_unit": "px^2", "score": "0.6"},
                 ],
+            )
+            json_dir = Path(temporary) / "run" / "json"
+            self._write_json_report(
+                json_dir / "a.json",
+                "a.png",
+                [("r0000_c0001", "NG"), ("r0001_c0000", "PASS")],
+            )
+            self._write_json_report(
+                json_dir / "b.json",
+                "b.png",
+                [("r0000_c0001", "PASS"), ("r0001_c0000", "NG")],
             )
 
             output_path, distribution = export_html_report(summary_path)
@@ -38,11 +50,21 @@ class TileDefectDistributionTests(unittest.TestCase):
             self.assertEqual(distribution.tiles["r0000_c0001"].defect_count, 3)
             self.assertEqual(distribution.tiles["r0000_c0001"].affected_image_count, 2)
             self.assertEqual(distribution.tiles["r0000_c0001"].defect_type_counts["scratch"], 2)
+            self.assertEqual(distribution.rows_with_area, 5)
+            self.assertEqual(distribution.rows_with_score, 5)
+            self.assertEqual(len(distribution.inspection_records), 4)
+            self.assertEqual(distribution.json_reports_scanned, 2)
             report = output_path.read_text(encoding="utf-8")
-            self.assertIn("AOI Tile 缺陷分布報表", report)
+            self.assertIn("AOI Tile 缺陷互動分析報表", report)
             self.assertIn("r0000_c0001", report)
-            self.assertIn("R0 C1", report)
             self.assertIn("scratch × 2", report)
+            self.assertIn("plotly.js v4.0.0", report)
+            self.assertIn('id="tile-ng-heatmap"', report)
+            self.assertIn('id="tile-ng-ranking"', report)
+            self.assertIn('id="tile-type-heatmap"', report)
+            self.assertIn('id="defect-treemap"', report)
+            self.assertIn('id="top-image-rows"', report)
+            self.assertIn("NG 率＝NG 次數 ÷ 檢測次數", report)
 
     def test_handles_missing_tile_id_and_escapes_report_values(self):
         with tempfile.TemporaryDirectory(prefix="visionflow_tile_distribution_") as temporary:
@@ -61,6 +83,57 @@ class TileDefectDistributionTests(unittest.TestCase):
             self.assertIn("&lt;detector&gt;", report)
             self.assertNotIn("<detector>", report)
             self.assertIn("未提供 tile_id", report)
+
+    def test_normalizes_optional_numbers_and_legacy_area_unit(self):
+        with tempfile.TemporaryDirectory(prefix="visionflow_tile_distribution_") as temporary:
+            summary_path = self._write_summary(
+                Path(temporary) / "summary.csv",
+                [
+                    {"image_name": "a.png", "tile_id": "T1", "detector_id": "401", "defect_type": "scratch", "area": "12.5", "area_unit": "", "score": "0.75"},
+                    {"image_name": "b.png", "tile_id": "T2", "detector_id": "401", "defect_type": "scratch", "area": "bad", "area_unit": "um^2", "score": "nan"},
+                ],
+            )
+
+            distribution = load_summary_distribution(summary_path)
+
+            self.assertEqual(distribution.records[0].area, 12.5)
+            self.assertEqual(distribution.records[0].area_unit, "px^2")
+            self.assertEqual(distribution.records[0].score, 0.75)
+            self.assertIsNone(distribution.records[1].area)
+            self.assertIsNone(distribution.records[1].score)
+            self.assertEqual(distribution.invalid_area_rows, 1)
+            self.assertEqual(distribution.invalid_score_rows, 1)
+
+    def test_json_tile_denominator_can_derive_result_and_is_script_safe(self):
+        with tempfile.TemporaryDirectory(prefix="visionflow_tile_distribution_") as temporary:
+            root = Path(temporary) / "run"
+            summary_path = self._write_summary(
+                root / "csv" / "summary.csv",
+                [{"image_name": "</script><b>", "tile_id": "r0000_c0000", "detector_id": "401", "defect_type": "scratch"}],
+            )
+            json_dir = root / "json"
+            json_dir.mkdir(parents=True)
+            (json_dir / "invalid.json").write_text("{", encoding="utf-8")
+            payload = {
+                "image_name": "</script><b>",
+                "recipe_name": "R",
+                "machine_id": "M",
+                "product_id": "P",
+                "final_result": "NG",
+                "tiles": [
+                    {"tile": {"tile_id": "r0000_c0000"}, "detectors": [{"pass": False}]},
+                    {"tile": {"tile_id": "r0000_c0001"}, "detectors": [{"pass": True}]},
+                ],
+            }
+            (json_dir / "valid.json").write_text(json.dumps(payload), encoding="utf-8")
+
+            output_path, distribution = export_html_report(summary_path)
+
+            self.assertEqual([record.tile_result for record in distribution.inspection_records], ["NG", "PASS"])
+            self.assertEqual(distribution.json_parse_errors, 1)
+            report = output_path.read_text(encoding="utf-8")
+            self.assertNotIn("</script><b>", report)
+            self.assertIn("\\u003c/script\\u003e\\u003cb\\u003e", report)
 
     def test_empty_summary_still_creates_a_readable_html_report(self):
         with tempfile.TemporaryDirectory(prefix="visionflow_tile_distribution_") as temporary:
@@ -93,11 +166,44 @@ class TileDefectDistributionTests(unittest.TestCase):
     @staticmethod
     def _write_summary(path: Path, rows: list[dict[str, str]]) -> Path:
         path.parent.mkdir(parents=True, exist_ok=True)
-        fields = ["image_name", "tile_id", "detector_id", "defect_type"]
+        fields = [
+            "image_name",
+            "recipe_name",
+            "machine_id",
+            "product_id",
+            "final_result",
+            "tile_id",
+            "detector_id",
+            "defect_type",
+            "score",
+            "area",
+            "area_unit",
+        ]
         with path.open("w", encoding="utf-8-sig", newline="") as handle:
             writer = csv.DictWriter(handle, fieldnames=fields)
             writer.writeheader()
             writer.writerows(rows)
+        return path
+
+    @staticmethod
+    def _write_json_report(
+        path: Path,
+        image_name: str,
+        tile_results: list[tuple[str, str]],
+    ) -> Path:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "image_name": image_name,
+            "recipe_name": "RECIPE_A",
+            "machine_id": "AOI_01",
+            "product_id": "PRODUCT_A",
+            "final_result": "NG" if any(result == "NG" for _, result in tile_results) else "PASS",
+            "tiles": [
+                {"tile": {"tile_id": tile_id}, "result": result, "detectors": []}
+                for tile_id, result in tile_results
+            ],
+        }
+        path.write_text(json.dumps(payload), encoding="utf-8")
         return path
 
 

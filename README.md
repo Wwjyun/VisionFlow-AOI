@@ -815,9 +815,9 @@ CUDA 詳細架構及操作請參考 [`gpu/README.md`](gpu/README.md)，完整實
 
 - `tools/export_scatter_plots.py`：從 JSON／CSV 報告匯出散佈圖摘要。
 - `tools/export_matrix_summary.py`：整合多個矩陣 CSV 為彙總報表。
-- `tools/export_tile_defect_distribution.py`：讀取 AOI 輸出 `csv/summary.csv`，產生各 tile 缺陷筆數、受影響圖片數、Detector／缺陷類型分布與網格熱度的離線 HTML 報表。
+- `tools/export_tile_defect_distribution.py`：讀取 AOI 輸出 `csv/summary.csv`，產生內嵌 Plotly、可離線篩選與探索的 HTML 儀表板；內容包含 Tile 缺陷熱圖、Pareto、Detector／缺陷類型組成、圖片排行、位置剖面、面積／score 分布與明細。若同一輸出目錄有 `json/` 完整報告，會另外以 `NG Tile 次數 ÷ Tile 檢測次數` 計算真正的 Tile NG 率熱圖與排行；缺少分母時不推算 NG 率。
 
-三者獨立於主 Pipeline，讓後處理工具可自行演進。
+這些工具獨立於主 Pipeline，讓後處理功能可自行演進。
 
 目前五個獨立工具都有各自的 PyInstaller one-file EXE：
 

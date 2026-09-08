@@ -6,7 +6,7 @@
 - `export_pattern_grid_tiles.py`：使用 Pattern Anchor Grid 批量切圖。
 - `export_matrix_summary.py`：彙整矩陣 CSV。
 - `export_scatter_plots.py`：由 JSON／CSV 匯出散點圖。
-- `export_tile_defect_distribution.py`：由 AOI `csv/summary.csv` 匯出各 tile 缺陷分布 HTML 報表。
+- `export_tile_defect_distribution.py`：由 AOI `csv/summary.csv` 匯出內嵌 Plotly 的互動式 Tile 缺陷分析 HTML；會自動讀取同層 `json/` 作為完整 Tile PASS／NG 分母，沒有 JSON 時仍可分析缺陷貢獻，但不會誤算 Tile NG 率。
 
 從 repository 根目錄使用模組方式執行：
 

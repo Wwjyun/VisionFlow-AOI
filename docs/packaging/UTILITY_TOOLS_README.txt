@@ -17,8 +17,10 @@ VisionFlow AOI 獨立小工具
    從 AOI JSON 或 CSV 報告批次輸出散點圖 PNG。
 
 5. Tile-Defect-Distribution-Exporter.exe
-   讀取 AOI 輸出 csv/summary.csv，輸出各 tile 缺陷筆數、受影響圖片數、
-   Detector／缺陷類型與網格熱度的離線 HTML 報表。
+   讀取 AOI 輸出 csv/summary.csv，輸出內嵌 Plotly、可離線篩選的互動 HTML；
+   包含 Tile 熱圖／Pareto、Detector／缺陷類型、圖片排行、面積／score、明細等分析。
+   若同一輸出資料夾有 json/ 完整報告，會以全部 Tile 檢測為分母計算 Tile NG 率；
+   缺少 json/ 時只呈現 summary.csv 能支持的缺陷貢獻統計，不推算 NG 率。
 
 使用方式
 --------
