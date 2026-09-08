@@ -13,7 +13,7 @@ Primary entry points:
 - Packaged GUI entry/smoke: `gui_launcher.py` and `VisionFlow AOI.exe --smoke-test`
 - Windows package build: `build_exe.ps1` using the tracked `VisionFlow AOI.spec`
 - Traditional-CV tuning reference: `contour_preprocess_tool/` (run with `python -m contour_preprocess_tool`; build the independent EXE with `build_contour_preprocess_tool.ps1`)
-- Standalone utilities: `tools/export_ng_tiles_by_area.py`, `tools/export_pattern_grid_tiles.py`, `tools/export_matrix_summary.py`, and `tools/export_scatter_plots.py`
+- Standalone utilities: `tools/export_ng_tiles_by_area.py`, `tools/export_pattern_grid_tiles.py`, `tools/export_matrix_summary.py`, `tools/export_scatter_plots.py`, and `tools/export_tile_defect_distribution.py`
 - Utility bundle build: `build_utility_tools.ps1`; individual utility builds use their dedicated `build_*_exporter.ps1` or `build_ng_tile_area_tool.ps1` entry point
 - CUDA build: `gpu/build_cuda_dll.ps1`
 - CUDA validation: `gpu/validate_cuda_dll.py`

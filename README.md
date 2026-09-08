@@ -834,10 +834,10 @@ CUDA 詳細架構及操作請參考 [`gpu/README.md`](gpu/README.md)，完整實
 若要建立單一 GitHub Release 資產，可指定語意版本一次重建五支工具並產生合集 ZIP：
 
 ```powershell
-.\build_utility_tools.ps1 -Version 1.0.0
+.\build_utility_tools.ps1 -Version 1.1.0
 ```
 
-輸出為 `release_artifacts\VisionFlow-Utility-Tools-v1.0.0-windows-x64.zip`，內含五支獨立 EXE、`README.txt` 與 `VERSION.txt`。工具合集使用 `utility-tools-vX.Y.Z` Tag，不與主程式 `vX.Y.Z` 或既有 `ng-tile-area-tool-vX.Y.Z` Tag 混用；成品目前未進行程式碼簽章，發佈說明必須明確標示 Windows SmartScreen 可能顯示未知發行者。
+輸出為 `release_artifacts\VisionFlow-Utility-Tools-v1.1.0-windows-x64.zip`，內含五支獨立 EXE、`README.txt` 與 `VERSION.txt`。工具合集使用 `utility-tools-vX.Y.Z` Tag，不與主程式 `vX.Y.Z` 或既有 `ng-tile-area-tool-vX.Y.Z` Tag 混用；成品目前未進行程式碼簽章，發佈說明必須明確標示 Windows SmartScreen 可能顯示未知發行者。
 
 ## 建立 Windows 執行檔
 
