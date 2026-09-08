@@ -10,7 +10,8 @@ $buildScripts = @(
     "build_ng_tile_area_tool.ps1",
     "build_pattern_grid_tile_exporter.ps1",
     "build_matrix_summary_exporter.ps1",
-    "build_scatter_plot_exporter.ps1"
+    "build_scatter_plot_exporter.ps1",
+    "build_tile_defect_distribution_exporter.ps1"
 )
 
 foreach ($buildScript in $buildScripts) {
@@ -48,6 +49,10 @@ $tools = @(
     @{
         Source = "dist\Scatter-Plot-Exporter\export_scatter_plots.exe"
         Name = "Scatter-Plot-Exporter.exe"
+    },
+    @{
+        Source = "dist\Tile-Defect-Distribution-Exporter\export_tile_defect_distribution.exe"
+        Name = "Tile-Defect-Distribution-Exporter.exe"
     }
 )
 

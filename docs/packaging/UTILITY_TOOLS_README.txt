@@ -16,10 +16,14 @@ VisionFlow AOI 獨立小工具
 4. Scatter-Plot-Exporter.exe
    從 AOI JSON 或 CSV 報告批次輸出散點圖 PNG。
 
+5. Tile-Defect-Distribution-Exporter.exe
+   讀取 AOI 輸出 csv/summary.csv，輸出各 tile 缺陷筆數、受影響圖片數、
+   Detector／缺陷類型與網格熱度的離線 HTML 報表。
+
 使用方式
 --------
 
-直接雙擊任一 EXE 可開啟圖形介面。四個工具也保留命令列模式；可在 PowerShell
+直接雙擊任一 EXE 可開啟圖形介面。五個工具也保留命令列模式；可在 PowerShell
 執行「工具檔名.exe --help」查看參數。
 
 相容性與安全

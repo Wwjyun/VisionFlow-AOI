@@ -26,6 +26,10 @@ class UtilityPackagingContractTests(unittest.TestCase):
                 "tools/export_scatter_plots.py",
                 "build_scatter_plot_exporter.ps1",
             ),
+            "Tile Defect Distribution Exporter.spec": (
+                "tools/export_tile_defect_distribution.py",
+                "build_tile_defect_distribution_exporter.ps1",
+            ),
         }
         for spec_name, (entry_point, build_name) in contracts.items():
             with self.subTest(spec=spec_name):
@@ -43,6 +47,7 @@ class UtilityPackagingContractTests(unittest.TestCase):
             "tools/export_pattern_grid_tiles.py",
             "tools/export_matrix_summary.py",
             "tools/export_scatter_plots.py",
+            "tools/export_tile_defect_distribution.py",
         ):
             with self.subTest(entry_point=entry_point):
                 source = (ROOT / entry_point).read_text(encoding="utf-8")
@@ -65,6 +70,7 @@ class UtilityPackagingContractTests(unittest.TestCase):
             "Pattern-Grid-Tile-Exporter.exe",
             "Matrix-Summary-Exporter.exe",
             "Scatter-Plot-Exporter.exe",
+            "Tile-Defect-Distribution-Exporter.exe",
         ):
             self.assertIn(name, build)
         self.assertIn("CPU-only", readme)
