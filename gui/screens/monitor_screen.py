@@ -197,7 +197,7 @@ class MonitorTablePanel(Panel):
                 TableColumn("結果", "final_result"),
                 TableColumn("缺陷", "defect_count", align_right=True),
                 TableColumn("NG", "ng_count", align_right=True),
-                TableColumn("耗時", "duration_sec", formatter=_format_duration, align_right=True),
+                TableColumn("端到端耗時", "duration_sec", formatter=_format_duration, align_right=True),
             ]
         )
         self.proxy = StatusFilterProxyModel(parent=self)

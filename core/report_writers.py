@@ -137,9 +137,14 @@ class JsonReportWriter:
 
     def write(self, context: ReportWriteContext) -> None:
         if context.profiler is not None:
-            context.result.setdefault("execution", {})[
-                "performance"
-            ] = context.profiler.snapshot()
+            performance = context.profiler.snapshot()
+            context.result.setdefault("execution", {})["performance"] = performance
+            # JSON is deliberately the final writer.  This timestamp therefore
+            # includes every earlier report artifact (overlay, NG tiles and CSVs)
+            # and is the closest durable value to the pipeline's final duration.
+            context.result["duration_sec"] = round(
+                float(performance.get("end_to_end_sec", 0.0) or 0.0), 3
+            )
         path = context.paths.json / f"{context.base_name}.json"
         with path.open("w", encoding="utf-8") as handle:
             json.dump(

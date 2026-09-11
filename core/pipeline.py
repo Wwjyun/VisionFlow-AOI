@@ -208,6 +208,10 @@ class AOIPipeline(LogMixin):
         with profiler.measure("reporting_total"):
             outputs = Reporter(self.output_dir, recipe["output"], profiler=profiler).write(image, result)
         serializable_result["outputs"] = outputs
+        # InspectionResultAssembler runs before report artifacts are written.  The
+        # public duration is end-to-end, so finalize it only after overlay/CSV/JSON
+        # writers have returned instead of exposing the pre-reporting timestamp.
+        serializable_result["duration_sec"] = round(time.perf_counter() - started, 3)
         serializable_result["execution"]["ai"] = self.detector_manager.ai_performance_stats()
         serializable_result["execution"]["gpu"]["metrics"] = gpu_runtime.performance_stats()
         serializable_result["execution"]["performance"] = profiler.snapshot()

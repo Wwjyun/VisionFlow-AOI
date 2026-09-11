@@ -644,6 +644,7 @@ Worker 預設為 `min(8, CPU 核數, 影像數)`；可用 `AOI_BATCH_WORKERS` �
 5. 結果顯示在監控表格與散佈圖。
 
 監控預設每秒輪詢一次，需連續通過 2 次穩定檢查；若設定移動資料夾，會保留子資料夾結構並處理同名衝突。
+監控表格的「耗時」是每張影像的端到端時間：從檔案建立時間可落在前後兩次輪詢區間時的到達點（否則採首次觀測），包含輪詢發現、穩定檢查、等待前序影像、檢測、overlay／CSV／JSON 等報告寫檔、結果整理，以及處理後原圖搬移完成。逐圖資料的 `timing` 另提供 `discovery_and_stability_wait_sec`、`queue_wait_sec`、`pipeline_and_reports_sec`、`processed_image_move_sec` 與 `end_to_end_sec` 分項；因此它會高於只看 Detector 或 Pipeline 前段的時間。
 
 ## 輸出內容
 

@@ -31,6 +31,7 @@ class MonitorImageResult:
     duration_sec: float
     outputs: dict
     detail: dict
+    timing: dict
     source_image_path: Path | None = None
     moved_image_path: Path | None = None
     error: str = ""
@@ -46,6 +47,7 @@ class MonitorImageResult:
             "duration_sec": self.duration_sec,
             "outputs": dict(self.outputs),
             "detail": dict(self.detail),
+            "timing": dict(self.timing),
             "error": self.error,
         }
         if self.source_image_path is not None:
@@ -84,6 +86,10 @@ class FolderMonitorProcessor(LogMixin):
         self._seen: set[Path] = set()
         self._pending: list[Path] = []
         self._file_states: dict[Path, tuple[int, int, int]] = {}
+        self._observed_at: dict[Path, float] = {}
+        self._ready_at: dict[Path, float] = {}
+        self._last_scan_wall = time.time()
+        self._last_scan_monotonic = time.perf_counter()
         self._processed_count = 0
 
     def run(self) -> dict:
@@ -96,6 +102,8 @@ class FolderMonitorProcessor(LogMixin):
         monitor_output_dir = self.output_dir / "monitor" / started_at.strftime("%Y%m%d_%H%M%S")
         monitor_output_dir.mkdir(parents=True, exist_ok=True)
         self._seen = set(self._discover_images())
+        self._last_scan_wall = time.time()
+        self._last_scan_monotonic = time.perf_counter()
         self.logger.info(
             "Folder monitor started: input=%s recipe=%s output=%s initial_seen=%s",
             self.input_dir,
@@ -110,7 +118,15 @@ class FolderMonitorProcessor(LogMixin):
                 self._enqueue_new_stable_images()
                 while self._pending and not self._should_stop():
                     image_path = self._pending.pop(0)
-                    result = self._process_image(image_path, monitor_output_dir, gpu_session)
+                    observed_at = self._observed_at.pop(image_path, None)
+                    ready_at = self._ready_at.pop(image_path, None)
+                    result = self._process_image(
+                        image_path,
+                        monitor_output_dir,
+                        gpu_session,
+                        observed_at=observed_at,
+                        ready_at=ready_at,
+                    )
                     self._processed_count += 1
                     if self.item_callback is not None:
                         self.item_callback(result.to_dict())
@@ -132,24 +148,40 @@ class FolderMonitorProcessor(LogMixin):
         return summary
 
     def _enqueue_new_stable_images(self) -> None:
+        scan_wall = time.time()
+        scan_monotonic = time.perf_counter()
         for image_path in self._discover_images():
             if image_path in self._seen or image_path in self._pending:
                 continue
+            if image_path not in self._observed_at:
+                self._observed_at[image_path] = self._estimate_arrival_monotonic(
+                    image_path, scan_wall, scan_monotonic
+                )
             if not self._is_stable(image_path):
                 continue
             self._seen.add(image_path)
             self._file_states.pop(image_path, None)
             self._pending.append(image_path)
+            self._ready_at[image_path] = scan_monotonic
             self.logger.info("Monitor queued image: %s", image_path)
             self._progress(5, f"已排入 {image_path.name}")
+        self._last_scan_wall = scan_wall
+        self._last_scan_monotonic = scan_monotonic
 
     def _process_image(
         self,
         image_path: Path,
         monitor_output_dir: Path,
         gpu_session: GpuExecutionSession,
+        observed_at: float | None = None,
+        ready_at: float | None = None,
     ) -> MonitorImageResult:
         result: dict | None = None
+        processing_started = time.perf_counter()
+        end_to_end_started = processing_started if observed_at is None else observed_at
+        processing_ready = processing_started if ready_at is None else ready_at
+        pipeline_duration = 0.0
+        move_duration = 0.0
         try:
             self.logger.info("Monitor image started: image=%s", image_path)
             pipeline = AOIPipeline(
@@ -160,39 +192,104 @@ class FolderMonitorProcessor(LogMixin):
                 progress_callback=lambda pct, msg: self._progress(pct, f"{image_path.name}: {msg}"),
             )
             result = pipeline.run(image_path)
+            pipeline_duration = float(result.get("duration_sec", 0) or 0)
             summary = result.get("summary", {})
             compact_detail = compact_inspection_result(result)
+            move_started = time.perf_counter()
             moved_path = self._move_processed_image(image_path)
+            move_duration = time.perf_counter() - move_started
             current_image_path = moved_path or image_path
+            finished = time.perf_counter()
+            timing = self._monitor_timing(
+                end_to_end_started,
+                processing_ready,
+                processing_started,
+                finished,
+                pipeline_duration,
+                move_duration,
+            )
+            self.logger.info("Monitor image timing: image=%s timing=%s", image_path, timing)
             return MonitorImageResult(
                 image_path=current_image_path,
                 final_result=str(result.get("final_result", "-")),
                 defect_count=int(summary.get("defect_count", 0)),
                 ng_count=int(summary.get("ng_count", 0)),
                 tile_count=int(summary.get("tile_count", 0)),
-                duration_sec=float(result.get("duration_sec", 0) or 0),
+                duration_sec=timing["end_to_end_sec"],
                 outputs=result.get("outputs", {}),
                 detail=compact_detail,
+                timing=timing,
                 source_image_path=image_path,
                 moved_image_path=moved_path,
             )
         except Exception as exc:
             self.logger.exception("Monitor image failed: image=%s", image_path)
+            finished = time.perf_counter()
+            timing = self._monitor_timing(
+                end_to_end_started,
+                processing_ready,
+                processing_started,
+                finished,
+                pipeline_duration,
+                move_duration,
+            )
             return MonitorImageResult(
                 image_path=image_path,
                 final_result="ERROR",
                 defect_count=0,
                 ng_count=0,
                 tile_count=0,
-                duration_sec=0.0,
+                duration_sec=timing["end_to_end_sec"],
                 outputs={},
                 detail={},
+                timing=timing,
                 source_image_path=image_path,
                 error=str(exc),
             )
         finally:
             result = None
             gc.collect(0)
+
+    def _estimate_arrival_monotonic(
+        self,
+        image_path: Path,
+        scan_wall: float,
+        scan_monotonic: float,
+    ) -> float:
+        """Map a new file's birth time into the monotonic clock when available.
+
+        Windows exposes creation time through ``st_birthtime`` on newer Python
+        versions and ``st_ctime`` on older versions.  We only trust it when it
+        falls inside the interval since the preceding scan; atomic moves may
+        preserve an older creation time and safely fall back to first observation.
+        """
+        try:
+            stat = image_path.stat()
+            birth_wall = float(getattr(stat, "st_birthtime", stat.st_ctime))
+        except (OSError, TypeError, ValueError):
+            return scan_monotonic
+        if self._last_scan_wall <= birth_wall <= scan_wall:
+            return max(self._last_scan_monotonic, scan_monotonic - (scan_wall - birth_wall))
+        return scan_monotonic
+
+    @staticmethod
+    def _monitor_timing(
+        end_to_end_started: float,
+        processing_ready: float,
+        processing_started: float,
+        finished: float,
+        pipeline_duration: float,
+        move_duration: float,
+    ) -> dict[str, float]:
+        return {
+            "discovery_and_stability_wait_sec": round(
+                max(0.0, processing_ready - end_to_end_started), 6
+            ),
+            "queue_wait_sec": round(max(0.0, processing_started - processing_ready), 6),
+            "pipeline_and_reports_sec": round(max(0.0, pipeline_duration), 6),
+            "processed_image_move_sec": round(max(0.0, move_duration), 6),
+            "end_to_end_sec": round(max(0.0, finished - end_to_end_started), 3),
+        }
 
     def _move_processed_image(self, image_path: Path) -> Path | None:
         if self.processed_move_dir is None:
