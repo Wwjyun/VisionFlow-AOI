@@ -5,9 +5,13 @@ the label numbering, the per-label stats and the centroids all match, including 
 
 ``connectivity=8`` is equivalent in the component count, the pixel sets and the per-component
 stats, but **not in the label numbering**: OpenCV labels 8-connectivity with the Bolelli 2x2 block
-scan, which creates provisional labels per block corner instead of per pixel.  Until that scan is
-reproduced, this reference must not be used as the golden standard for an 8-connectivity
-replacement.
+scan, which creates provisional labels per block corner instead of per pixel.  The numbering rule
+below is already OpenCV's and is applied correctly - what is missing is only the order in which the
+block scan creates provisional labels.  Measured on random masks, the difference shows up as whole
+runs of labels shifted by one (for example cv2 label 2 -> reference 9 and cv2 3..8 -> reference
+2..7), which is exactly the signature of the same numbering rule fed with a different provisional
+order.  Until that scan is reproduced, this reference must not be used as the golden standard for an
+8-connectivity replacement; 4-connectivity is fully equivalent and can be used.
 
 The numbering rule itself is reproduced faithfully and documented in ``_numbering`` below.
 

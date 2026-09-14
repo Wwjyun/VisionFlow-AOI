@@ -385,11 +385,22 @@ float32 累加、OpenCV 的 kernel 係數）與 `vf_gaussian_blur_f32_roi`，並
   最小優先權」為 key、再依名次配號，**row-major 與 column-major 兩種區塊順序都是 0/6 隨機遮罩相符**
   （4 連通同樣 0/6，因為 4 連通的正確順序本來就是 pixel raster，不是區塊順序）。故 8 連通的編號
   不能以「區塊優先權」近似，必須忠實模擬 Bolelli 掃描中 provisional 標籤的實際建立與合併順序。
-- 另已由原始碼確認 8 連通是**逐欄成對**處理（`c` 每次前進 2，`img_labels_row[c]` 與 `[c+1]` 同時寫入，
-  條件為 `CONDITION_O/P` 等），且首列／末列／單列各有專屬的 goto-DAG（
-  `ccl_bolelli_forest_{singleline,firstline,lastline,}.inc.hpp`，由 GRAPHGEN 產生）。
-  **忠實移植的成本與風險都高**（goto-DAG 狀態機、3 個森林檔、需與 cv2 逐位元比對），
-  因此本輪不進行；已改派的替代路線是先把 4 連通（已完全等價）當作可用的黃金標準。
+
+**2026-09-15 新增的兩項確認（把剩餘不確定性再收窄）：**
+1. **OpenCV 的 8 連通編號在本機是跨執行緒數決定性的**（600×800 隨機遮罩、3733 個 component）：
+   預設（16 執行緒）連續 5 次結果相同，且 `cv2.setNumThreads` 設為 1／2／4／8 以及重設回 auto
+   的 label map 全部相同。因此這**不是**平行分條造成的不可重現行為，而是可複製的決定性演算法——
+   剩下的純粹是「忠實移植成本」而非「本質上做不到」。
+2. **「最小 provisional 標籤的名次」配號規則本身是正確的**：把該規則套用在**以 pixel raster 順序
+   建立的 provisional 標籤**上仍與 cv2 不符（27 個 component 中 15 個不同），但差異的**結構**
+   證實了規則：cv2↔參考的對應是「同一段連續編號整體位移」（例如 cv2 label 2→9、3→2、4→3、5→4、
+   6→5、7→6、8→7），即**編號序列相同、只是 provisional 標籤的產生順序不同**。
+   結論：`flattenL` 的配號規則不必再研究；缺的只有「OpenCV 8 連通 Bolelli 掃描建立 provisional
+   標籤的順序」。另外由 OpenCV 原始碼確認該掃描是**逐欄成對**（`c` 每次前進 2、同時寫入
+   `img_labels_row[c]` 與 `[c+1]`），且首列／末列／單列各有 GRAPHGEN 產生的專屬 goto-DAG
+   （`ccl_bolelli_forest_{singleline,firstline,lastline,}.inc.hpp`）。
+   **忠實移植的成本與風險都高**（goto-DAG 狀態機、3 個森林檔、須與 cv2 逐位元比對），
+   因此本輪不進行；目前可用且已完全等價的黃金標準是 **4 連通**。
 
 **標籤編號是否真的會影響 202 的最終輸出：會，已實測確認。** 新增 `tools/cnr_label_order_impact.py`：
 在一個會產生**精確 CNR 平手**的場景（49 個完全相同缺陷的規則網格；49 個候選、7 個相異 CNR、
@@ -738,6 +749,8 @@ vs 原本 `[255,255,20,20]`）。因此「標籤編號順序」對 202 的最終
 - [ ] 加速不得犧牲 GUI 回應、打包啟動、結果追溯、錯誤訊息或 CPU fallback。
 
 ## 完成紀錄
+
+- [x] 2026-09-15：把 connected components 8 連通缺口的剩餘不確定性再收窄到「只缺移植」，並翻新過時的說明文字。兩項新確認：（1）**OpenCV 的 8 連通編號在本機是跨執行緒數決定性的**——600×800 隨機遮罩（3733 個 component）在預設 16 執行緒下連續 5 次結果相同，且 `cv2.setNumThreads(1/2/4/8)` 與重設回 auto 的 label map 全部相同；因此差異**不是**平行分條造成的不可重現行為，而是可複製的決定性演算法，剩餘成本是「忠實移植」而非「本質上做不到」。（2）**確認 `flattenL` 的「最小 provisional 標籤名次」配號規則本身正確**：把該規則套用在以 pixel raster 順序建立的 provisional 標籤上仍與 cv2 不符（27 個 component 中 15 個不同），但差異結構證實了規則——對應關係是「同一段連續編號整體位移」（cv2 label 2→9、3→2、4→3…8→7），即**編號序列相同、只有 provisional 標籤的產生順序不同**。因此配號規則不必再研究，缺的只有 Bolelli 掃描建立 provisional 標籤的順序（逐欄成對、首列／末列／單列各有 GRAPHGEN 的 goto-DAG 森林檔）。同步翻新 `tools/connected_components_reference.py` 的模組說明與 Todo 缺口段落，移除「規則尚未確定」的過時措辭，改為精確描述（4 連通完全等價、8 連通只缺掃描順序），避免後續誤解缺口範圍。未修改產線程式；414 tests OK 不受影響。
 
 - [x] 2026-09-15：依使用者決定，**保留 GPU Gaussian 接線並把語意差異寫進報表本身**（不只寫在文件）。`Detector202_1._background_blur` 現在同時回傳背景與產生它的 backend，`_automatic_cnr_mask` 回報 `background_backend`，每個缺陷 metadata 新增兩個欄位：`background_backend`（`opencv_cpu`／`cuda_f32`）與 `background_precision_note`（明文說明 `cuda_f32` 下四個殘差衍生診斷值有約 1e-5 尾位差異、候選遮罩與 PASS/NG 判定不受影響）。**如此看 CSV/JSON 的人不需重跑即可分辨兩條路徑**，符合 AGENT.md「必須回報實際 device/host 分割、不得靜默替換」的要求。新增測試 `test_reported_metadata_names_the_background_backend`（同時驗證 `_automatic_cnr_mask` 與最終 defect metadata 的 CPU／CUDA 值）。同步更新 `README.md`（新增 202 CNR 的 GPU 段落，說明 median 逐位元相同、Gaussian 為數學等價、四個診斷值尾位差異、以及需要逐位元時請用 `gpu.mode: cpu`）與 `gpu/README.md`（把 Gaussian 從「未接入」改為「已接入」，補上等價數據、語意差異、`background_backend` 揭露與 1.31× 量測）。全套 **414 tests OK**、compileall exit 0。
 
