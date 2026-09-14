@@ -300,6 +300,29 @@
 OpenCV 對 float32 的邊界處理（BORDER_DEFAULT＝reflect101）與 separable 卷積順序，
 必須先做逐像素等價驗證才可使用。
 
+**第二十三次嘗試（2026-09-14）：device 端 float32 Gaussian 背景的等價性與容差研究。**
+
+目的：202 的 `cv2.GaussianBlur(float32, (51,51), 0.0)` 目前只在 CPU，導致 residual 無法留在
+device（median 需上傳 32 MB、遮罩又要來回）。要搬到 device 必須先確認可等價。
+
+已驗證（`outputs_validation/cnr_profile/gaussian_tolerance_impact.txt` 與探測腳本）：
+- **sigma 規則**：ksize=51 時 OpenCV 等效 sigma＝8.0（＝`0.3*((k-1)*0.5-1)+0.8`），
+  以該式產生的 kernel 與 `cv2.getGaussianKernel(51, 0, CV_64F)` 最大差 1.4e-17、和為 1.0。
+  但 **ksize=3 時不符**（差 2.2e-2），代表 OpenCV 對極小 kernel 另有規則；目前產線用 ksize=51，暫不影響，
+  實作時必須對 ksize 設限或逐尺寸驗證。
+- **可分離＋reflect101 邊界**：與 `cv2.GaussianBlur` 的浮點計算**不是逐位相同**，
+  最大絕對差 4.6e-5、平均 1.0e-5；float32 或 float64 中間累加對此差異幾乎沒有影響，
+  使用 CV_32F kernel 亦同。因此 device 版必須以「容差」而非「逐位」契約把關。
+- **容差對最終判定的影響**：以可分離實作取代 202 的 Gaussian 背景（其餘完全不變），
+  5 個合成場景（1024×768、8～19 個缺陷）的 **PASS/NG、缺陷數、bbox、area、confidence、metadata 全部相同**，
+  `final-output identical: 5/5`。這是容差契約的第一份證據，但**樣本仍小**：
+  正式啟用前必須擴大場景數與缺陷尺寸分布，並涵蓋臨界面積／CNR 邊界附近的案例。
+
+尚未實作 CUDA kernel。下一步若要落地，須新增 `vf_gaussian_blur_f32`（separable、reflect101、
+float32 累加、OpenCV 的 kernel 係數）與 `vf_gaussian_blur_f32_roi`，並加：
+（1）浮點背景的等價測試（記錄容差與最大差），（2）202 端到端 PASS/NG 與缺陷欄位等價矩陣，
+（3）啟用後量測是否真的省下 median 的 H2D 與遮罩來回。
+
 **可平行推進、不依賴上述卡點的項目：**
 1. 202-CS-SN-1 其餘步驟（**不含 median，已於本輪完成**）：Gaussian 背景、遮罩、connected components
    標籤順序、component 幾何、ring CNR 統計的黃金參考與等價測試。
