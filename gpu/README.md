@@ -53,15 +53,19 @@ plan，tile metadata 以 `cpu_crossover` 路線與 `preprocess_routes` 標示。
   `RETR_EXTERNAL` 13.83→1234.75（0.01×）。**沒有任何形狀勝出，故不訂啟用界線、維持停用**；
   此結論已更正先前的錯誤記載，日後若要重啟需先提出新的演算法（例如 tile 化後只下載輪廓點，
   而非整張 label 影像）。
-- `vf_median_f32`（float32 精確中位數，供 202-CS-SN-1 的 median／MAD 使用）：**已接入
-  `detectors/detector_202_1.py` 的 `_exact_median`**（`gpu.mode: cuda`／支援時才走 GPU，
-  否則整個呼叫回 `np.median`）。除以 float32 轉 monotone uint32 key 後用
-  `cub::DeviceRadixSort` 排序、只讀回中間 1～2 個 key，再於 host 以 float32 平均，
-  因此與 `np.median(float32)` **位元相同**：34/34 案例一致（其中 32 個連排序後的中間值
-  圖樣也相同）、NaN 6/6、不改動輸入、決定性。4M float32 為 GPU 2.92～6.53 ms、
-  CPU 34.5～36.3 ms（**5.6～11.8×**）；202 端到端 PASS/NG、缺陷數、bbox、area、
-  confidence、metadata **完全相同**，305.5 → 188.2 ms（**1.62×**）。median 未接線前
-  約佔該 Detector 75% 時間，是該 Detector GPU 化的首要目標，現已完成。
+- `vf_cnr_mask_f32`（residual 門檻與候選遮罩一次算完）：**已接入** `detectors/detector_202_1.py`
+  的 `_residual_statistics`。它把 `residual` 與 `|residual − median|` 都建在 device 上，用與
+  `vf_median_f32` 相同的 key／排序機制取兩個中位數、以 double 算門檻、再以 **float32** 比較
+  （NumPy 拿 float32 陣列比 Python float 時會把純量窄化，所以比較必須在 float32），
+  只回傳 3 個純量與一張 uint8 遮罩，因此這兩個運算元**不會**再各自上傳一次。
+  **等價是精確的**：623 個案例中 `residual_median`／`mad` **逐位元相同**、
+  `threshold` **double 完全相等**、遮罩**逐位元組相同**，零不符、零差異像素；
+  決定性、不改動輸入，16 種非法參數全部拒絕且不留下痕跡。
+  驗收工具含一個**門檻進位探針**：證明若比較寫成 double 會得到 4 個亮點而正確答案是 2 個。
+  **效果**：2000×12000 ROI 由 271.7 ms 降到 **41.5 ms**（含 183.1 MiB H2D／22.9 MiB D2H）；
+  接線後 202 的 `automatic_cnr_mask` 由 528.3 降到 **471.8 ms**，產線形狀端到端 **1.26×**，
+  且 decision-bearing 欄位完全相同。報表另以 `metadata.residual_backend`
+  （`numpy_cpu`／`cuda_f32`）標示這一段走哪條路。
 - `vf_gaussian_blur_f32` / `vf_gaussian_blur_f32_roi`（float32 Gaussian，供 202-CS-SN-1 的
   CNR 背景）：**已接入** `detectors/detector_202_1.py` 的 `_background_blur`，需同時具備
   `supports_gaussian_blur_f32` 與 `supports_gaussian_f32_sigma`；缺 export、舊版 DLL 或任何
