@@ -160,7 +160,7 @@
 - [x] 新增 batch ROI API，以座標陣列產生連續 device buffers。
 - [x] 新增 `run_batch(images/rois)` 或等價 detector batch 介面；CPU 預設實作可逐張執行。
 - [x] 依影像尺寸與可用 VRAM 自動選 batch size，配置失敗時自動縮小批次且不留下 stale handle。
-- [ ] RTX 3090 實機測試 8、16、32、64 ROI batch 的正確性、效能與 VRAM 平台。
+- [x] RTX 3090 實機測試 8、16、32、64 ROI batch 的正確性、效能與 VRAM 平台。（2026-09-14 以 `validate_cuda_dll.py --roi-batch-matrix` 完成；ROI batch API 目前未用於正式 Pipeline，Detector 仍逐 tile 使用 resident ROI plan）
 - [x] 單張 GUI 採低延遲策略；資料夾、monitor、batch 採高吞吐策略。
 - [x] 使用 bounded 單一 GPU queue，避免多個 CPU workers 同時搶 GPU 或無限制累積 VRAM。
 - [ ] 評估 pinned host memory 與 CUDA streams，量測 upload/kernel/download 重疊收益。
@@ -415,6 +415,8 @@
 - [ ] 加速不得犧牲 GUI 回應、打包啟動、結果追溯、錯誤訊息或 CPU fallback。
 
 ## 完成紀錄
+
+- [x] 2026-09-14：完成 RTX 3090 ROI batch 8／16／32／64 實機驗收。`validate_cuda_dll.py` 新增 `--roi-batch-matrix`：在 16384×13000 隨機 BGR resident 原圖上，以 256²／512²／1024² ROI 各建立 batch 8／16／32／64（各 5 次），首輪逐 ROI 全像素比對 NumPy 切片全部相同。建立（gather kernel＋同步）median：256² 0.35→1.16 ms、512² 0.59→2.42 ms、1024² 1.41→6.80 ms；逐張下載全部 ROI 1024²×64 為 59.3 ms，時間大致隨總位元組線性成長。批次存在期間 device 使用量約等於 batch bytes（1024²×64 為 194 MiB），關閉後回收至原水位（僅首例 2 MiB 驅動顆粒差異，其餘 0），無 VRAM 持續成長；`recommended_roi_batch_size` 對 256²～1024² 建議 64。另以 66 個 2000×12000 ROI（一次約 4.8 GiB）呼叫 `iter_roi_batches`，依可用記憶體建議 8 並分為 8×8＋2，最後一張 ROI 像素正確、未遺漏且不留 native handle。完整 validator、353 tests、compileall、CUDA preflight 與 `git diff --check` 通過；未修改 runtime、CUDA source／ABI／DLL，ROI batch API 仍未用於正式 Pipeline。
 
 - [x] 2026-09-14：完成 CUDA 可分離／合併有效 kernel 形態學原型比較，決定不採用。先以 Python 驗證 OpenCV 矩形 kernel 重複 `iterations` 次等同單一半徑 `(kernel/2)×iterations` 的矩形，且可拆成水平與垂直一維 min／max（邊界視為 erode 255／dilate 0）：240 組（含 1×40、5×7 等極小圖、1／3 通道、灰階／二值、open／close／erode／dilate、k3～7、iterations 1～10）與 `cv2.morphologyEx` 逐像素相同。CUDA 原型以 van Herk／Gil-Werman block 前後綴 min／max 實作一維 pass（每趟 2 次 launch、每像素存取次數與半徑無關），open 5×5×10 由 20 趟改為 4 趟。RTX 3090 同一程序與舊 DLL 交錯 A/B 各 6 輪、resident ROI 路徑，所有輸出與 CPU 相同，但效能：(1) interleaved 3 通道版本在 2000×12000 BGR k5×10 由 18.3 ms 變 42 ms；(2) 將通道放入 grid z 維度更慢（86 ms）；(3) 逐通道拆平面版本與現行持平（21.0 vs 21.2 ms，完整 401-AS-SN-1 plan 22.7 vs 22.4 ms，僅 3/6 勝）。收益只出現在單通道大半徑（2000×12000 k5×10 9.8→6.5 ms、512² 0.22→0.11 ms）與 3 通道 k7×4（37.3→14.7 ms）、k3×8（17.4→12.7 ms），而 k≤5 且 iterations≤2 在各尺寸都變慢（例如 2000×12000 3 通道 k3×1 1.6→7.4 ms）。正式 Recipe 只有 NEGATIVE 的 BGR open 5×5×10 與 203 的 open 3×1 使用形態學，均無收益，因此還原 CUDA source、重編 DLL 並通過 native smoke，保留現行 5×5 shared-memory kernel；原型 diff 與 A/B JSON 僅存於本機 `outputs_validation/morph_prototype/`。本次未改變 runtime、ABI 或 DLL 行為。
 

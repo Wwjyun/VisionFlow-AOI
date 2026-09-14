@@ -91,6 +91,10 @@ validator 或 profiler。
   --json-output outputs_validation\rtx3090_benchmark.json
 ```
 
+`--roi-batch-matrix` 在 16384×13000 resident 原圖上以 256²／512²／1024² ROI 測 batch
+8／16／32／64 的全像素正確性、建立與下載時間及 VRAM 回收，並以 66 個 2000×12000 ROI 驗證依可用
+記憶體自動分批。
+
 `--resize-area-pipeline` 以正式 `PRODUCT_A_CIRCLE_401_1_AOI_01.yaml` 在多個
 `process_scale` 下比對合成 PASS／NG 圖的完整 CPU/GPU Pipeline。
 

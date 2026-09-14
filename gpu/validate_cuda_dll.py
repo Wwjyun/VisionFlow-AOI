@@ -72,6 +72,10 @@ def parse_args() -> argparse.Namespace:
         help="Profile detector-401-style morphology iterations and native CUDA event share.",
     )
     parser.add_argument(
+        "--roi-batch-matrix", action="store_true",
+        help="Validate 8/16/32/64 ROI batches of production-sized ROIs on a 16384x13000 resident image.",
+    )
+    parser.add_argument(
         "--resize-area-pipeline", action="store_true",
         help="Compare full CPU/GPU pipelines of the 401-CS-AP-1 production recipe across process_scale values.",
     )
@@ -551,6 +555,68 @@ def validate_primitives(runtime: GpuRuntime) -> list[dict]:
         print("SKIP resident image/ROI routing: optional exports unavailable")
     metrics.extend(validate_context_reuse_matrix(runtime))
     return metrics
+
+
+def validate_roi_batch_matrix(runtime: GpuRuntime, repetitions: int = 5) -> dict:
+    """Production-sized ROI batches: every pixel, timing, VRAM plateau and OOM downshift."""
+    if not runtime.supports_roi_batch:
+        print(f"SKIP ROI batch matrix: {runtime.native_plan_unavailable_reason or 'ROI batch exports unavailable'}")
+        return {}
+    rng = np.random.default_rng(20260916)
+    image = rng.integers(0, 256, (13000, 16384, 3), dtype=np.uint8)
+    resident = runtime.upload_image(image)
+    report = {"image_shape": list(image.shape), "repetitions": repetitions, "cases": []}
+    for side in (256, 512, 1024):
+        coordinates = [
+            (x, y, side, side)
+            for y in range(0, 13000 - side + 1, 1200)
+            for x in range(0, 16384 - side + 1, 997)
+        ][:64]
+        recommended = runtime.recommended_roi_batch_size(side, side, 3)
+        for batch_size in (8, 16, 32, 64):
+            regions = coordinates[:batch_size]
+            memory_before = runtime.memory_info()["free_bytes"]
+            create_ms, download_ms, free_during = [], [], []
+            for repetition in range(repetitions):
+                started = time.perf_counter()
+                with runtime.create_roi_batch(resident, regions) as batch:
+                    created = time.perf_counter()
+                    free_during.append(runtime.memory_info()["free_bytes"])
+                    for index, (x, y, width, height) in enumerate(regions):
+                        roi = batch.download(index)
+                        if repetition == 0 and not np.array_equal(roi, image[y:y + height, x:x + width]):
+                            raise AssertionError(f"ROI batch {side}px x{batch_size} index {index} differs")
+                    download_ms.append((time.perf_counter() - created) * 1000.0)
+                create_ms.append((created - started) * 1000.0)
+            memory_after = runtime.memory_info()["free_bytes"]
+            case = {
+                "roi": [side, side], "batch_size": batch_size, "recommended_batch_size": recommended,
+                "batch_bytes": side * side * 3 * batch_size,
+                "create_median_ms": round(statistics.median(create_ms), 3),
+                "download_all_median_ms": round(statistics.median(download_ms), 3),
+                "device_bytes_in_use_during_batch": int(memory_before - min(free_during)),
+                "device_bytes_retained_after_close": int(memory_before - memory_after),
+            }
+            if case["device_bytes_retained_after_close"] > 64 * 1024 * 1024:
+                raise AssertionError(f"ROI batch memory did not return to its plateau: {case}")
+            report["cases"].append(case)
+            print(f"PASS roi_batch_matrix: {case}")
+    large = [(192 + index * 2800, 500, 2000, 12000) for index in range(6)] * 11  # 66 ROIs, about 4.8 GiB at once
+    batches = []
+    for batch in runtime.iter_roi_batches(resident, large, candidates=(8, 16, 32, 64)):
+        x, y, width, height = large[batch.offset + batch.count - 1]
+        if not np.array_equal(batch.download(batch.count - 1), image[y:y + height, x:x + width]):
+            raise AssertionError("large ROI batch download differs")
+        batches.append(batch.count)
+    report["large_roi_batches"] = {
+        "roi": [2000, 12000], "roi_count": len(large), "batch_counts": batches,
+        "recommended_batch_size": runtime.recommended_roi_batch_size(2000, 12000, 3),
+        "registered_batches_after": len(runtime._roi_batches),
+    }
+    if sum(batches) != len(large) or runtime._roi_batches:
+        raise AssertionError(f"large ROI batch iteration lost ROIs or handles: {report['large_roi_batches']}")
+    print(f"PASS roi_batch_large: {report['large_roi_batches']}")
+    return report
 
 
 def _timing_summary(operation, repetitions: int, warmup: int) -> dict:
@@ -1111,6 +1177,7 @@ def main() -> int:
     )
     if args.image and args.recipe:
         validate_pipeline(Path(args.image), Path(args.recipe), str(runtime.dll_path))
+    roi_batch_matrix = validate_roi_batch_matrix(runtime) if args.roi_batch_matrix else {}
     resize_area_pipeline = (
         validate_resize_area_recipe_sweep(str(runtime.dll_path)) if args.resize_area_pipeline else []
     )
@@ -1132,6 +1199,7 @@ def main() -> int:
                     "stress": stress_result,
                     "production": production_results,
                     "resize_area_pipeline": resize_area_pipeline,
+                    "roi_batch_matrix": roi_batch_matrix,
                     "gpu_metrics": runtime.performance_stats(),
                 },
                 ensure_ascii=False,
