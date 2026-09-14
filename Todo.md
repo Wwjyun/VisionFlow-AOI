@@ -254,6 +254,33 @@
   host 端 float32 取平均），需要 `/Zc:preprocessor` 旗標且須重跑既有全部 GPU 證據。
 - 此卡點**不阻擋** CNR 其他步驟（Gaussian 背景、遮罩、幾何、ring CNR 統計）以 CPU 參考先建立黃金標準並驗證。
 
+**第二十一次嘗試（2026-09-14）：median 完成後重測 CNR 剩餘階段，決定下一個目標。**
+
+2000×4000 ROI、合成 24 個嵌入缺陷、median 已走 GPU 的實測（`outputs_validation/cnr_profile/cnr_stage_profile.txt`）：
+
+| 階段 | 耗時 |
+| --- | --- |
+| `cv2.GaussianBlur`(float32, kernel=51) | 16.3 ms |
+| GPU 精確 median（單次呼叫，含 H2D） | 6.2 ms |
+| candidate mask 建立（`abs(residual-med) > threshold` 相乘） | **33.0 ms** |
+| morphology open (3×3, 1) | 7.4 ms |
+| `cv2.connectedComponentsWithStats` | 13.4 ms（89 labels） |
+| `_collect_candidates`（每 component 的幾何＋ring CNR） | 19.0 ms（88 candidates） |
+| 完整 `detector.run()` | 177.0 ms |
+
+解讀：
+- median 已不再是瓶頸（單次 6.2 ms，其中約 5.4 ms 是 32 MB pageable H2D，kernel 僅約 0.9 ms）；
+  MAD 需再呼叫一次，故 median 總計約 12～18 ms。
+- **最大的單一可 GPU 化目標是 33.0 ms 的 candidate mask 建立**：它是逐像素的
+  `abs(residual - median) > threshold` 再乘 `candidate_max_value`，而 `residual` 目前只存在 CPU
+  （由 `cv2.GaussianBlur` 產生），所以除了 median 之外還要把它上傳一次。
+  若把 Gaussian 背景與整個遮罩鏈都搬到 device（residual 留在 device，median 直接吃 device 指標），
+  可同時省下 median 的 H2D 與遮罩的來回，這是下一個真正有收益的方向。
+- `connectedComponentsWithStats`（13.4 ms）與 `_collect_candidates`（19.0 ms）合計約 32 ms、
+  佔比可觀但需要新的 GPU 實作（label 順序必須與 OpenCV 完全相同），工程量較大。
+- 177 ms 與上列各階段相加之差（約 80 ms）落在 detector 內未被單獨計時的部分
+  （MAD 的 abs 運算、inclusion mask、逐 component CNR 迴圈的重複切片等），需再細分才可歸因。
+
 **可平行推進、不依賴上述卡點的項目：**
 1. 202-CS-SN-1 其餘步驟（**不含 median，已於本輪完成**）：Gaussian 背景、遮罩、connected components
    標籤順序、component 幾何、ring CNR 統計的黃金參考與等價測試。
