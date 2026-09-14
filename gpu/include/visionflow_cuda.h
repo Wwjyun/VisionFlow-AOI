@@ -221,6 +221,42 @@ VF_CUDA_API int vf_morphology_rect_u8(
     uint8_t* dst, int dst_stride, int dst_channels,
     int operation, int kernel_size, int iterations);
 
+/*
+ * Optional Template Anchor Grid localization extension. Reads a search ROI out of the
+ * context's resident image, converts it to gray with the same weights as
+ * vf_bgr_to_gray_u8, and returns the best TM_CCOEFF_NORMED match of a host gray template as
+ * a half-open rectangle plus its score. Only the result rectangle and score cross PCIe; the
+ * template is uploaded once per call (it is small and constant per Recipe).
+ *
+ * Semantics match the CPU reference in core/tiler.py::Tiler._find_grid_anchor:
+ *   score = sum((window - mean(window)) * (templ - mean(templ)))
+ *           / sqrt(sum((window - mean(window))^2) * sum((templ - mean(templ))^2))
+ * Ties (equal score) resolve to the topmost, then leftmost match. The template must not be
+ * flat (standard deviation <= 1e-6); the CPU reference switches to TM_SQDIFF_NORMED there,
+ * which is reported as VF_CUDA_UNSUPPORTED so the caller can restart the step on the CPU.
+ * out_match must hold 4 int32 values [x, y, width, height] and out_score 1 float.
+ */
+VF_CUDA_API int vf_match_template_gray_u8(
+    void* context,
+    uint64_t generation,
+    int search_x, int search_y, int search_width, int search_height,
+    const uint8_t* templ, int template_width, int template_height,
+    int* out_match, float* out_score);
+
+/*
+ * Debug helper for the localization extension: after vf_match_template_gray_u8 has run, copies
+ * the packed winning key back so a caller can inspect the raw candidate comparison. Not used by
+ * production code paths.
+ */
+VF_CUDA_API int vf_match_template_debug_key(void* context, unsigned long long* out_key);
+
+/* Diagnostics: copy one prefix plane of the localization scratch back to the host. */
+VF_CUDA_API int vf_match_template_debug_planes(
+    void* context, int plane, int64_t* out_values, size_t count);
+
+/* Diagnostics: copy the gray search ROI that the localization step computed back to the host. */
+VF_CUDA_API int vf_match_template_debug_roi(void* context, uint8_t* out_values, size_t count);
+
 VF_CUDA_API int vf_preprocess_401_2_u8(
     void* context,
     const uint8_t* src, int width, int height, int src_stride, int src_channels,

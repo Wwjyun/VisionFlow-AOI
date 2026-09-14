@@ -493,6 +493,7 @@ class Tiler:
         gpu_runtime=None,
         resident_image=None,
         crop_workers: int | str = "auto",
+        gpu_anchor_enabled: bool = False,
     ):
         if width <= 0 or height <= 0:
             raise ValueError("Tile width and height must be positive.")
@@ -509,6 +510,9 @@ class Tiler:
         self.image_loader = ImageLoader()
         self.gpu_runtime = gpu_runtime
         self.resident_image = resident_image
+        # Off until the CUDA localization kernel is both equivalent and faster than the CPU
+        # reference; see _find_grid_anchor_on_device for the measured evidence.
+        self.gpu_anchor_enabled = bool(gpu_anchor_enabled)
         self.crop_workers = crop_workers
         self.last_profile_ms = {"template_match_ms": 0.0, "roi_generation_ms": 0.0}
 
@@ -620,6 +624,7 @@ class Tiler:
                                     anchor["x"], anchor["y"], anchor["width"], anchor["height"]
                                 ],
                                 "score": float(anchor["score"]),
+                                "grid_anchor_backend": str(anchor.get("backend", "cpu")),
                                 "base_roi": [
                                     int(base_x),
                                     int(base_y),
@@ -664,25 +669,70 @@ class Tiler:
         if template_width > search_roi.shape[1] or template_height > search_roi.shape[0]:
             raise ValueError("Grid template is larger than the search ROI.")
 
-        if float(np.std(template_gray)) <= 1e-6:
-            result = cv2.matchTemplate(search_roi, template_gray, cv2.TM_SQDIFF_NORMED)
-            min_score, _, min_loc, _ = cv2.minMaxLoc(result)
-            max_score = 1.0 - float(min_score)
-            max_loc = min_loc
-        else:
-            result = cv2.matchTemplate(search_roi, template_gray, cv2.TM_CCOEFF_NORMED)
-            _, max_score, _, max_loc = cv2.minMaxLoc(result)
-        if config.match_threshold > 0 and max_score < config.match_threshold:
+        search_rect = [int(search_x), int(search_y), int(search_x2 - search_x), int(search_y2 - search_y)]
+        anchor = self._find_grid_anchor_on_device(image, search_rect, template_gray)
+        if anchor is None:
+            if float(np.std(template_gray)) <= 1e-6:
+                result = cv2.matchTemplate(search_roi, template_gray, cv2.TM_SQDIFF_NORMED)
+                min_score, _, min_loc, _ = cv2.minMaxLoc(result)
+                anchor = {
+                    "x": int(search_x + min_loc[0]),
+                    "y": int(search_y + min_loc[1]),
+                    "width": int(template_width),
+                    "height": int(template_height),
+                    "score": float(1.0 - float(min_score)),
+                    "backend": "cpu",
+                }
+            else:
+                result = cv2.matchTemplate(search_roi, template_gray, cv2.TM_CCOEFF_NORMED)
+                _, max_score, _, max_loc = cv2.minMaxLoc(result)
+                anchor = {
+                    "x": int(search_x + max_loc[0]),
+                    "y": int(search_y + max_loc[1]),
+                    "width": int(template_width),
+                    "height": int(template_height),
+                    "score": float(max_score),
+                    "backend": "cpu",
+                }
+        # The threshold applies to whichever backend produced the score.
+        if config.match_threshold > 0 and float(anchor["score"]) < config.match_threshold:
             raise ValueError(
-                f"Grid template match score {max_score:.4f} is below threshold {config.match_threshold:.4f}."
+                f"Grid template match score {float(anchor['score']):.4f} is below threshold "
+                f"{config.match_threshold:.4f}."
             )
+        anchor["search_roi"] = search_rect
+        return anchor
+
+    def _find_grid_anchor_on_device(self, image, search_rect, template_gray):
+        """Locate the anchor on the resident device image when the caller opts in.
+
+        The resident image is already on the device, so this step would add no pixel H2D, but the
+        current `vf_match_template_gray_u8` kernel is not usable yet: on the RTX 3090 it is 3-14x
+        slower than the CPU reference at every measured scale, and it only agreed with OpenCV on
+        3 of 7 synthetic scenes (score deltas up to 0.96). Until the kernel is rewritten with
+        shared-memory tiling and passes the equivalence matrix, the CPU reference stays in charge
+        and this path is only reachable with an explicit opt-in.
+        """
+        if not self.gpu_anchor_enabled:
+            return None
+        runtime = self.gpu_runtime
+        resident = self.resident_image
+        if runtime is None or resident is None or not getattr(runtime, "supports_template_match", False):
+            return None
+        try:
+            match = runtime.match_template_gray(resident, tuple(search_rect), template_gray)
+        except Exception:
+            # A failed GPU step falls back to the CPU reference, which is the correctness baseline.
+            return None
+        if int(match["width"]) != int(template_gray.shape[1]) or int(match["height"]) != int(template_gray.shape[0]):
+            return None
         return {
-            "x": int(search_x + max_loc[0]),
-            "y": int(search_y + max_loc[1]),
-            "width": int(template_width),
-            "height": int(template_height),
-            "score": float(max_score),
-            "search_roi": [int(search_x), int(search_y), int(search_x2 - search_x), int(search_y2 - search_y)],
+            "x": int(match["x"]),
+            "y": int(match["y"]),
+            "width": int(match["width"]),
+            "height": int(match["height"]),
+            "score": float(match["score"]),
+            "backend": "cuda_dll",
         }
 
     @staticmethod

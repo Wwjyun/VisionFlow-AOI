@@ -176,6 +176,10 @@ class GpuRuntime:
     def supports_roi_batch(self) -> bool:
         return self._capabilities.roi_batch
 
+    @property
+    def supports_template_match(self) -> bool:
+        return self._capabilities.template_match
+
     def status(self, requested: bool = False) -> dict:
         active = bool(requested and self.available and not self.last_error)
         return {
@@ -193,6 +197,7 @@ class GpuRuntime:
                 "resident_roi": self.supports_resident_roi,
                 "roi_batch": self.supports_roi_batch,
                 "fused_401_2": self.supports_fused_401_2,
+                "template_match": self.supports_template_match,
             },
             "queue": {
                 "depth": self.queue_depth,
@@ -369,6 +374,71 @@ class GpuRuntime:
         return GpuResidentImage(
             self, int(generation.value), int(source.shape[1]), int(source.shape[0]), channels
         )
+
+    def match_template_gray(
+        self,
+        resident: "GpuResidentImage",
+        search_rect: tuple[int, int, int, int],
+        template_gray: np.ndarray,
+    ) -> dict:
+        """Locate a gray template inside the resident image without uploading pixels again.
+
+        Returns the match rectangle in full-image coordinates plus the TM_CCOEFF_NORMED score.
+        Only the rectangle and score cross PCIe. Raises GpuRuntimeError on a missing export or a
+        flat template, which lets the caller restart localization on the CPU.
+        """
+        if not self.supports_template_match:
+            raise GpuRuntimeError("CUDA DLL has no Template Anchor Grid localization export")
+        if resident is None or resident.runtime is not self:
+            raise GpuRuntimeError("Template match requires a resident image owned by this runtime")
+        template = np.ascontiguousarray(template_gray, dtype=np.uint8)
+        if template.ndim != 2:
+            raise GpuRuntimeError("Template match requires a single-channel template")
+        search_x, search_y, search_width, search_height = (int(value) for value in search_rect)
+        if search_width <= 0 or search_height <= 0:
+            raise GpuRuntimeError(f"Invalid template match search rect: {search_rect}")
+        match = np.zeros(4, dtype=np.int32)
+        score = ctypes.c_float(0.0)
+        queued = time.perf_counter()
+        with self._queue_slots, self._lock:
+            lock_acquired = time.perf_counter()
+            result = int(self._dll.vf_match_template_gray_u8(
+                self._context,
+                ctypes.c_uint64(resident.generation),
+                search_x, search_y, search_width, search_height,
+                template.ctypes.data_as(ctypes.POINTER(ctypes.c_uint8)),
+                int(template.shape[1]), int(template.shape[0]),
+                match.ctypes.data_as(ctypes.POINTER(ctypes.c_int)),
+                ctypes.byref(score),
+            ))
+            completed = time.perf_counter()
+            self._record_performance(
+                "vf_match_template_gray_u8", int(template.nbytes), int(match.nbytes + 4),
+                completed - lock_acquired, lock_acquired - queued,
+            )
+        if result != 0:
+            raise self._native_error("vf_match_template_gray_u8", result)
+        return {
+            "x": int(match[0]),
+            "y": int(match[1]),
+            "width": int(match[2]),
+            "height": int(match[3]),
+            "score": float(score.value),
+        }
+
+    def match_template_debug_key(self) -> int:
+        """Return the raw packed winning key of the last localization call (diagnostics only)."""
+        debug = getattr(self._dll, "vf_match_template_debug_key", None)
+        if debug is None:
+            raise GpuRuntimeError("CUDA DLL has no template match debug export")
+        debug.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_ulonglong)]
+        debug.restype = ctypes.c_int
+        key = ctypes.c_ulonglong(0)
+        with self._queue_slots, self._lock:
+            result = int(debug(self._context, ctypes.byref(key)))
+        if result != 0:
+            raise self._native_error("vf_match_template_debug_key", result)
+        return int(key.value)
 
     def memory_info(self) -> dict[str, int]:
         if not self.available or getattr(self._dll, "vf_gpu_memory_info", None) is None:
@@ -769,6 +839,7 @@ class GpuRuntime:
         self._load_optional_native_dag_plan()
         self._load_optional_resident_roi()
         self._load_optional_roi_batch()
+        self._load_optional_template_match()
 
     def _load_optional_native_plan(self) -> None:
         query = getattr(self._dll, "vf_plan_query", None)
@@ -874,6 +945,18 @@ class GpuRuntime:
         if destroy is not None:
             destroy.argtypes = [ctypes.c_void_p]
             destroy.restype = ctypes.c_int
+
+    def _load_optional_template_match(self) -> None:
+        match = getattr(self._dll, "vf_match_template_gray_u8", None)
+        if match is None:
+            return
+        match.argtypes = [
+            ctypes.c_void_p, ctypes.c_uint64,
+            ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+            ctypes.POINTER(ctypes.c_uint8), ctypes.c_int, ctypes.c_int,
+            ctypes.POINTER(ctypes.c_int), ctypes.POINTER(ctypes.c_float),
+        ]
+        match.restype = ctypes.c_int
 
     @staticmethod
     def _native_plan_descriptor(plan, image: np.ndarray) -> tuple[_VfPlanDescV1, object]:

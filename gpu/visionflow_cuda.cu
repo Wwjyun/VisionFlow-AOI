@@ -41,6 +41,12 @@ constexpr unsigned int GAUSSIAN_FINAL_ROUND =
     1U << (GAUSSIAN_FIXED_SHIFT * 2 - 1);
 __constant__ uint16_t gaussian_weights[MAX_GAUSSIAN_KERNEL];
 
+// Template Anchor Grid scratch planes owned by the persistent context. Declared here because the
+// context struct sizes its plane arrays from them.
+constexpr int MATCH_SUM_PREFIX_PLANE = 0;      // int64: vertical prefix of the horizontal window sum
+constexpr int MATCH_SQUARE_PREFIX_PLANE = 1;   // int64: vertical prefix of its sum of squares
+constexpr int MATCH_PLANE_COUNT = 2;
+
 struct PersistentContext {
     uint8_t* u8[5]{};
     size_t u8_capacity[5]{};
@@ -56,6 +62,13 @@ struct PersistentContext {
     int resident_height = 0;
     int resident_channels = 0;
     uint64_t resident_generation = 0;
+    // Template Anchor Grid scratch: three grow-only int64 planes of output_width x output_height,
+    // one int64 plane of template column sums, and the candidate/result slots. Kept separate from
+    // u64[] because those are plan scratch and reserve_device only grows.
+    long long* match_plane[MATCH_PLANE_COUNT]{};
+    size_t match_plane_capacity[MATCH_PLANE_COUNT]{};
+    long long* match_candidates = nullptr;
+    size_t match_candidate_capacity = 0;
     unsigned long long allocation_count = 0;
     cudaStream_t stream = nullptr;
     cudaError_t initialization_error = cudaSuccess;
@@ -85,6 +98,8 @@ struct PersistentContext {
         visionflow_cuda::free_device(gaussian_buffer);
         for (void* pointer : u64) visionflow_cuda::free_device(pointer);
         for (void* pointer : dag_u8) visionflow_cuda::free_device(pointer);
+        for (long long* plane : match_plane) visionflow_cuda::free_device(plane);
+        visionflow_cuda::free_device(match_candidates);
         visionflow_cuda::free_device(resident_u8);
         for (cudaEvent_t event : timing_events) {
             if (event != nullptr) cudaEventDestroy(event);
@@ -235,6 +250,26 @@ int reserve_device(
         return VF_CUDA_INVALID_ARGUMENT;
     }
     if (*pointer != nullptr && *capacity >= count) return VF_CUDA_OK;
+    T* replacement = nullptr;
+    cudaError_t error = cudaMalloc(&replacement, count * sizeof(T));
+    if (error != cudaSuccess) return visionflow_cuda::runtime_error(error);
+    visionflow_cuda::free_device(*pointer);
+    *pointer = replacement;
+    *capacity = count;
+    if (allocation_count != nullptr) ++(*allocation_count);
+    return VF_CUDA_OK;
+}
+
+template <typename T>
+int reserve_exact(
+    T** pointer,
+    size_t* capacity,
+    size_t count,
+    unsigned long long* allocation_count = nullptr) {
+    if (pointer == nullptr || capacity == nullptr || count == 0 || count > SIZE_MAX / sizeof(T)) {
+        return VF_CUDA_INVALID_ARGUMENT;
+    }
+    if (*pointer != nullptr && *capacity == count) return VF_CUDA_OK;
     T* replacement = nullptr;
     cudaError_t error = cudaMalloc(&replacement, count * sizeof(T));
     if (error != cudaSuccess) return visionflow_cuda::runtime_error(error);
@@ -675,6 +710,26 @@ __global__ void bgr_gray_kernel(const uint8_t* src, uint8_t* dst, int width, int
          (1 << (gray_shift - 1))) >> gray_shift);
 }
 
+// Grays a rectangular region of a wider BGR source into a tightly packed single-channel buffer.
+// The plain bgr_gray_kernel above assumes a packed source, which a resident-image ROI is not.
+__global__ void bgr_gray_roi_kernel(
+    const uint8_t* src, int src_width, int offset_x, int offset_y,
+    uint8_t* dst, int width, int height) {
+    int x = blockIdx.x * blockDim.x + threadIdx.x;
+    int y = blockIdx.y * blockDim.y + threadIdx.y;
+    if (x >= width || y >= height) return;
+    const int index = ((y + offset_y) * src_width + x + offset_x) * 3;
+    constexpr int gray_shift = 15;
+    constexpr int blue_to_gray = 3735;
+    constexpr int green_to_gray = 19235;
+    constexpr int red_to_gray = 9798;
+    dst[y * width + x] = static_cast<uint8_t>(
+        (blue_to_gray * src[index] +
+         green_to_gray * src[index + 1] +
+         red_to_gray * src[index + 2] +
+         (1 << (gray_shift - 1))) >> gray_shift);
+}
+
 __global__ void bgr_rgb_kernel(const uint8_t* src, uint8_t* dst, int width, int height) {
     int x = blockIdx.x * blockDim.x + threadIdx.x;
     int y = blockIdx.y * blockDim.y + threadIdx.y;
@@ -1084,6 +1139,256 @@ __global__ void gather_roi_batch_kernel(
 }
 
 dim3 grid2d(int width, int height) { return dim3((width + BLOCK_X - 1) / BLOCK_X, (height + BLOCK_Y - 1) / BLOCK_Y); }
+
+// --- Template Anchor Grid localization (TM_CCOEFF_NORMED) -------------------------------
+// Reproduces core/tiler.py::Tiler._find_grid_anchor: the same correlation formula and the same
+// "topmost then leftmost wins a tie" order as the CPU argmax over the result map. Only the
+// match rectangle and its score cross PCIe.
+//
+// Two vertical prefixes per output column give the window pixel sum and the window square sum in
+// O(1) each. The template-weighted window sum is accumulated directly by the score kernel:
+//   num = sum(w*t) - N*mean_w*mean_t
+//   den = sqrt((sum(w^2) - N*mean_w^2) * (sum(t^2) - N*mean_t^2))
+constexpr int MATCH_TEMPLATE_BUFFER = 2;    // context->u8[2]: template gray on device
+constexpr int MATCH_ROI_BUFFER = 3;         // context->u8[3]: search ROI gray on device
+constexpr int MATCH_REDUCE_BLOCK = 256;
+constexpr int MATCH_CANDIDATE_SLOTS = MATCH_REDUCE_BLOCK;
+// Candidate slots occupy [0, 3 * MATCH_CANDIDATE_SLOTS), then two int32 result coordinates, one
+// float score and one packed best key, all inside one int64-aligned grow-only block.
+constexpr int MATCH_RESULT_OFFSET = MATCH_CANDIDATE_SLOTS * 3;
+constexpr int MATCH_KEY_OFFSET = MATCH_RESULT_OFFSET + 1;
+constexpr int MATCH_SLOT_COUNT = MATCH_RESULT_OFFSET + 3;
+// Match key layout, ordered so that a larger unsigned key is the better match:
+//   bits 62..40 score, bits 39..20 inverted y, bits 19..0 inverted x.
+// The score is quantized to 22 bits once, and that same value is what the caller receives, so a
+// tie in the packed key is exactly a tie in the reported score. Coordinates must fit 20 bits.
+constexpr int MATCH_SCORE_BITS = 22;
+constexpr double MATCH_SCORE_MAX = static_cast<double>((1 << MATCH_SCORE_BITS) - 1);
+constexpr int MATCH_COORD_BITS = 20;
+constexpr int MATCH_COORD_MASK = (1 << MATCH_COORD_BITS) - 1;
+
+__device__ __forceinline__ unsigned long long match_pack_key(double score, int x, int y) {
+    double clamped = score;
+    if (clamped > 1.0) clamped = 1.0;
+    if (clamped < 0.0) clamped = 0.0;
+    const unsigned long long quantized =
+        static_cast<unsigned long long>(clamped * MATCH_SCORE_MAX + 0.5);
+    return (quantized << 40) |
+           (static_cast<unsigned long long>(MATCH_COORD_MASK - y) << 20) |
+           static_cast<unsigned long long>(MATCH_COORD_MASK - x);
+}
+
+__device__ __forceinline__ void match_unpack_key(
+    unsigned long long key, double* score, int* x, int* y) {
+    *x = MATCH_COORD_MASK - static_cast<int>(key & MATCH_COORD_MASK);
+    *y = MATCH_COORD_MASK - static_cast<int>((key >> 20) & MATCH_COORD_MASK);
+    const unsigned long long quantized = (key >> 40) & ((1ULL << MATCH_SCORE_BITS) - 1);
+    *score = static_cast<double>(quantized) / MATCH_SCORE_MAX;
+}
+
+// One thread per output column. Writes the vertical prefixes of the horizontal window sum and of
+// its square, so the score kernel obtains the window pixel sum and the window square sum with two
+// subtractions each. The horizontal window for output (row, column) starts at image row `row`.
+__global__ void match_prefix_kernel(
+    const uint8_t* roi, int roi_width, int roi_height,
+    int output_width, int template_width,
+    long long* sum_prefix, long long* square_prefix) {
+    const int column = blockIdx.x * blockDim.x + threadIdx.x;
+    if (column >= output_width) return;
+    long long sum_running = 0;
+    long long square_running = 0;
+    for (int row = threadIdx.y; row < roi_height; row += blockDim.y) {
+        const uint8_t* line = roi + static_cast<size_t>(row) * roi_width;
+        int sum = 0;
+        long long square_sum = 0;
+        for (int offset = 0; offset < template_width; ++offset) {
+            const int value = line[column + offset];
+            sum += value;
+            square_sum += static_cast<long long>(value) * value;
+        }
+        sum_running += sum;
+        square_running += square_sum;
+        const size_t index = static_cast<size_t>(row) * output_width + column;
+        sum_prefix[index] = sum_running;
+        square_prefix[index] = square_running;
+    }
+}
+
+// One thread per output column walks every candidate window of that column. The window sum and
+// its square come from the prefix planes in O(1); the template-weighted sum is accumulated
+// directly, with consecutive threads reading consecutive ROI columns so the loads coalesce and
+// every warp shares one template row.
+__global__ void match_score_kernel(
+    const uint8_t* roi, int roi_width, int roi_height,
+    int output_width, int output_height,
+    int template_width, int template_height,
+    const uint8_t* templ,
+    const long long* sum_prefix, const long long* square_prefix,
+    double template_mean, double template_variance, int template_pixels,
+    double* candidate_scores, int* candidate_ys) {
+    const int column = blockIdx.x * blockDim.x + threadIdx.x;
+    if (column >= output_width || template_height > roi_height) return;
+    double best_score = -2.0;
+    int best_y = -1;
+    for (int row = 0; row < output_height; ++row) {
+        const size_t bottom = static_cast<size_t>(row + template_height - 1) * output_width + column;
+        long long window_sum = sum_prefix[bottom];
+        long long window_square_sum = square_prefix[bottom];
+        if (row > 0) {
+            const size_t top = static_cast<size_t>(row - 1) * output_width + column;
+            window_sum -= sum_prefix[top];
+            window_square_sum -= square_prefix[top];
+        }
+        const double mean = static_cast<double>(window_sum) / template_pixels;
+        double window_variance =
+            static_cast<double>(window_square_sum) / template_pixels - mean * mean;
+        if (window_variance < 0.0) window_variance = 0.0;
+        const double denominator = std::sqrt(window_variance * template_variance) * template_pixels;
+        double score = -1.0;
+        if (denominator > 0.0) {
+            long long weighted = 0;
+            for (int template_row = 0; template_row < template_height; ++template_row) {
+                const uint8_t* line =
+                    roi + static_cast<size_t>(row + template_row) * roi_width + column;
+                const uint8_t* template_line =
+                    templ + static_cast<size_t>(template_row) * template_width;
+                long long term = 0;
+                for (int offset = 0; offset < template_width; ++offset) {
+                    term += static_cast<long long>(line[offset]) * template_line[offset];
+                }
+                weighted += term;
+            }
+            score = (static_cast<double>(weighted) - template_mean * window_sum) / denominator;
+        }
+        if (score > 1.0) score = 1.0;
+        if (score < -1.0) score = -1.0;
+        if (score > best_score) {
+            best_score = score;
+            best_y = row;
+        }
+    }
+    candidate_scores[column] = best_score;
+    candidate_ys[column] = best_y;
+}
+
+
+// One thread per output column. Builds the vertical prefix of the ROI pixel sums and of the ROI
+// sum of squares, which is everything the TM_SQDIFF_NORMED score needs:
+//   sum((w - t)^2) = sum(w^2) - 2*sum(w*t) + sum(t^2)
+__global__ void match_diff_prefix_kernel(
+    const uint8_t* roi, int roi_width, int roi_height,
+    int output_width, int template_width,
+    long long* value_prefix, long long* square_prefix) {
+    const int column = blockIdx.x * blockDim.x + threadIdx.x;
+    if (column >= output_width) return;
+    long long value_running = 0;
+    long long square_running = 0;
+    for (int row = threadIdx.y; row < roi_height; row += blockDim.y) {
+        const uint8_t* line = roi + static_cast<size_t>(row) * roi_width;
+        long long value_sum = 0;
+        long long square_sum = 0;
+        for (int offset = 0; offset < template_width; ++offset) {
+            const long long value = line[column + offset];
+            value_sum += value;
+            square_sum += value * value;
+        }
+        value_running += value_sum;
+        square_running += square_sum;
+        const size_t index = static_cast<size_t>(row) * output_width + column;
+        value_prefix[index] = value_running;
+        square_prefix[index] = square_running;
+    }
+}
+
+// One thread per output column minimises the normalized squared difference over the column. The
+// packed value is 1 - difference so that the shared "larger key wins" reduction, and therefore the
+// topmost-then-leftmost tie order, describes the smallest difference.
+__global__ void match_diff_score_kernel(
+    const uint8_t* roi, int roi_width, int roi_height,
+    int output_width, int output_height,
+    int template_width, int template_height,
+    const uint8_t* templ,
+    const long long* value_prefix, const long long* square_prefix,
+    long long template_square_sum,
+    double* candidate_scores, int* candidate_ys) {
+    const int column = blockIdx.x * blockDim.x + threadIdx.x;
+    if (column >= output_width || template_height > roi_height) return;
+    double best_value = -1.0;
+    int best_y = -1;
+    for (int row = 0; row < output_height; ++row) {
+        const size_t bottom = static_cast<size_t>(row + template_height - 1) * output_width + column;
+        long long window_value = value_prefix[bottom];
+        long long window_square = square_prefix[bottom];
+        if (row > 0) {
+            const size_t top = static_cast<size_t>(row - 1) * output_width + column;
+            window_value -= value_prefix[top];
+            window_square -= square_prefix[top];
+        }
+        long long cross = 0;
+        for (int template_row = 0; template_row < template_height; ++template_row) {
+            const uint8_t* line =
+                roi + static_cast<size_t>(row + template_row) * roi_width + column;
+            const uint8_t* template_line =
+                templ + static_cast<size_t>(template_row) * template_width;
+            long long term = 0;
+            for (int offset = 0; offset < template_width; ++offset) {
+                term += static_cast<long long>(line[offset]) * template_line[offset];
+            }
+            cross += term;
+        }
+        const double numerator =
+            static_cast<double>(window_square) - 2.0 * cross + static_cast<double>(template_square_sum);
+        const double denominator = std::sqrt(
+            static_cast<double>(window_square) * static_cast<double>(template_square_sum));
+        const double difference = denominator > 0.0 ? numerator / denominator : 1.0;
+        const double clamped_difference = difference < 0.0 ? 0.0 : (difference > 1.0 ? 1.0 : difference);
+        const double value = 1.0 - clamped_difference;
+        if (value > best_value) {
+            best_value = value;
+            best_y = row;
+        }
+    }
+    candidate_scores[column] = best_value;
+    candidate_ys[column] = best_y;
+}
+
+// One thread per output column publishes its candidate into the single best-key slot. The
+// candidate column is the thread index, so no separate index array is needed. For
+// TM_SQDIFF_NORMED the caller stores 1 - score, so "larger key wins" and the topmost-then-leftmost
+// tie order still describe the smallest normalized difference.
+__global__ void match_publish_kernel(
+    const double* candidate_scores, const int* candidate_ys,
+    int output_width, unsigned long long* best_key) {
+    const int column = blockIdx.x * blockDim.x + threadIdx.x;
+    if (column >= output_width) return;
+    const double score = candidate_scores[column];
+    const int y = candidate_ys[column];
+    // y < 0 means the column produced no candidate; publishing it would compute MASK - y and wrap.
+    if (y < 0 || y > MATCH_COORD_MASK - 1 || !(score >= 0.0)) return;
+    const unsigned long long key = match_pack_key(score, column, y);
+    unsigned long long* slot = best_key;
+    unsigned long long current = *slot;
+    while (key > current) {
+        const unsigned long long previous = atomicCAS(slot, current, key);
+        if (previous == current) break;
+        current = previous;
+    }
+}
+
+// Expands the winning key back into the rectangle origin and score. mode_sign is +1 for
+// TM_CCOEFF_NORMED (report the packed value) and -1 for TM_SQDIFF_NORMED (report 1 - value), the
+// same conversion core/tiler.py applies when it detects a flat template.
+__global__ void match_unpack_kernel(
+    const unsigned long long* best_key, float mode_sign, int* out_xy, float* out_score) {
+    double score = 0.0;
+    int x = 0;
+    int y = 0;
+    match_unpack_key(*best_key, &score, &x, &y);
+    out_xy[0] = x;
+    out_xy[1] = y;
+    *out_score = static_cast<float>(1.0 + mode_sign * (score - 1.0));
+}
+
 
 // Mirrors OpenCV computeResizeAreaTab: double geometry, 1e-3 edge tolerance, float weights.
 void append_area_axis(
@@ -2331,4 +2636,221 @@ VF_CUDA_API int vf_morphology_rect_u8(const uint8_t* src,int w,int h,int stride,
     else visionflow_cuda::free_device(a);
     visionflow_cuda::free_device(b);
     return result;
+}
+
+VF_CUDA_API int vf_match_template_gray_u8(
+    void* context,
+    uint64_t generation,
+    int search_x, int search_y, int search_width, int search_height,
+    const uint8_t* templ, int template_width, int template_height,
+    int* out_match, float* out_score) {
+    PersistentContext* persistent = static_cast<PersistentContext*>(context);
+    if (persistent == nullptr || templ == nullptr || out_match == nullptr || out_score == nullptr ||
+        generation == 0 || generation != persistent->resident_generation ||
+        persistent->resident_u8 == nullptr) {
+        return VF_CUDA_INVALID_ARGUMENT;
+    }
+    if (search_x < 0 || search_y < 0 || search_width <= 0 || search_height <= 0 ||
+        search_x > persistent->resident_width - search_width ||
+        search_y > persistent->resident_height - search_height) {
+        return VF_CUDA_INVALID_ARGUMENT;
+    }
+    if (template_width <= 0 || template_height <= 0 ||
+        template_width > search_width || template_height > search_height ||
+        static_cast<long long>(template_width) * template_height > INT_MAX) {
+        return VF_CUDA_INVALID_ARGUMENT;
+    }
+    const int output_width = search_width - template_width + 1;
+    const int output_height = search_height - template_height + 1;
+    if (output_width <= 0 || output_height <= 0) return VF_CUDA_INVALID_ARGUMENT;
+
+    const size_t template_bytes = static_cast<size_t>(template_width) * template_height;
+    // The prefix planes are indexed by output_width * roi_height, and the context caches them with
+    // grow-only semantics, so reserve the ROI area: it bounds every shape this call can index and
+    // keeps a later, wider search from reading past an earlier smaller allocation.
+    size_t plane_elements = static_cast<size_t>(search_width) * search_height;
+    if (plane_elements < static_cast<size_t>(output_width) * output_height) {
+        plane_elements = static_cast<size_t>(output_width) * output_height;
+    }
+    if (plane_elements > SIZE_MAX / sizeof(long long) / MATCH_PLANE_COUNT) {
+        return VF_CUDA_INVALID_ARGUMENT;
+    }
+    cudaError_t error = cudaSuccess;
+    int result = reserve_device(
+        &persistent->u8[MATCH_TEMPLATE_BUFFER], &persistent->u8_capacity[MATCH_TEMPLATE_BUFFER],
+        template_bytes, &persistent->allocation_count);
+    if (result != VF_CUDA_OK) return result;
+    // The gray ROI is fully rewritten by this call, so it must be exactly the requested size:
+    // a larger leftover buffer from an earlier call would keep the old row pitch.
+    result = reserve_exact(
+        &persistent->u8[MATCH_ROI_BUFFER], &persistent->u8_capacity[MATCH_ROI_BUFFER],
+        static_cast<size_t>(search_width) * search_height, &persistent->allocation_count);
+    if (result != VF_CUDA_OK) return result;
+    // planes: sum prefix, square prefix
+    for (int plane = 0; plane < MATCH_PLANE_COUNT; ++plane) {
+        result = reserve_device(
+            &persistent->match_plane[plane], &persistent->match_plane_capacity[plane],
+            plane_elements, &persistent->allocation_count);
+        if (result != VF_CUDA_OK) return result;
+    }
+    result = reserve_device(
+        &persistent->match_candidates, &persistent->match_candidate_capacity,
+        static_cast<size_t>(MATCH_SLOT_COUNT), &persistent->allocation_count);
+    if (result != VF_CUDA_OK) return result;
+    long long* candidate_storage = persistent->match_candidates;
+    // Result slots live in the same grow-only block: two int32 for the winner origin, one float
+    // score and one packed best key, all int64-aligned.
+    int* match_xy_device = reinterpret_cast<int*>(candidate_storage + MATCH_RESULT_OFFSET);
+    float* match_score_device = reinterpret_cast<float*>(match_xy_device + 2);
+    unsigned long long* best_key = reinterpret_cast<unsigned long long*>(candidate_storage + MATCH_KEY_OFFSET);
+
+    // Template statistics on the host: the template is small and constant per Recipe.
+    double template_sum = 0.0;
+    double template_square_sum = 0.0;
+    for (int row = 0; row < template_height; ++row) {
+        for (int column = 0; column < template_width; ++column) {
+            const int value = templ[static_cast<size_t>(row) * template_width + column];
+            template_sum += value;
+            template_square_sum += static_cast<double>(value) * value;
+        }
+    }
+    const double template_pixels = static_cast<double>(template_width) * template_height;
+    const double template_mean = template_sum / template_pixels;
+    const double template_variance = template_square_sum / template_pixels - template_mean * template_mean;
+    if (!(template_variance > 1e-12)) {
+        // core/tiler.py::_find_grid_anchor switches to TM_SQDIFF_NORMED when the template has no
+        // contrast. The extension's difference path is not equivalent to OpenCV yet (it reports
+        // scores outside [0, 1] and can pick a neighbouring column), so the caller restarts this
+        // step on the CPU reference instead of receiving a wrong anchor. Production anchor
+        // templates are structured patterns, so this affects the flat-template edge case only.
+        return VF_CUDA_UNSUPPORTED;
+    }
+    if (output_width > MATCH_COORD_MASK) return VF_CUDA_INVALID_ARGUMENT;
+    reset_timing(persistent, true);
+    error = cudaMemcpyAsync(
+        persistent->u8[MATCH_TEMPLATE_BUFFER], templ, template_bytes,
+        cudaMemcpyHostToDevice, persistent->stream);
+    if (error != cudaSuccess) return cuda_result(error);
+
+    // Gray the search ROI on the device: the resident image is BGR, the reference works on gray,
+    // and the weights are the ones vf_bgr_to_gray_u8 already uses. The ROI-aware kernel is needed
+    // because a resident sub-rectangle is not tightly packed.
+    const size_t resident_pitch =
+        static_cast<size_t>(persistent->resident_width) * persistent->resident_channels;
+    const uint8_t* roi_source = persistent->resident_u8 +
+        static_cast<size_t>(search_y) * resident_pitch +
+        static_cast<size_t>(search_x) * persistent->resident_channels;
+    if (persistent->resident_channels == 3) {
+        bgr_gray_roi_kernel<<<
+            grid2d(search_width, search_height), dim3(BLOCK_X, BLOCK_Y), 0, persistent->stream>>>(
+            roi_source, persistent->resident_width, 0, 0,
+            persistent->u8[MATCH_ROI_BUFFER], search_width, search_height);
+    } else {
+        error = cudaMemcpy2DAsync(
+            persistent->u8[MATCH_ROI_BUFFER], static_cast<size_t>(search_width), roi_source,
+            resident_pitch, static_cast<size_t>(search_width), search_height,
+            cudaMemcpyDeviceToDevice, persistent->stream);
+        if (error != cudaSuccess) return cuda_result(error);
+    }
+    result = visionflow_cuda::kernel_launch_result();
+    if (result != VF_CUDA_OK) return result;
+
+    double* candidate_scores = reinterpret_cast<double*>(candidate_storage);
+    int* candidate_ys = reinterpret_cast<int*>(candidate_storage + MATCH_CANDIDATE_SLOTS);
+    const dim3 prefix_grid((output_width + MATCH_REDUCE_BLOCK - 1) / MATCH_REDUCE_BLOCK, 1);
+    const dim3 reduce_block(MATCH_REDUCE_BLOCK, 1);
+    match_prefix_kernel<<<prefix_grid, reduce_block, 0, persistent->stream>>>(
+        persistent->u8[MATCH_ROI_BUFFER], search_width, search_height,
+        output_width, template_width,
+        persistent->match_plane[MATCH_SUM_PREFIX_PLANE],
+        persistent->match_plane[MATCH_SQUARE_PREFIX_PLANE]);
+    result = visionflow_cuda::kernel_launch_result();
+    if (result != VF_CUDA_OK) return result;
+    match_score_kernel<<<prefix_grid, reduce_block, 0, persistent->stream>>>(
+        persistent->u8[MATCH_ROI_BUFFER], search_width, search_height,
+        output_width, output_height, template_width, template_height,
+        persistent->u8[MATCH_TEMPLATE_BUFFER],
+        persistent->match_plane[MATCH_SUM_PREFIX_PLANE],
+        persistent->match_plane[MATCH_SQUARE_PREFIX_PLANE],
+        template_mean, template_variance, template_width * template_height,
+        candidate_scores, candidate_ys);
+    result = visionflow_cuda::kernel_launch_result();
+    if (result != VF_CUDA_OK) return result;
+
+    // One packed best key decides the winner, so no ordering between blocks can change it.
+    error = cudaMemsetAsync(best_key, 0, sizeof(unsigned long long), persistent->stream);
+    if (error != cudaSuccess) return cuda_result(error);
+    match_publish_kernel<<<
+        dim3((output_width + MATCH_REDUCE_BLOCK - 1) / MATCH_REDUCE_BLOCK, 1),
+        dim3(MATCH_REDUCE_BLOCK, 1), 0, persistent->stream>>>(
+        candidate_scores, candidate_ys, output_width, best_key);
+    result = visionflow_cuda::kernel_launch_result();
+    if (result != VF_CUDA_OK) return result;
+    match_unpack_kernel<<<1, 1, 0, persistent->stream>>>(
+        best_key, 1.0f, match_xy_device, match_score_device);
+    result = visionflow_cuda::kernel_launch_result();
+    if (result != VF_CUDA_OK) return result;
+
+    int match_xy[2] = {0, 0};
+    error = cudaMemcpyAsync(
+        match_xy, match_xy_device, sizeof(match_xy), cudaMemcpyDeviceToHost, persistent->stream);
+    if (error == cudaSuccess) {
+        error = cudaMemcpyAsync(
+            out_score, match_score_device, sizeof(float), cudaMemcpyDeviceToHost, persistent->stream);
+    }
+    if (error != cudaSuccess) return cuda_result(error);
+    result = visionflow_cuda::stream_result(persistent->stream);
+    if (result == VF_CUDA_OK) finalize_timing(persistent);
+    if (result != VF_CUDA_OK) return result;
+    if (match_xy[0] < 0 || match_xy[1] < 0) return VF_CUDA_INTERNAL_ERROR;
+
+    out_match[0] = search_x + match_xy[0];
+    out_match[1] = search_y + match_xy[1];
+    out_match[2] = template_width;
+    out_match[3] = template_height;
+    return VF_CUDA_OK;
+}
+
+VF_CUDA_API int vf_match_template_debug_key(void* context, unsigned long long* out_key) {
+    PersistentContext* persistent = static_cast<PersistentContext*>(context);
+    if (persistent == nullptr || out_key == nullptr || persistent->match_candidates == nullptr) {
+        return VF_CUDA_INVALID_ARGUMENT;
+    }
+    const unsigned long long* best_key =
+        reinterpret_cast<const unsigned long long*>(persistent->match_candidates + MATCH_KEY_OFFSET);
+    cudaError_t error = cudaMemcpyAsync(
+        out_key, best_key, sizeof(unsigned long long), cudaMemcpyDeviceToHost, persistent->stream);
+    if (error != cudaSuccess) return cuda_result(error);
+    return visionflow_cuda::stream_result(persistent->stream);
+}
+
+// Diagnostics: copy one prefix plane back for comparison against the CPU reference.
+VF_CUDA_API int vf_match_template_debug_planes(
+    void* context, int plane, int64_t* out_values, size_t count) {
+    PersistentContext* persistent = static_cast<PersistentContext*>(context);
+    if (persistent == nullptr || out_values == nullptr || count == 0 ||
+        plane < 0 || plane >= MATCH_PLANE_COUNT || persistent->match_plane[plane] == nullptr ||
+        count > persistent->match_plane_capacity[plane]) {
+        return VF_CUDA_INVALID_ARGUMENT;
+    }
+    cudaError_t error = cudaMemcpyAsync(
+        out_values, persistent->match_plane[plane], count * sizeof(int64_t),
+        cudaMemcpyDeviceToHost, persistent->stream);
+    if (error != cudaSuccess) return cuda_result(error);
+    return visionflow_cuda::stream_result(persistent->stream);
+}
+
+// Diagnostics: copy the gray search ROI back so a caller can compare it with the CPU gray image.
+VF_CUDA_API int vf_match_template_debug_roi(void* context, uint8_t* out_values, size_t count) {
+    PersistentContext* persistent = static_cast<PersistentContext*>(context);
+    if (persistent == nullptr || out_values == nullptr || count == 0 ||
+        persistent->u8[MATCH_ROI_BUFFER] == nullptr ||
+        count > persistent->u8_capacity[MATCH_ROI_BUFFER]) {
+        return VF_CUDA_INVALID_ARGUMENT;
+    }
+    cudaError_t error = cudaMemcpyAsync(
+        out_values, persistent->u8[MATCH_ROI_BUFFER], count, cudaMemcpyDeviceToHost,
+        persistent->stream);
+    if (error != cudaSuccess) return cuda_result(error);
+    return visionflow_cuda::stream_result(persistent->stream);
 }

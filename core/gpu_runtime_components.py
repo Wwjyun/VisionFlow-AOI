@@ -98,6 +98,11 @@ class GpuCapabilities:
             )
         )
 
+    @property
+    def template_match(self) -> bool:
+        """Optional Template Anchor Grid localization that reads the resident image."""
+        return bool(self.resident_roi and self.has_exports(("vf_match_template_gray_u8",)))
+
 
 @dataclass(slots=True)
 class GpuResourceRegistry:
