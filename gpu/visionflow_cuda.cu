@@ -1162,12 +1162,19 @@ constexpr int MATCH_TILE_COLS = 64;
 constexpr int MATCH_TILE_ROWS = 32;
 constexpr int MATCH_BLOCK_X = 64;
 constexpr int MATCH_BLOCK_Y = 4;
-constexpr size_t MATCH_SHARED_LIMIT_BYTES = 48 * 1024;
+// sm_86 allows up to 100 KiB of dynamic shared memory per block once opted in, and the export
+// opts in for every launch it makes. The tile shrink loop stays within this budget.
+constexpr size_t MATCH_SHARED_LIMIT_BYTES = 99 * 1024;
 // Candidate slots scale with the search width, not the block size: the score kernel writes one
 // entry per output column, so a fixed small count would overflow as soon as output_width exceeds
 // it. Slots are int64-sized so the double scores stay aligned, and the result fields follow them.
-constexpr int MATCH_CANDIDATE_SLOT_STRIDE = 3;   // score (double) + row (int) + padding per column
-constexpr int MATCH_RESULT_SLOTS = 3;            // two int32 coordinates, one float score, one key
+// Layout, all indexed by column count:
+//   [0, W)      packed best keys (one per output column, int64, atomic target)
+//   [W, 2W)     candidate score (double, one per output column)
+//   [2W, 3W)    candidate row (int, one per output column, padded to int64 stride)
+//   then        the two coordinate ints, the float score and the global best key
+constexpr int MATCH_CANDIDATE_SLOT_STRIDE = 3;
+constexpr int MATCH_RESULT_SLOTS = 3;
 constexpr int MATCH_FIXED_SLOTS = MATCH_RESULT_SLOTS + 1;
 
 int match_candidate_slots(int output_width) {
@@ -1178,12 +1185,16 @@ int match_slot_count(int output_width) {
     return match_candidate_slots(output_width) * MATCH_CANDIDATE_SLOT_STRIDE + MATCH_FIXED_SLOTS;
 }
 
-int match_result_offset(int output_width) {
-    return match_candidate_slots(output_width) * MATCH_CANDIDATE_SLOT_STRIDE;
+int match_score_offset(int output_width) {
+    return match_candidate_slots(output_width);
 }
 
-int match_key_offset(int output_width) {
-    return match_result_offset(output_width) + 1;
+int match_row_offset(int output_width) {
+    return match_candidate_slots(output_width) * 2;
+}
+
+int match_result_offset(int output_width) {
+    return match_candidate_slots(output_width) * MATCH_CANDIDATE_SLOT_STRIDE;
 }
 // Match key layout, ordered so that a larger unsigned key is the better match:
 //   bits 62..40 score, bits 39..20 inverted y, bits 19..0 inverted x.
@@ -1241,32 +1252,29 @@ __global__ void match_prefix_kernel(
     }
 }
 
-// Offers one candidate for a column and keeps the best by score, breaking a tie toward the
-// smaller row and then the smaller column. The row/column fields are 20-bit values packed beside
-// the quantized score, and the whole triple is published with one compare-and-swap, so two blocks
-// writing the same column cannot interleave a score from one with a row from the other.
+// Offers one candidate for a column through a dedicated packed-key slot. The key is
+// (quantized score, inverted row, inverted column), so a larger key is a better match and a tie
+// resolves to the smaller row and then the smaller column - the same order as the CPU argmax over
+// the match map. Publishing the whole triple with one compare-and-swap on its own array keeps the
+// winner independent of block and thread order; the score array is never used as the atomic.
 __device__ __forceinline__ void match_offer_candidate(
-    double score, int column, int row, double* candidate_scores, int* candidate_ys) {
-    // No early exit: every thread that computes a candidate offers it, and the compare-and-swap
-    // converges on the best one, so the result does not depend on block or thread order.
+    double score, int column, int row, unsigned long long* best_keys) {
     double clamped = score;
     if (clamped > 1.0) clamped = 1.0;
     if (clamped < 0.0) clamped = 0.0;
     const unsigned long long quantized =
         static_cast<unsigned long long>(clamped * MATCH_SCORE_MAX + 0.5);
     const int safe_row = row > MATCH_COORD_MASK - 1 ? MATCH_COORD_MASK - 1 : row;
+    const int safe_column = column > MATCH_COORD_MASK - 1 ? MATCH_COORD_MASK - 1 : column;
     const unsigned long long key =
         (quantized << 40) |
         (static_cast<unsigned long long>(MATCH_COORD_MASK - safe_row) << 20) |
-        static_cast<unsigned long long>(MATCH_COORD_MASK - column);
-    unsigned long long current = *reinterpret_cast<unsigned long long*>(&candidate_scores[column]);
+        static_cast<unsigned long long>(MATCH_COORD_MASK - safe_column);
+    unsigned long long* slot = best_keys + column;
+    unsigned long long current = *slot;
     while (key > current) {
-        const unsigned long long previous = atomicCAS(
-            reinterpret_cast<unsigned long long*>(&candidate_scores[column]), current, key);
-        if (previous == current) {
-            candidate_ys[column] = safe_row;
-            return;
-        }
+        const unsigned long long previous = atomicCAS(slot, current, key);
+        if (previous == current) break;
         current = previous;
     }
 }
@@ -1285,7 +1293,7 @@ __global__ void match_score_kernel(
     int tile_cols, int tile_rows,
     double template_mean, double template_variance,
     const uint8_t* templ,
-    double* candidate_scores, int* candidate_ys) {
+    unsigned long long* best_keys) {
     extern __shared__ unsigned char shared_bytes[];
     uint8_t* tile = shared_bytes;
 
@@ -1339,10 +1347,8 @@ __global__ void match_score_kernel(
             }
             if (score > 1.0) score = 1.0;
             if (score < -1.0) score = -1.0;
-            const int global_column = first_column + output_column;
-            const int global_row = first_row + output_row;
             match_offer_candidate(
-                score, global_column, global_row, candidate_scores, candidate_ys);
+                score, first_column + output_column, first_row + output_row, best_keys);
         }
     }
 }
@@ -1428,20 +1434,13 @@ __global__ void match_diff_score_kernel(
     candidate_ys[column] = best_y;
 }
 
-// One thread per output column publishes its candidate into the single best-key slot. The
-// candidate column is the thread index, so no separate index array is needed. For
-// TM_SQDIFF_NORMED the caller stores 1 - score, so "larger key wins" and the topmost-then-leftmost
-// tie order still describe the smallest normalized difference.
+// Reduces the per-column packed keys into one slot, keeping the same ordering the columns used.
 __global__ void match_publish_kernel(
-    const double* candidate_scores, const int* candidate_ys,
-    int output_width, unsigned long long* best_key) {
+    const unsigned long long* column_keys, int output_width, unsigned long long* best_key) {
     const int column = blockIdx.x * blockDim.x + threadIdx.x;
     if (column >= output_width) return;
-    const double score = candidate_scores[column];
-    const int y = candidate_ys[column];
-    // y < 0 means the column produced no candidate; publishing it would compute MASK - y and wrap.
-    if (y < 0 || y > MATCH_COORD_MASK - 1 || !(score >= 0.0)) return;
-    const unsigned long long key = match_pack_key(score, column, y);
+    const unsigned long long key = column_keys[column];
+    if (key == 0) return;
     unsigned long long* slot = best_key;
     unsigned long long current = *slot;
     while (key > current) {
@@ -2775,10 +2774,14 @@ VF_CUDA_API int vf_match_template_gray_u8(
     if (result != VF_CUDA_OK) return result;
     persistent->match_candidate_output_width = output_width;
     long long* candidate_storage = persistent->match_candidates;
+    unsigned long long* best_keys = reinterpret_cast<unsigned long long*>(candidate_storage);
+    double* candidate_scores =
+        reinterpret_cast<double*>(candidate_storage + match_score_offset(output_width));
+    int* candidate_ys = reinterpret_cast<int*>(candidate_storage + match_row_offset(output_width));
     // Result slots live in the same grow-only block: two int32 for the winner origin, one float
     // score and one packed best key, all int64-aligned.
     const int result_offset = match_result_offset(output_width);
-    const int key_offset = match_key_offset(output_width);
+    const int key_offset = match_result_offset(output_width) + 1;
     int* match_xy_device = reinterpret_cast<int*>(candidate_storage + result_offset);
     float* match_score_device = reinterpret_cast<float*>(match_xy_device + 2);
     unsigned long long* best_key = reinterpret_cast<unsigned long long*>(candidate_storage + key_offset);
@@ -2834,54 +2837,69 @@ VF_CUDA_API int vf_match_template_gray_u8(
     result = visionflow_cuda::kernel_launch_result();
     if (result != VF_CUDA_OK) return result;
 
-    double* candidate_scores = reinterpret_cast<double*>(candidate_storage);
-    int* candidate_ys = reinterpret_cast<int*>(candidate_storage + match_candidate_slots(output_width));
     // Shrink the tile until its shared footprint fits, because a large template widens the halo.
     int tile_cols = MATCH_TILE_COLS;
     int tile_rows = MATCH_TILE_ROWS;
     size_t shared_bytes = 0;
+    const size_t halo = static_cast<size_t>(template_height - 1);
     for (;;) {
-        shared_bytes = static_cast<size_t>(tile_rows + template_height - 1) *
-                       static_cast<size_t>(tile_cols + template_width - 1);
+        shared_bytes = (static_cast<size_t>(tile_rows) + halo) *
+                       (static_cast<size_t>(tile_cols) + static_cast<size_t>(template_width - 1));
         if (shared_bytes <= MATCH_SHARED_LIMIT_BYTES) break;
-        if (tile_cols > 16) {
-            tile_cols /= 2;
+        // Shrink the larger dimension first, and never below a one-row-tall, 8-column-wide tile,
+        // which keeps the block occupied while reducing the halo overhead.
+        if (tile_cols >= tile_rows && tile_cols > 8) {
+            tile_cols = tile_cols > 16 ? tile_cols / 2 : tile_cols - 4;
             continue;
         }
-        if (tile_rows > 4) {
-            tile_rows /= 2;
+        if (tile_rows > 1) {
+            tile_rows = tile_rows > 2 ? tile_rows / 2 : tile_rows - 1;
             continue;
         }
         break;
     }
     if (shared_bytes > MATCH_SHARED_LIMIT_BYTES) {
-        // A template this large cannot be tiled within the default shared limit; the caller falls
-        // back to the CPU reference instead of failing.
+        // Beyond this the template height alone exceeds the block budget, so the caller restarts
+        // localization on the CPU reference instead of receiving a wrong anchor.
         return VF_CUDA_UNSUPPORTED;
+    }
+    if (cudaFuncSetAttribute(
+            match_score_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
+            static_cast<int>(MATCH_SHARED_LIMIT_BYTES)) != cudaSuccess) {
+        return cuda_result(cudaGetLastError());
     }
     const int tiles_x = (output_width + tile_cols - 1) / tile_cols;
     const int tiles_y = (output_height + tile_rows - 1) / tile_rows;
     const dim3 score_grid(static_cast<unsigned int>(tiles_x) * static_cast<unsigned int>(tiles_y));
     const dim3 score_block(MATCH_BLOCK_X, MATCH_BLOCK_Y);
+    // The per-column key slots are the compare-and-swap targets, so they must start empty.
+    error = cudaMemsetAsync(
+        best_keys, 0, sizeof(unsigned long long) * match_candidate_slots(output_width),
+        persistent->stream);
+    if (error != cudaSuccess) return cuda_result(error);
     match_score_kernel<<<score_grid, score_block, shared_bytes, persistent->stream>>>(
         persistent->u8[MATCH_ROI_BUFFER], search_width,
         output_width, output_height, template_width, template_height,
         template_width * template_height, tile_cols, tile_rows,
         template_mean, template_variance,
         persistent->u8[MATCH_TEMPLATE_BUFFER],
-        candidate_scores, candidate_ys);
+        best_keys);
     result = visionflow_cuda::kernel_launch_result();
     if (result != VF_CUDA_OK) return result;
 
-    // One packed best key decides the winner, so no ordering between blocks can change it.
+    // Reduce the per-column keys to one global best with the same packed ordering, then unpack it
+    // on the device so the host receives coordinates and the quantized score.
     error = cudaMemsetAsync(best_key, 0, sizeof(unsigned long long), persistent->stream);
     if (error != cudaSuccess) return cuda_result(error);
     match_publish_kernel<<<
         dim3((output_width + MATCH_REDUCE_BLOCK - 1) / MATCH_REDUCE_BLOCK, 1),
         dim3(MATCH_REDUCE_BLOCK, 1), 0, persistent->stream>>>(
-        candidate_scores, candidate_ys, output_width, best_key);
+        best_keys, output_width, best_key);
     result = visionflow_cuda::kernel_launch_result();
     if (result != VF_CUDA_OK) return result;
+    (void)candidate_scores;
+    (void)candidate_ys;
+
     match_unpack_kernel<<<1, 1, 0, persistent->stream>>>(
         best_key, 1.0f, match_xy_device, match_score_device);
     result = visionflow_cuda::kernel_launch_result();
@@ -2912,9 +2930,10 @@ VF_CUDA_API int vf_match_template_debug_key(void* context, unsigned long long* o
     if (persistent == nullptr || out_key == nullptr || persistent->match_candidates == nullptr) {
         return VF_CUDA_INVALID_ARGUMENT;
     }
+    const int key_offset =
+        match_result_offset(static_cast<int>(persistent->match_candidate_output_width)) + 1;
     const unsigned long long* best_key = reinterpret_cast<const unsigned long long*>(
-        persistent->match_candidates +
-        match_key_offset(static_cast<int>(persistent->match_candidate_output_width)));
+        persistent->match_candidates + key_offset);
     cudaError_t error = cudaMemcpyAsync(
         out_key, best_key, sizeof(unsigned long long), cudaMemcpyDeviceToHost, persistent->stream);
     if (error != cudaSuccess) return cuda_result(error);
