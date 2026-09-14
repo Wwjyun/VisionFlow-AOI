@@ -36,6 +36,7 @@ gpu/
 ├── test_cuda_api.cu
 ├── preflight_cuda_build.py
 ├── validate_cuda_dll.py
+├── validate_cuda_fault_injection.py
 └── build_cuda_dll.ps1
 ```
 
@@ -81,5 +82,28 @@ validator 或 profiler。
 正式 validator 覆蓋 structured/non-contiguous primitives、linear/DAG plan、resident
 ROI、coordinate batches、context reuse、4K benchmark 與 persistent-plan stress。
 五份 production recipe 的 PASS/NG acceptance 仍需提供可追溯真實樣本 manifest。
+
+實機故障注入不使用 fake DLL：
+
+```powershell
+.\env\Scripts\python.exe gpu\validate_cuda_fault_injection.py `
+  --dll gpu\visionflow_cuda.dll `
+  --vram-pressure `
+  --json-output outputs_validation\fault_injection\report.json
+```
+
+- `init_failure`：子程序設定 `CUDA_VISIBLE_DEVICES=-1`，確認 Detector／`gpu.mode: auto`
+  Pipeline 與 CPU 完全一致且零 CUDA 呼叫，`gpu.mode: cuda` 明確失敗。
+- `kernel_launch_error`：1 像素寬、高度超過 `65535 × 16` 列的影像使 kernel grid
+  無效，真實 launch 失敗後整顆 Detector CPU 重跑；同一 runtime／session 的下一張圖
+  必須恢復 CUDA 且不得沿用上一張的 fallback 狀態。
+- `device_oom`：配置超過專用＋共用 GPU 記憶體的 ROI batch 取得真實 OOM，之後同一
+  context 的小批次與 resident plan 必須立即成功並與 CPU 相同。
+- `--vram-pressure`：另一個程序佔住可用專用 VRAM。Windows 驅動預設的 CUDA sysmem
+  fallback 會讓配置溢出到共用記憶體而非回傳 OOM，因此此項驗證結果等價與時間變化，
+  不代表 OOM 失敗路徑。
+
+高度介於 1,048,561～1,048,576 列的影像會觸發上述 kernel grid 限制並由 CPU fallback
+處理；OpenCV 預設讀圖上限為 1,048,576 列。
 
 完整驗收進度以 [`Todo.md`](../Todo.md) 為準。

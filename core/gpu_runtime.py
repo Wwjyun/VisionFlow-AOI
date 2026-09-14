@@ -1149,6 +1149,15 @@ class GpuRuntime:
         if not self.fallback_to_cpu:
             raise exc
 
+    def clear_recoverable_error(self) -> None:
+        """Start a new inspection scope on a long-lived runtime.
+
+        ``last_error`` disables optional GPU steps for the rest of one run. A shared
+        session must not let one image's recovered failure mark later images as CPU.
+        """
+        with self._lock:
+            self.last_error = ""
+
     @staticmethod
     def _u8_image(
         image: np.ndarray, channels: tuple[int, ...], *, contiguous: bool = True,

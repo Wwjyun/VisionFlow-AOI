@@ -174,6 +174,17 @@ class CudaSourceContractTests(unittest.TestCase):
         self.assertLess(reserve.index("cudaMalloc(&replacement"), reserve.index("free_device(*pointer)"))
         self.assertLess(reserve.index("if (error != cudaSuccess) return"), reserve.index("free_device(*pointer)"))
 
+    def test_reported_runtime_failure_consumes_stale_last_error_and_smoke_covers_oom_recovery(self):
+        root = Path(__file__).resolve().parents[1]
+        internal = (root / "gpu" / "include" / "visionflow_cuda_internal.cuh").read_text(encoding="utf-8")
+        runtime_error = internal.split("inline int runtime_error(", 1)[1].split("inline bool valid_image(", 1)[0]
+        smoke = (root / "gpu" / "test_cuda_api.cu").read_text(encoding="utf-8")
+
+        self.assertLess(runtime_error.index("cudaSuccess) return VF_CUDA_OK"), runtime_error.index("cudaGetLastError()"))
+        self.assertLess(runtime_error.index("cudaGetLastError()"), runtime_error.index("VF_CUDA_RUNTIME_ERROR_BASE"))
+        self.assertIn("oom_recovery_result = vf_roi_batch_create(", smoke)
+        self.assertIn("std::vector<VfRoiV1> oom_rois(65535", smoke)
+
 
 if __name__ == "__main__":
     unittest.main()

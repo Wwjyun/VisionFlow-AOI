@@ -195,6 +195,32 @@ int main() {
         result = vf_roi_batch_download_u8(roi_batch, 1, downloaded_roi.data(), 4 * 3, 3);
     }
     int batch_destroy_result = vf_roi_batch_destroy(roi_batch);
+    // A real device OOM must not leave a stale error for the next ROI batch.
+    const int oom_side = 4096;
+    std::vector<uint8_t> oom_source(static_cast<size_t>(oom_side) * oom_side, 7);
+    uint64_t oom_generation = 0;
+    int oom_result = VF_CUDA_OK;
+    int oom_recovery_result = VF_CUDA_OK;
+    if (result == VF_CUDA_OK) {
+        result = vf_context_upload_u8(
+            context, oom_source.data(), oom_side, oom_side, oom_side, 1, &oom_generation);
+    }
+    if (result == VF_CUDA_OK) {
+        std::vector<VfRoiV1> oom_rois(65535, VfRoiV1{sizeof(VfRoiV1), 0, 0, oom_side, oom_side});
+        void* oom_batch = nullptr;
+        oom_result = vf_roi_batch_create(
+            context, oom_generation, oom_rois.data(), static_cast<int>(oom_rois.size()), &oom_batch);
+        if (oom_result == VF_CUDA_OK) vf_roi_batch_destroy(oom_batch);
+        void* recovery_batch = nullptr;
+        oom_recovery_result = vf_roi_batch_create(
+            context, oom_generation, batch_rois, 2, &recovery_batch);
+        if (oom_recovery_result == VF_CUDA_OK) vf_roi_batch_destroy(recovery_batch);
+    }
+    if (result == VF_CUDA_OK && (oom_result == VF_CUDA_OK || oom_recovery_result != VF_CUDA_OK)) {
+        std::cerr << "ROI batch OOM recovery failed: oom_result=" << oom_result
+                  << " recovery_result=" << oom_recovery_result << "\n";
+        return 9;
+    }
     VfCudaTimingsV1 timings{};
     timings.struct_size = sizeof(VfCudaTimingsV1);
     timings.version = 1;

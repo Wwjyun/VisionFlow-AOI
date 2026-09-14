@@ -22,7 +22,7 @@
 - [x] Gaussian 已改 separable kernels；Adaptive Mean 已改 64-bit integral image。
 - [x] 已有 persistent context、grow-only buffers 與 401-2 fused preprocessing 原型。
 - [x] 已建立通用 `PreprocessPlan`、typed operators、CPU/CUDA executors，401-2 已完成第一階段遷移。
-- [ ] 目前開發機缺少可用的 `nvcc`/CMake，新增 CUDA 原始碼仍需在 RTX 3090 重新編譯與實測。
+- [x] 目前開發機已具備 RTX 3090（Driver 610.62）、CUDA 13.3 `nvcc` 與 Visual Studio 18 x64 工具，可經 `vcvars64.bat` 執行 `gpu/build_cuda_dll.ps1`（建置不需 CMake）；新增 CUDA 原始碼仍須每次重編並跑 native smoke／validator 後才可宣稱通過。
 - [ ] 尚未完成固定 production 測試集、五個 recipes 全流程等價、長時間壓測與可信的 CPU/GPU benchmark。
 
 ## P0：正確性、CPU 基準與觀測能力
@@ -47,7 +47,7 @@
 - [ ] 補入固定真實 AOI 影像測例；manifest schema、路徑/標籤/coverage 驗證已完成，待取得可追蹤的生產樣本後執行。
 - [x] 覆蓋奇數尺寸、極小圖、4K、non-contiguous stride、1/3 channels 與不同 ROI 尺寸。
 - [ ] 五個 production recipes 各準備至少一張 PASS 與一張 NG 樣本；`gpu/production_manifest.example.yaml` 已固定所需 10 個 case，影像待提供。
-- [ ] 實機注入 kernel error、CUDA 初始化失敗與 OOM，確認 fallback 後無 stale pointer 或錯誤中間結果。（loader tests 已覆蓋 ABI mismatch、無 device、context init failure；fake execution/OOM recovery 已完成，實機注入待 RTX）
+- [x] 實機注入 kernel error、CUDA 初始化失敗與 OOM，確認 fallback 後無 stale pointer 或錯誤中間結果。（2026-09-14 RTX 3090 以 `gpu/validate_cuda_fault_injection.py` 完成：`CUDA_VISIBLE_DEVICES=-1`、超過 kernel grid 上限的真實 launch error、超過專用＋共用 GPU 記憶體的 ROI batch OOM；Detector／Pipeline 與 CPU 完全一致，同一 runtime／session 下一張圖恢復 CUDA。sticky context error 另列 P2 待辦）
 - [x] `fallback_to_cpu: false` 且 CUDA DLL 不可用時必須明確失敗，不可回報假的 GPU success。
 
 ## P1：共用 Preprocess Plan 架構
@@ -99,7 +99,9 @@
 - [x] `GpuRuntime` 提供 `close()`、context manager、destructor 與 `RLock` 序列化。
 - [x] 將 CUDA stream、morphology ping-pong 與所有 plan scratch 納入同一 context。
 - [x] monitor/batch 跨多張影像重用同一個長生命週期 `GpuRuntime`/context。
-- [ ] 測試尺寸增減、channel 切換、參數改變、CUDA error/OOM 後的重用與釋放。（validator 已覆蓋 shape grow/shrink、1/3 channel、參數切換與 warm allocation plateau；fake DLL 已覆蓋 execution error recovery、ROI batch OOM 降批，source contract 固定 allocation-before-free；真實 CUDA error/OOM 仍待 RTX）
+- [x] 測試尺寸增減、channel 切換、參數改變、CUDA error/OOM 後的重用與釋放。（validator 覆蓋 shape grow/shrink、1/3 channel、參數切換與 warm allocation plateau；2026-09-14 RTX 3090 真實 launch error 後 context allocation 不再增加、真實 OOM 後連續三次小批次／resident plan 與 CPU 相同且 allocation count 不變、失敗 batch 不留下 native handle）
+- [ ] 偵測 sticky CUDA context error（例如 illegal memory access）後，明確停用或重建共用 `GpuExecutionSession`，並以 GUI／監控狀態提示重新啟動；目前每次 run 仍會嘗試 CUDA 後整顆 Detector CPU fallback，結果正確但會重複失敗。需在 RTX 以隔離子程序注入驗證。
+- [ ] 評估 Windows 驅動預設 CUDA sysmem fallback：佔滿專用 VRAM 時配置溢出到共用記憶體而不回傳 OOM（2026-09-14 4K plan 結果等價、新 context 首次 51 ms），需以正式大圖／批次量測溢出後的端到端延遲，決定是否以 `recommended_roi_batch_size`／監控告警限制專用 VRAM 使用量。
 - [ ] 評估 `cudaMallocAsync`/memory pool；只有相容且實測有收益時採用。
 
 ### Morphology
@@ -410,6 +412,8 @@
 - [ ] 加速不得犧牲 GUI 回應、打包啟動、結果追溯、錯誤訊息或 CPU fallback。
 
 ## 完成紀錄
+
+- [x] 2026-09-14：完成 RTX 3090 實機 CUDA 故障注入並修正兩個因此發現的恢復缺陷。新增 `gpu/validate_cuda_fault_injection.py`（不使用 fake DLL）：`CUDA_VISIBLE_DEVICES=-1` 子程序中 Detector 與 `gpu.mode=auto` Pipeline 與 CPU 完全一致且零 CUDA 呼叫、`gpu.mode=cuda` 明確失敗；1×1,048,570 影像使 kernel grid 超過 65535 列，真實 launch 回傳 1001 後整顆 Detector CPU 重跑、strict 模式直接回報，同一 runtime 下一張圖恢復 CUDA 且 context allocation 不再增加；65535 張 4096² ROI batch 取得真實 1002 OOM，失敗 batch 不留 native handle，之後連續三次小批次與 resident plan 逐像素等於 CPU、allocation count 不變。缺陷一（DLL）：失敗的 `cudaMalloc` 會殘留 CUDA thread-local last error，下一次 kernel launch 檢查再回報同一個 OOM，使 OOM 後第一個小批次也失敗、`iter_roi_batches` 降批時每層被吃掉一次；`runtime_error()` 改為回報錯誤時同時消耗 last error，新增 native smoke（舊 DLL 實測回傳 exit 9／1002，重編後通過）與 source contract。缺陷二（Python）：共用 `GpuExecutionSession` 中一張圖的 GPU crop／resident upload 失敗會讓 `last_error` 永久殘留，之後正常圖片仍顯示 tiling CPU fallback 且不再嘗試 GPU crop（RTX 實測重現）；`runtime_for()` 現在於每次 Pipeline run 開始清除可恢復錯誤，新增 fake runtime 回歸測試（未修正前 2 項失敗）。另以子程序佔住 23,208 MiB 專用 VRAM，Windows 驅動預設 sysmem fallback 使 4K plan 配置溢出而非 OOM，結果仍等價、median 7.8→7.6 ms、新 context 首次 51 ms，已列 P2 待評估；sticky context error 需重建 session 另列待辦。以 CUDA 13.3、MSVC（VS 18）、`sm_86` 重編 DLL，native smoke、fault injection（含 VRAM pressure）、`validate_cuda_dll.py`（126 PASS、4K benchmark、10／100／1000 stress allocation 維持 44）、完整 339 tests、compileall、CUDA preflight、CLI 合成 NG（預期 exit 2）與 `git diff --check` 均通過。已知限制：高度 1,048,561～1,048,576 列的影像會觸發 kernel grid 上限並安全回退 CPU。ABI v1 與 exports 未變；production 真圖驗收仍待樣本。
 
 - [x] 2026-09-14：`llm-delegate` MCP 的 GLM 與 Qwen provider 改經 OpenRouter（`https://openrouter.ai/api/v1`），共用 `OPENROUTER_API_KEY`，預設模型分別為 `z-ai/glm-5.3-flash`、`qwen/qwen3.8-flash`（仍可用 `GLM_MODEL`／`QWEN_MODEL`／`*_BASE_URL` 或 `model` 參數覆寫）；串流解析同時接受 DeepSeek `reasoning_content` 與 OpenRouter `reasoning` 欄位，並更新 `CLAUDE.md` 設定說明。本機假 OpenRouter SSE smoke 驗證 provider 清單、Bearer 授權、`/chat/completions` 路徑、模型 ID、`: OPENROUTER PROCESSING` 註解行略過、reasoning 計數與提案可套用；真實 OpenRouter 以合成 `clamp` 範例（不含 repo 程式碼）實測：`z-ai/glm-5.3-flash` TTFT 0.78 s、總時間 7.07 s、約 167 output tokens/s（含 621 reasoning tokens），`qwen/qwen3.8-flash` TTFT 0.55 s、總時間 3.39 s、約 302 output tokens/s；兩者提案皆可套用，產生的 5 個 unittest 均通過。未修改 runtime、Detector、Recipe、GUI、CUDA source／header／ABI／DLL。
 - [x] 2026-09-14：啟用 resident GPU ROI 時，grid／Template Anchor Grid tile 改為 CPU 原圖零複製 view，原生 linear／DAG plan 的 capability 與 ROI 執行不再對非連續 view 做 `ascontiguousarray`；混用 CPU Detector 時才按需複製獨立 CPU tile。RTX 3090 的 16384×13000 合成 BGR／六個 2300×12000 ROI 基準，六張 CPU tile 複製 warm median 148.5→resident view 0.1 ms，整圖 H2D 78.2 ms，單張大 ROI native Gray plan 額外 H2D 為零；4K 合成圖交錯 A/B 的 GPU Pipeline warm median 296→268 ms（約 9.5%），tile 階段 15.3→0.6 ms，PASS/NG、Tile 與 defect count 相同。1K 合成圖 CPU/GPU overlay 與九張 NG tile PNG 逐像素相同。完整 336 tests、compileall、CUDA preflight、RTX native C ABI smoke／validator（含 ROI batch 8/16/32/64 與 10/100 stress）、strict GPU CLI 預期 NG exit 2、diff check 均通過。此為合成資料與局部執行證據，完整產線 Recipe／真圖等價、端到端收益及長時間穩定性仍待驗收，production 預設未變。

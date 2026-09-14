@@ -10,7 +10,7 @@ import cv2
 import numpy as np
 
 from core.batch_processor import BatchImageResult, BatchInspectionProcessor
-from core.gpu_runtime import GpuResidentImage, GpuRuntimeError
+from core.gpu_runtime import GpuResidentImage, GpuRuntime, GpuRuntimeError
 from core.gpu_session import GpuExecutionSession, GpuExecutionSessionCache
 from core.monitor_processor import FolderMonitorProcessor
 from core.pipeline import AOIPipeline
@@ -24,6 +24,9 @@ ROOT = Path(__file__).resolve().parents[1]
 class _CloseTrackingRuntime:
     def __init__(self):
         self.close_calls = 0
+
+    def clear_recoverable_error(self):
+        pass
 
     def close(self):
         self.close_calls += 1
@@ -39,12 +42,24 @@ class _ResidentRuntime:
     device_name = "fake"
     compute_capability = "8.6"
 
-    def __init__(self):
+    def __init__(self, failing_uploads: int = 0):
         self.upload_calls = 0
         self.close_calls = 0
+        self.failing_uploads = int(failing_uploads)
+        self.last_error = ""
+
+    def fallback_or_raise(self, exc):
+        self.last_error = str(exc)
+        if not self.fallback_to_cpu:
+            raise exc
+
+    def clear_recoverable_error(self):
+        self.last_error = ""
 
     def upload_image(self, image):
         self.upload_calls += 1
+        if self.upload_calls <= self.failing_uploads:
+            raise GpuRuntimeError("vf_context_upload_u8 failed with CUDA DLL error 1002: out of memory")
         height, width = image.shape[:2]
         channels = 1 if image.ndim == 2 else image.shape[2]
         return GpuResidentImage(self, self.upload_calls, width, height, channels)
@@ -220,6 +235,73 @@ class GpuExecutionSessionTests(unittest.TestCase):
                 (roi.x, roi.y, roi.width, roi.height),
                 (tile["tile"]["x"], tile["tile"]["y"], tile["tile"]["width"], tile["tile"]["height"]),
             )
+
+    def test_session_run_scope_clears_previous_recoverable_gpu_error(self):
+        runtime = GpuRuntime("missing_fault_scope.dll", enabled=False)
+        config = {"dll_path": "missing_fault_scope.dll", "fallback_to_cpu": True}
+        session = GpuExecutionSession(runtime, requested=True, config=config)
+        try:
+            runtime.fallback_or_raise(GpuRuntimeError("vf_crop_u8 failed with CUDA DLL error 1001"))
+            self.assertTrue(runtime.last_error)
+
+            self.assertIs(session.runtime_for(config, requested=True), runtime)
+
+            self.assertEqual(runtime.last_error, "")
+        finally:
+            session.close()
+
+    def test_failed_resident_upload_does_not_disable_next_session_run(self):
+        recipe_path = ROOT / "recipes" / "PRODUCT_A_NEGATIVE_401_AOI_01.yaml"
+        recipe = deepcopy(AOIPipeline(recipe_path, ROOT / "outputs").recipe_manager.load(recipe_path))
+        recipe["gpu"] = {
+            "mode": "auto",
+            "dll_path": "fake_resident.dll",
+            "fallback_to_cpu": True,
+            "tiling": False,
+        }
+        for config in recipe["detectors"].values():
+            config["enabled"] = False
+        recipe["detectors"]["401-AS-SN-1"]["enabled"] = True
+        recipe["detectors"]["401-AS-SN-1"]["use_gpu"] = True
+        runtime = _ResidentRuntime(failing_uploads=1)
+        session = GpuExecutionSession(runtime, requested=True, config=recipe["gpu"])
+        output_overrides = {
+            "save_overlay": False,
+            "save_ng_tiles": False,
+            "save_csv": False,
+            "save_matrix_csv": False,
+            "save_json": False,
+        }
+
+        with tempfile.TemporaryDirectory(prefix="visionflow_fault_scope_") as temporary:
+            image_path = Path(temporary) / "input.png"
+            encoded, buffer = cv2.imencode(".png", np.zeros((600, 600, 3), dtype=np.uint8))
+            self.assertTrue(encoded)
+            image_path.write_bytes(buffer.tobytes())
+            results = []
+            errors_after_run = []
+            for _ in range(2):
+                detector = _RoiCapturingDetector()
+                pipeline = AOIPipeline(
+                    recipe_path,
+                    Path(temporary),
+                    output_overrides=output_overrides,
+                    gpu_session=session,
+                )
+                pipeline.recipe_manager.load = Mock(return_value=recipe)
+                pipeline.detector_manager.create_enabled = Mock(return_value=[detector])
+                results.append((pipeline.run(image_path), detector))
+                errors_after_run.append(runtime.last_error)
+
+        (first, first_detector), (second, second_detector) = results
+        self.assertIn("out of memory", errors_after_run[0])
+        self.assertFalse(first["execution"]["gpu"]["resident_image"]["active"])
+        self.assertTrue(all(roi is None for roi in first_detector.device_rois))
+        self.assertEqual(errors_after_run[1], "")
+        self.assertTrue(second["execution"]["gpu"]["resident_image"]["active"])
+        self.assertTrue(all(roi is not None for roi in second_detector.device_rois))
+        self.assertEqual(first["final_result"], second["final_result"])
+        self.assertEqual(runtime.upload_calls, 2)
 
     def test_latency_and_throughput_sessions_select_distinct_queue_policy(self):
         recipe_path = ROOT / "recipes" / "PRODUCT_A_NEGATIVE_401_AOI_01.yaml"

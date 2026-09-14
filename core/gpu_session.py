@@ -75,6 +75,8 @@ class GpuExecutionSession:
             raise GpuRuntimeError("Injected GPU session is incompatible with the recipe GPU configuration")
         if requested and not self.requested:
             raise GpuRuntimeError("Injected GPU session was created without CUDA enabled")
+        # Each pipeline run is a separate recoverable-failure scope on the shared runtime.
+        self.runtime.clear_recoverable_error()
         return self.runtime
 
     def close(self) -> None:

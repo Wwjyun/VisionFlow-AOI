@@ -199,6 +199,7 @@ AOI_CVbased/
 |   |-- preflight_cuda_build.py     # ABI/source/build manifest 靜態檢查
 |   |-- production_manifest.example.yaml # 五份配方 PASS／NG 驗收清單範例
 |   |-- validate_cuda_dll.py        # CPU／GPU 比對工具
+|   |-- validate_cuda_fault_injection.py # 實機 CUDA 初始化失敗／kernel error／OOM 注入
 |   `-- build_cuda_dll.ps1          # CUDA 編譯入口
 |-- cuda_practice/                  # 獨立 CUDA 學習與裝置檢查範例
 |-- design_handoff_aoi_gui/         # GUI 設計交接參考，不是 runtime dependency
