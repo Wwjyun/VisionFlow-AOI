@@ -157,6 +157,14 @@
 - [x] 使用 bounded 單一 GPU queue，避免多個 CPU workers 同時搶 GPU 或無限制累積 VRAM。
 - [ ] 評估 pinned host memory 與 CUDA streams，量測 upload/kernel/download 重疊收益。
 
+### 大圖 GPU ROI 直通 Detector（2026-09-14 規劃，尚未實作）
+
+- [ ] 保持 PNG／JPEG 等圖片由 CPU 讀檔與 OpenCV 解碼成 BGR；啟用原生 GPU Detector 的 grid 路徑在解碼後整圖只做一次 H2D upload，tile 只保存 resident image 的 ROI 座標／尺寸，Detector 由 GPU 內部 D2D staging 接續 CUDA plan，不逐 tile 下載 BGR，也不逐 tile 重傳原圖。非 grid 定位（例如 contour／pattern match）仍依其 CPU 定位語意另行評估。
+- [ ] GPU 路徑不要在切圖階段預先產生所有 CPU tile 副本；同步調整 Tile、Detector／PreprocessPlan 的輸入與能力檢查，以 ROI 的 shape／dtype／channels metadata 驗證，避免 `np.ascontiguousarray` 對非連續 CPU view 偷做等量複製。確認 GPU plan、ROI inset、generation／bounds 及 batch／monitor 共用 session 均維持正確生命週期。
+- [ ] CPU Detector、GPU 不可用或 plan/kernel/OOM 失敗時，才由保留的 CPU 原圖按 ROI 取得像素並依既有政策重跑完整 Detector；`gpu.mode=cpu/auto/cuda`、舊 DLL、strict CUDA、混用 CPU/GPU Detector 的路由與 fallback 訊息必須維持一致，不能用部分 GPU 中間結果接續 CPU。
+- [ ] Overlay、NG tile／sidecar、debug 與 GUI 預覽所需的 CPU 像素按需取得；401 等目前仍需 CPU `findContours`／幾何判定的 Detector 只下載必要的 binary mask，檢查 PASS/NG、tile 順序／座標、defect bbox／area／confidence／metadata、輸出內容與 CPU 基準等價。
+- [ ] 用同一批真實 16384×13000 圖、約六個 2300×12000 ROI 及正式 Recipe／輸出設定，在 RTX 3090 比較修改前後 cold、warm median／P95、image load、整圖 H2D、tile 建立、Detector、D2D／必要 D2H、Reporter、端到端耗時、RAM／VRAM 峰值與 100 次穩定性；未證明整體收益與完整等價前保持 production 預設不變。2026-09-14 合成尺寸基準：BGR 原圖約 609.4 MiB，六張 CPU tile 副本約 473.8 MiB，CPU 裁切 warm median 128.6 ms，整圖 H2D 85.0 ms，ROI descriptor 建立約 0.03 ms；預期省的是 CPU 副本及其約 129 ms 複製，不包含既有 H2D，端到端百分比須以目前每張總耗時為分母實測。
+
 ## P5：CPU 與整體 Pipeline 最佳化
 
 - [x] 分別量測 `findContours`、幾何分析、Python tile/detector 迴圈、progress callback、aggregation 與 reporter。
@@ -386,6 +394,7 @@
 
 ## 完成紀錄
 
+- [x] 2026-09-14：完成大圖 GPU ROI 直通 Detector 的現況盤點、RTX 3090 合成尺寸量測與實作／驗收規劃，新增 P4 未完成項目；確認現有原生 GPU grid 路徑已整圖一次 H2D、device ROI 額外 H2D 為零，但仍預製 CPU tile，binary mask 仍依 Detector 需求 D2H。16384×13000、六個 2300×12000 ROI 的 CPU tile 複製 warm median 128.6 ms，整圖上傳 85.0 ms，約 473.8 MiB CPU 副本可望省去；此為切圖階段上限估算，尚未修改 runtime／Detector／CUDA、未驗證產線端到端加速。
 - [x] 2026-09-14：主 Pipeline／GUI／切圖模板讀圖改由 OpenCV `imdecode` 直接產生 BGR，保留 Windows 中文路徑及 EXIF 旋轉；RGB 預覽僅在需要時轉換。OpenCV 載入前提高像素／寬高上限，調參工具亦套用相同設定。新增中文路徑、透明圖、EXIF、壞檔及小上限啟動回歸測試；本機 16384×50000 合成 PNG 成功解碼為 2.46 GB BGR，單次 OpenCV 3.84 秒、舊 Pillow→NumPy→OpenCV 11.01 秒，GUI 預覽 worker 亦成功建立完整尺寸 QImage（約 4.24 秒）。完整單元測試、compileall、CUDA preflight、中文檔名 CLI PASS、GUI offscreen smoke 與 diff check 通過；真實產線圖速度及可處理尺寸仍受 RAM 與後續處理額外配置影響。
 - [x] 2026-09-14：新增 CPU opt-in 平行切圖，`performance.crop_workers`／`AOI_CROP_WORKERS` 可設定 worker 數，獨立 tiler 支援 `tile.crop_workers`；一般 grid、先整圖 Pattern Match 再依 offset／rows／cols／ROI／gap 裁切的 Template Anchor Grid、contour 與 pattern_match 均使用有界且保序的 ROI 裁切工作池。GPU crop／resident image 仍維持序列，0～1 張 tile 不建立工作池。四模式像素、座標、metadata 與排序等價、實際多執行緒、GPU 路由及 Pipeline 串接測試通過；完整 327 tests、compileall、CUDA ABI preflight、CPU CLI 合成 PASS smoke 與 `git diff --check` 通過。未改 CUDA source／ABI／DLL，實際產線資料集加速幅度仍待量測。
 - [x] 2026-09-14：依使用者要求將 CPU 切圖預設升為工作量自動選擇：前 16 張 ROI 至少 4 張且總裁切量達 8 MiB 時最多用 4 workers，小批／小 Tile 維持序列，明確指定 worker 數仍可覆寫。本機 16 邏輯核心、3072×4096 合成圖切圖基準顯示 64×64 grid 序列 median 44.9 ms、4 workers 137.7 ms；512×512 grid 序列 9.5 ms、4 workers 6.2 ms，Template Anchor Grid 256×256 序列 10.1 ms、4 workers 11.5 ms。63 tiles 的合成全 Pipeline median 由序列 387 ms 降至 auto 375 ms，PASS/NG、Tile 座標與順序一致。完整 329 tests、compileall、CUDA ABI preflight、CPU CLI 合成 PASS smoke 與 `git diff --check` 通過；門檻為本機合成尺寸上的保守預設，產線最佳值仍須用固定 production 資料集驗證。
