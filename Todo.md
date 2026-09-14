@@ -183,7 +183,7 @@
 - [x] PNG／JPEG 等圖片保持 CPU 讀檔／OpenCV BGR 解碼；啟用原生 GPU Detector 的 grid／Template Anchor Grid 路徑在切 tile 前整圖只做一次 H2D upload，tile 以 resident device ROI 執行 D2D staging 與 CUDA plan，不逐 tile 下載 BGR 或重傳原圖；tile 同時保留不複製像素的 CPU 原圖 view 供 shape、fallback 與報表。非 grid 定位（例如 contour／pattern match）仍依其 CPU 定位語意另行評估。
 - [x] GPU resident tile 不再預製所有 CPU tile 副本；PreprocessPlan／native linear 與 DAG 能力查詢及 device ROI 執行可用非連續 NumPy view 的 shape／dtype／channels 驗證，避免 `np.ascontiguousarray` 偷做等量複製。ROI inset、generation／bounds 與 batch／monitor 共用 session 沿用既有生命週期。
 - [x] 混用 CPU Detector 時才按需建立獨立 CPU tile 副本供該 tile 的 CPU Detectors 共用；GPU 執行失敗時依既有政策從原圖 view 重跑完整 Detector。保留 `gpu.mode=cpu/auto/cuda`、舊 DLL 與 strict CUDA 路由，不混用部分 GPU 中間結果與 CPU 後續步驟。
-- [ ] Overlay、NG tile／sidecar、debug 與 GUI 預覽所需的 CPU 像素按需取得；401 等目前仍需 CPU `findContours`／幾何判定的 Detector 只下載必要的 binary mask，檢查 PASS/NG、tile 順序／座標、defect bbox／area／confidence／metadata、輸出內容與 CPU 基準等價。
+- [x] Overlay、NG tile／sidecar、debug 與 GUI 預覽所需的 CPU 像素按需取得；（2026-09-14 RTX 3090 以合成 16384×13000、6 個 2000×12000 ROI 開啟全部輸出與 debug images 驗證：CPU／strict CUDA 各 22 個輸出檔，PNG 逐像素、JSON／sidecar 與 CSV 除耗時／後端／路徑外完全相同；resident tile 仍為 CPU 原圖零複製 view，只有 debug 開啟時才複製中間影像，GUI 預覽維持獨立 CPU 讀圖）401 等目前仍需 CPU `findContours`／幾何判定的 Detector 只下載必要的 binary mask，檢查 PASS/NG、tile 順序／座標、defect bbox／area／confidence／metadata、輸出內容與 CPU 基準等價。
 - [ ] 用同一批真實 16384×13000 圖、約六個 2300×12000 ROI 及正式 Recipe／輸出設定，在 RTX 3090 比較修改前後 cold、warm median／P95、image load、整圖 H2D、tile 建立、Detector、D2D／必要 D2H、Reporter、端到端耗時、RAM／VRAM 峰值與 100 次穩定性；未證明整體收益與完整等價前保持 production 預設不變。2026-09-14 合成尺寸基準：BGR 原圖約 609.4 MiB，六張 CPU tile 副本約 473.8 MiB，CPU 裁切 warm median 128.6 ms，整圖 H2D 85.0 ms，ROI descriptor 建立約 0.03 ms；預期省的是 CPU 副本及其約 129 ms 複製，不包含既有 H2D，端到端百分比須以目前每張總耗時為分母實測。
 
 ## P5：CPU 與整體 Pipeline 最佳化
@@ -415,6 +415,8 @@
 - [ ] 加速不得犧牲 GUI 回應、打包啟動、結果追溯、錯誤訊息或 CPU fallback。
 
 ## 完成紀錄
+
+- [x] 2026-09-14：完成大圖 GPU resident ROI 路徑的輸出等價驗收。以合成 16384×13000 BMP、正式 401-AS-SN-1 參數、Template Anchor Grid 6 個 2000×12000 ROI，開啟 overlay、NG tiles、CSV、矩陣 CSV、JSON 與 `save_debug_images`，分別以 `gpu.mode: cpu` 與 strict `gpu.mode: cuda`（backend `cuda_dll`、resident ROI）執行。兩者皆 NG、6 tiles、6 NG tiles、597 defects，各產生 22 個檔案且相對路徑（去除時間戳記）一致：13 張 PNG（overlay、NG tile、debug 階段影像）解碼後逐像素相同，7 份 JSON（檢測結果與 NG tile sidecar）與 2 份 CSV 在排除耗時、執行後端與輸出路徑後完全相同。Detector 仍只下載必要 binary mask，tile 影像維持 CPU 原圖零複製 view，debug 影像只在開啟時複製；未修改 runtime、CUDA source／ABI／DLL。真圖端到端收益仍依下一項。
 
 - [x] 2026-09-14：完成 pinned host memory 評估，決定不採用於 resident 整圖上傳。RTX 3090 以 16384×13000 BGR 與正式 401-AS-SN-1 plan（6 個 2000×12000 resident ROI）量測：同一 NumPy 陣列持續以 `cudaHostRegister` pin 住時，DLL `vf_context_upload_u8` median 由 pageable 88.97／78.8 ms 降為 55.38 ms（約 11 GB/s，接近本機 PCIe 頻寬上限），6 ROI plan 200.1→180.0 ms、單次 mask D2H 5.8→4.8 ms 差異在雜訊內。但產線每張圖由 OpenCV 解碼成新陣列，同一程序交錯 10 輪「新陣列 register（2.6 ms）→ upload → unregister（13.4 ms）」完整週期 median 115.0 ms，與 pageable 113.3 ms 持平（5/10 勝），因為新頁面的實際 pin 成本轉移到複製期間；改用常駐 pinned buffer 則需先額外複製 609 MiB，OpenCV `imdecode` 也無法直接解碼到指定 buffer。單張 Pipeline 為單一序列 stream，upload／kernel／download 無可重疊區段；跨圖片重疊依 execution slots 待辦條件另行評估。未修改 runtime、CUDA source／ABI／DLL。
 
