@@ -40,13 +40,15 @@ AOI 專案若將每種產品的規則硬寫在程式內，往往很快就難以�
 
 - Windows 10／11
 - Python 3.13（CI、打包與目前部署環境的鎖定版本）
-- OpenCV：影像處理與傳統 CV Detector
+- OpenCV：完整解析度影像載入、影像處理與傳統 CV Detector
 - NumPy：數值運算
-- Pillow：大型影像載入與預覽轉換
+- Pillow：散佈圖匯出工具使用
 - PyYAML：配方讀寫
 - PySide6：桌面 GUI
 - PyInstaller：Windows 打包
 - CUDA Toolkit 與 NVIDIA GPU：僅 CUDA 加速功能需要
+
+主 Pipeline、GUI 與切圖模板使用 OpenCV 直接解碼完整影像。啟動時會提高 OpenCV 的像素與寬高檢查上限；例如 16384×50000 彩色圖解碼後仍需約 2.46 GB RAM，實際可處理大小取決於可用記憶體與後續處理所需的額外空間。
 
 直接相依套件固定在 `requirements.txt`，完整 Windows transitive lock 位於 `requirements.lock.txt`；版本升級來源則保留在 `requirements.in`。CI、RTX runner 與打包環境一律安裝 lock：
 

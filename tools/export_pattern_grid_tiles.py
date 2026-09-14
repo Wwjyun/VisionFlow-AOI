@@ -6,6 +6,7 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path
 
+import core  # Apply OpenCV image limits before its native module is imported.
 import cv2
 import yaml
 from PySide6.QtCore import QObject, QSettings, QThread, QTimer, Signal, Slot
