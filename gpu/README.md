@@ -34,6 +34,30 @@ float 累加的逐像素一致性，不可移除。
 plan，tile metadata 以 `cpu_crossover` 路線與 `preprocess_routes` 標示。`gpu.mode: cuda`
 不啟用此路由。
 
+## 已實作但尚未接入產線的步驟
+
+以下 operator 已完成並以 RTX 3090 對 OpenCV 做等價量測，但**尚未接進任何 Detector**，因此在
+`execution.gpu.device_host_split` 中仍回報為 cpu。啟用前必須先接線並通過 PASS/NG、缺陷數、
+bbox、area、confidence、metadata 等價測試。
+
+- `vf_match_template_gray_u8`（Template Anchor Grid 定位）：**已接入** `core/tiler.py`。
+  與 `cv2.matchTemplate` 的定位座標在 9 個場景 9/9 相同、分數差 ≤ 4.2e-7、逐次執行決定性。
+  形狀界線內（template 每邊 ≤ 128 px 且搜尋面積 ≥ 256×256）比 CPU 快 1.6～3.9 倍，
+  界線外或失敗時回 CPU 參考；界線見 `core/tiler.py` 的 `gpu_anchor_shapes_supported`。
+- `vf_find_contours_u8` / `vf_find_contours_download`（輪廓抽取）：與
+  `cv2.findContours(RETR_LIST/RETR_EXTERNAL, CHAIN_APPROX_SIMPLE)` 在
+  `tools/check_contour_equivalence.py` 的 **314 個案例全部逐點相同且決定性**（含輪廓數、
+  每條 shape、點順序、子區域座標契約）。速度尚未全面勝過 CPU：2000×12000 於
+  `RETR_LIST` 密集 358 條輪廓為 8.1～9.9 ms、比 cv2（13.2～14.6 ms）快；
+  稀疏 200 條大輪廓為 39～40 ms、比 cv2（14～15 ms）慢約 2.6 倍；`RETR_EXTERNAL`
+  仍走逐列掃描、約 1227 ms，明顯較慢。因此**維持停用**，不得視為已完成步驟。
+- `vf_median_f32`（float32 精確中位數，供 202-CS-SN-1 的 median／MAD 使用）：仍在校正與等價
+  驗證中，未有可啟用的實作。量測顯示中位數運算約佔該 Detector 75% 的時間，是該 Detector
+  GPU 化的首要目標。
+
+`vf_match_template_debug_*` 與 `vf_find_contours_*` 的下載介面只供等價驗證與診斷使用，
+不屬於產線路徑。
+
 ## 檔案
 
 ```text

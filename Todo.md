@@ -201,8 +201,18 @@
   效能 2000×12000 sparse 200 條輪廓 39.92 ms vs cv2 14.03 ms（2.85×，仍較慢）、
   dense 358 條輪廓 **9.92 ms vs cv2 14.41 ms（比 cv2 快 1.45×）**，kernel 3.85 ms、h2d 0 ms。
   另 2000×2000 密集案例先前亦已量得快於 cv2。
-- 後續：等價與速度多數情境已具備，但仍有稀疏情境較慢；啟用前需定義形狀／密度界線（比照 anchor 的 `gpu_anchor_shapes_supported` 作法），
-  且必須先把 contour 接進 Detector 並通過 PASS/NG、bbox、area、confidence、metadata 等價測試。**目前仍未接進任何 Detector**，`candidate_extraction` 仍回報 cpu。
+- 後續：等價已具備但**速度尚未全面勝過 CPU**，因此不得啟用。最終量測（RTX 3090、2000×12000、皆 identical）：
+  `RETR_LIST` 密集 358 條輪廓 8.1～9.9 ms vs cv2 13.2～14.6 ms（比 cv2 快）；
+  稀疏 200 條大輪廓 39.0～39.9 ms vs cv2 14.0～15.2 ms（慢約 2.6 倍）；
+  `RETR_EXTERNAL` 仍走逐列 byte 掃描、約 1227 ms vs cv2 24.1 ms（慢約 51 倍），
+  原因是 EXTERNAL 的 `lnbd` 會被「同零性但不同標記」的 stop 更新，轉換清單看不到那些 stop，故不敢換。
+  另外 contour 實作修掉一個真實 bug：ROI 原點被套用兩次（resident 指標先 offset、kernel 內又用 x,y），
+  x=y=0 時看不出來，是子區域契約檢查抓到並修正。
+  啟用前需要：（1）比照 anchor 定義形狀／密度界線，（2）把 contour 接進 Detector，
+  （3）通過 PASS/NG、缺陷數、bbox、area、confidence、metadata 等價測試。
+  **目前仍未接進任何 Detector**，`candidate_extraction` 仍回報 cpu。
+- `gpu/README.md` 已補上「已實作但尚未接入產線的步驟」一節，如實記載 anchor（已接入）、
+  contour（等價 314/314 但速度未全面勝出、停用）與 median（尚無可啟用實作）的狀態與量測數字。
 
 **原始卡點描述（保留供追溯）：**
 - 現況：`vf_find_contours_u8` 與 `cv2.findContours` 在 `tools/check_contour_equivalence.py` 的 102 個案例
