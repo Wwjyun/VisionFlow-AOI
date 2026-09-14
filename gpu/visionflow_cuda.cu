@@ -1,6 +1,11 @@
 #define VISIONFLOW_CUDA_EXPORTS
 #include "visionflow_cuda.h"
 #include "visionflow_cuda_internal.cuh"
+// The exact-median export radix-sorts its order keys with the CCCL CUB device algorithm that ships
+// with the CUDA Toolkit. CUB refuses to compile under the traditional MSVC preprocessor, so
+// gpu/cuda_project.json declares /Zc:preprocessor for both native targets and
+// gpu/build_cuda_dll.ps1 passes it through -Xcompiler.
+#include <cub/device/device_radix_sort.cuh>
 // which gpu/cuda_project.json now opts into for the whole project.
 #include <algorithm>
 #include <cfloat>
@@ -97,6 +102,19 @@ struct PersistentContext {
     int contour_point_count = 0;
     uint64_t contour_generation = 0;
     bool contour_result_valid = false;
+    // Exact-median scratch: the uploaded float values, their monotone-orderable uint32 order keys,
+    // the radix-sorted keys, the cub temporary storage and a one-word NaN-presence flag. All
+    // grow-only and deliberately separate from u8[]/u64[], which are plan scratch.
+    float* median_values = nullptr;
+    size_t median_value_capacity = 0;
+    uint32_t* median_keys = nullptr;
+    size_t median_key_capacity = 0;
+    uint32_t* median_sorted_keys = nullptr;
+    size_t median_sorted_key_capacity = 0;
+    uint8_t* median_sort_scratch = nullptr;
+    size_t median_sort_scratch_capacity = 0;
+    int* median_nan_flag = nullptr;
+    size_t median_nan_flag_capacity = 0;
     unsigned long long allocation_count = 0;
     cudaStream_t stream = nullptr;
     cudaError_t initialization_error = cudaSuccess;
@@ -137,6 +155,11 @@ struct PersistentContext {
         visionflow_cuda::free_device(contour_row_counts);
         visionflow_cuda::free_device(contour_row_start);
         visionflow_cuda::free_device(contour_transitions);
+        visionflow_cuda::free_device(median_values);
+        visionflow_cuda::free_device(median_keys);
+        visionflow_cuda::free_device(median_sorted_keys);
+        visionflow_cuda::free_device(median_sort_scratch);
+        visionflow_cuda::free_device(median_nan_flag);
         visionflow_cuda::free_device(resident_u8);
         for (cudaEvent_t event : timing_events) {
             if (event != nullptr) cudaEventDestroy(event);
@@ -3711,4 +3734,144 @@ VF_CUDA_API int vf_find_contours_download(
     }
     if (error != cudaSuccess) return cuda_result(error);
     return visionflow_cuda::stream_result(persistent->stream);
+}
+
+// Monotone float32 -> uint32 order key: positives keep their magnitude and gain the top bit,
+// negatives invert every bit. Unsigned integer order then equals float order for every bit pattern,
+// including -0.0 < +0.0, subnormals and infinities, so a plain key sort orders floats exactly.
+__global__ void median_order_key_kernel(
+    const float* values,
+    uint32_t* keys,
+    int* nan_flag,
+    int count) {
+    const int index = blockIdx.x * blockDim.x + threadIdx.x;
+    if (index >= count) return;
+    const uint32_t bits = __float_as_uint(values[index]);
+    keys[index] = (bits & 0x80000000u) != 0u
+        ? (bits ^ 0xFFFFFFFFu)
+        : (bits | 0x80000000u);
+    // NumPy's median returns NaN whenever the input holds one (_median_nancheck inspects the last
+    // partitioned element, and every NaN sorts last), so NaN presence is reported explicitly rather
+    // than being folded into an invented key order.
+    if ((bits & 0x7F800000u) == 0x7F800000u && (bits & 0x007FFFFFu) != 0u) {
+        atomicOr(nan_flag, 1);
+    }
+}
+
+// Inverse of median_order_key_kernel() for the one or two middle keys, evaluated on the host.
+float median_key_to_value(uint32_t key) {
+    const uint32_t bits = (key & 0x80000000u) != 0u
+        ? (key & 0x7FFFFFFFu)
+        : (key ^ 0xFFFFFFFFu);
+    float value = 0.0f;
+    std::memcpy(&value, &bits, sizeof(value));
+    return value;
+}
+
+// Bit-exact np.median for a host float32 array. The full contract is documented in
+// include/visionflow_cuda.h: monotone keys, device radix sort, middle-key-only readback, and the
+// float32 even-count average on the host.
+VF_CUDA_API int vf_median_f32(
+    void* context,
+    const float* values,
+    long long count,
+    float* out_median) {
+    PersistentContext* persistent = static_cast<PersistentContext*>(context);
+    if (persistent == nullptr || values == nullptr || out_median == nullptr || count <= 0 ||
+        count > static_cast<long long>(INT_MAX)) {
+        return VF_CUDA_INVALID_ARGUMENT;
+    }
+    const int items = static_cast<int>(count);
+    const size_t item_count = static_cast<size_t>(items);
+
+    int result = reserve_device(
+        &persistent->median_values, &persistent->median_value_capacity, item_count,
+        &persistent->allocation_count);
+    if (result != VF_CUDA_OK) return result;
+    result = reserve_device(
+        &persistent->median_keys, &persistent->median_key_capacity, item_count,
+        &persistent->allocation_count);
+    if (result != VF_CUDA_OK) return result;
+    result = reserve_device(
+        &persistent->median_sorted_keys, &persistent->median_sorted_key_capacity, item_count,
+        &persistent->allocation_count);
+    if (result != VF_CUDA_OK) return result;
+    result = reserve_device(
+        &persistent->median_nan_flag, &persistent->median_nan_flag_capacity,
+        static_cast<size_t>(1), &persistent->allocation_count);
+    if (result != VF_CUDA_OK) return result;
+
+    // Size the CUB temporary storage with the same offset type the sorting call below uses.
+    size_t sort_storage_bytes = 0;
+    cudaError_t error = cub::DeviceRadixSort::SortKeys(
+        nullptr, sort_storage_bytes, persistent->median_keys, persistent->median_sorted_keys,
+        items, 0, static_cast<int>(sizeof(uint32_t) * 8), persistent->stream);
+    if (error != cudaSuccess) return cuda_result(error);
+    const size_t sort_storage_required = sort_storage_bytes;
+    if (sort_storage_required == 0) return VF_CUDA_INTERNAL_ERROR;
+    result = reserve_device(
+        &persistent->median_sort_scratch, &persistent->median_sort_scratch_capacity,
+        sort_storage_required, &persistent->allocation_count);
+    if (result != VF_CUDA_OK) return result;
+
+    reset_timing(persistent, true);
+    error = cudaMemcpyAsync(
+        persistent->median_values, values, sizeof(float) * item_count, cudaMemcpyHostToDevice,
+        persistent->stream);
+    if (error != cudaSuccess) return cuda_result(error);
+    cudaEventRecord(persistent->timing_events[TIMING_AFTER_INPUT], persistent->stream);
+
+    error = cudaMemsetAsync(persistent->median_nan_flag, 0, sizeof(int), persistent->stream);
+    if (error != cudaSuccess) return cuda_result(error);
+    constexpr int MEDIAN_THREADS = 256;
+    median_order_key_kernel<<<
+        (items + MEDIAN_THREADS - 1) / MEDIAN_THREADS, MEDIAN_THREADS, 0, persistent->stream>>>(
+        persistent->median_values, persistent->median_keys, persistent->median_nan_flag, items);
+    result = visionflow_cuda::kernel_launch_result();
+    if (result != VF_CUDA_OK) return result;
+
+    error = cub::DeviceRadixSort::SortKeys(
+        persistent->median_sort_scratch, sort_storage_bytes, persistent->median_keys,
+        persistent->median_sorted_keys, items, 0, static_cast<int>(sizeof(uint32_t) * 8),
+        persistent->stream);
+    if (error != cudaSuccess) return cuda_result(error);
+    cudaEventRecord(persistent->timing_events[TIMING_AFTER_KERNEL], persistent->stream);
+
+    // Only the middle one or two keys cross PCIe, plus the four-byte NaN-presence word.
+    const bool even = (items % 2) == 0;
+    const int middle = items / 2;
+    const int first_key = even ? (middle - 1) : middle;
+    const int key_reads = even ? 2 : 1;
+    uint32_t host_keys[2] = {0u, 0u};
+    int host_nan = 0;
+    error = cudaMemcpyAsync(
+        host_keys, persistent->median_sorted_keys + first_key,
+        sizeof(uint32_t) * static_cast<size_t>(key_reads), cudaMemcpyDeviceToHost,
+        persistent->stream);
+    if (error == cudaSuccess) {
+        error = cudaMemcpyAsync(
+            &host_nan, persistent->median_nan_flag, sizeof(int), cudaMemcpyDeviceToHost,
+            persistent->stream);
+    }
+    if (error != cudaSuccess) return cuda_result(error);
+    cudaEventRecord(persistent->timing_events[TIMING_AFTER_OUTPUT], persistent->stream);
+    result = visionflow_cuda::stream_result(persistent->stream);
+    if (result != VF_CUDA_OK) return result;
+    finalize_timing(persistent);
+
+    if (host_nan != 0) {
+        const uint32_t quiet_nan_bits = 0x7FC00000u;
+        std::memcpy(out_median, &quiet_nan_bits, sizeof(*out_median));
+        return VF_CUDA_OK;
+    }
+    const float low = median_key_to_value(host_keys[0]);
+    if (!even) {
+        *out_median = low;
+        return VF_CUDA_OK;
+    }
+    const float high = median_key_to_value(host_keys[1]);
+    // np.median averages the two middle values in the input dtype: a float32 add, then a float32
+    // divide by two. Reproduce both operations exactly, including their overflow and rounding.
+    *out_median = (low + high) / 2.0f;
+    return VF_CUDA_OK;
 }

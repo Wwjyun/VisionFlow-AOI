@@ -323,6 +323,36 @@ VF_CUDA_API int vf_preprocess_401_2_u8(
     int adaptive_block_size, float adaptive_c,
     int max_value, int invert);
 
+/*
+ * Optional exact-median extension: the bit-exact NumPy result of ``np.median`` for float32 input.
+ *
+ * The detector that motivates this export spends most of its time in ``np.median(residual)`` and in
+ * the median absolute deviation around it, so the median is the highest-value device step there.
+ *
+ * Semantics. Every float32 is mapped to a monotone-orderable uint32 key (positives flip the sign
+ * bit, negatives invert every bit), so unsigned integer order is exactly float order, including
+ * negatives, zeros, subnormals and infinities. The keys are radix-sorted on the device with
+ * ``cub::DeviceRadixSort``; only the one or two middle keys cross PCIe, and the float32 average for
+ * an even count (add, then divide by two, both in float32 -- NumPy averages in the input dtype)
+ * is computed on the host. No device-side floating-point arithmetic is involved, so the result
+ * cannot drift from the reference for any finite or infinite input.
+ *
+ * ``values`` is a host float32 array of ``count`` elements and is only read, never written.
+ * ``count`` must be positive and must fit in a signed 32-bit integer (the radix-sort offset type).
+ * A NaN anywhere in ``values`` returns NaN, mirroring NumPy's ``_median_nancheck``; note that
+ * ``NaN == NaN`` is false, so callers comparing against ``np.median`` must use a NaN-aware test
+ * for that case only.
+ *
+ * The operation is deterministic: identical input bytes always produce identical output bytes.
+ * Deviceless callers that want to restart the step on the CPU reference should probe this export
+ * and fall back when it is missing.
+ */
+VF_CUDA_API int vf_median_f32(
+    void* context,
+    const float* values,
+    long long count,
+    float* out_median);
+
 #ifdef __cplusplus
 }
 #endif

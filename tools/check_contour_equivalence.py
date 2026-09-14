@@ -103,6 +103,24 @@ def cases() -> list[tuple[str, np.ndarray]]:
     return shapes
 
 
+def random_battery(count: int) -> list[tuple[str, np.ndarray]]:
+    """Deterministic sweep of small masks: the RETR_LIST transition-list scan must agree with the
+    literal row walk and with OpenCV on shapes no hand-written case covers."""
+    rng = np.random.default_rng(20260915)
+    masks = []
+    for trial in range(count):
+        height = int(rng.integers(3, 26))
+        width = int(rng.integers(3, 26))
+        density = float(rng.uniform(0.1, 0.9))
+        mask = (rng.random((height, width)) < density).astype(np.uint8) * 255
+        if trial % 3 == 0:
+            mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
+        elif trial % 3 == 1:
+            mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((3, 3), np.uint8))
+        masks.append((f"random_battery_{trial}", mask))
+    return masks
+
+
 def benchmark_masks(shape: tuple[int, int] = BENCHMARK_SHAPE) -> list[tuple[str, np.ndarray]]:
     """Production-shaped masks: many separated blobs, then a denser opened noise field."""
     height, width = shape
@@ -208,6 +226,10 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Compare the CUDA contour operator with OpenCV.")
     parser.add_argument("--dll", default=str(DLL), help="CUDA DLL path")
     parser.add_argument("--skip-benchmark", action="store_true", help="skip the 2000x12000 timing")
+    parser.add_argument(
+        "--random-battery", type=int, default=40,
+        help="number of deterministic random masks appended to the matrix (0 disables)",
+    )
     args = parser.parse_args()
 
     OUTPUT.mkdir(parents=True, exist_ok=True)
@@ -234,7 +256,11 @@ def main() -> int:
     identical = 0
     total = 0
     rows = []
-    for name, mask in cases():
+    matrix = cases()
+    if args.random_battery > 0:
+        # The battery reuses the region loop too, so every mask is checked full-frame and cropped.
+        matrix = matrix + random_battery(args.random_battery)
+    for name, mask in matrix:
         for mode, flag in MODES:
             reference, _ = cv2.findContours(mask, flag, cv2.CHAIN_APPROX_SIMPLE)
             try:
@@ -294,7 +320,7 @@ def main() -> int:
 
     # Determinism: the same mask and region must produce the same bytes on every call.
     deterministic = True
-    for name, mask in cases():
+    for name, mask in matrix:
         if not mask.any():
             continue
         first = runtime.find_contours_gray(mask, "list")
