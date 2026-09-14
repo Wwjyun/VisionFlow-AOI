@@ -24,7 +24,8 @@ Consequences worth knowing:
 
 ## Environment mechanics
 
-- Shell: `pwsh` (PowerShell 7) via `pwsh -Command`. **Every call is a fresh process** — cwd, variables, and functions do not persist. Pass a working directory per call instead of relying on `cd`.
+- Shell: the harness shell tool executes **Windows PowerShell 5.1** (`powershell.exe`) on this machine — `$PSVersionTable.PSEdition` is `Desktop` and no `pwsh.exe` is installed, so write PowerShell 5.1-compatible code (`;` / `if ($?)`, never `&&`). **Every call is a fresh process** — cwd, variables, and functions do not persist. Pass a working directory per call instead of relying on `cd`.
+- Text encoding: this machine's ANSI code page is 950 (Big5), so `Get-Content` / `Set-Content` without an explicit UTF-8 encoding silently mangle Traditional Chinese. Read with `-Encoding utf8` (or `[System.IO.File]::ReadAllText($p, [System.Text.Encoding]::UTF8)`), write with `[System.IO.File]::WriteAllText($p, $t, (New-Object System.Text.UTF8Encoding($false)))` to avoid a BOM, and prefer the file tools for anything containing non-ASCII.
 - Python: always `.\env\Scripts\python.exe`. The system interpreter is not the project environment.
 - Repository root: `C:\Users\user\Desktop\AOI_CVBased` on this machine, but never hard-code it in committed text — resolve from the directory containing `AGENT.md` and `Todo.md`.
 - File permissions: this session runs `danger-full-access` with approval prompts disabled, so a sandbox denial is final policy, not a bug — report it instead of retrying another way.
@@ -45,7 +46,7 @@ GUI changes add the offscreen `MainWindow` smoke; pipeline/detector/CUDA/packagi
 ### Git and artifacts (unchanged from `AGENT.md`)
 
 - `main` → `origin/main`. Stage explicit paths only; never `git add .` in this workspace.
-- Never stage, move, or delete untracked user artifacts (`*.pptx`, `*.inspect.ndjson`, `charts/`, `cuda_course/`, `interview_prep/`, `runtime-architecture.*`, `架構圖*/`, `docs/reports/*.md` drafts).
+- Never stage or delete untracked user artifacts. They are grouped as `簡報/` (投影片＋`.inspect.ndjson`) and `架構圖/` (with `runtime-architecture/`, `charts/`, `_backup_20260911/`), plus `cuda_course/`, `interview_prep/`, `docs/reports/*.md` drafts, and `.codex_ppt_build/`. `ARTIFACTS.md` owns the map and the move rules; moving a whole group requires updating every reference in the same change.
 - `Todo.md` is the only task list: mark only genuinely complete items, append the dated `完成紀錄` entry newest-first, and leave hardware-dependent items unchecked until they run on the RTX 3090 machine.
 
 ## Skills imported into DSH
@@ -84,3 +85,4 @@ DSH spawns subagents as ordinary child sessions through the `subagent` and `suba
 ## Import record
 
 - 2026-09-14: created this contract; imported the five AOI Codex skills into `$DSH_HOME\skills` (verified live in the session catalog); added the DSH-only `aoi-coder` subagent skill; added the `HERMES.md` pointer to `CLAUDE.md`.
+- 2026-09-14: consolidated the untracked artifacts — 8 `.pptx` (+ sidecars) and the slide exports into `簡報/`, and the loose `runtime-architecture.*`, `charts/`, and the old diagram backup into `架構圖/`; created `ARTIFACTS.md` as the map, updated the 4 deck scripts' output paths, and fixed the two Phase2 reports' broken diagram links. Recorded here: the harness shell is Windows PowerShell 5.1 (not `pwsh`), and ANSI code page 950 will mangle Chinese written through plain `Set-Content`.

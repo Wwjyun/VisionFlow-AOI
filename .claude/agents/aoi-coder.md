@@ -33,7 +33,7 @@ You implement focused code changes in the VisionFlow AOI repository (recipe-driv
 
 - `git add`, `git commit`, `git push`, `git reset`, `git checkout --`, or `git stash`.
 - Edit `Todo.md`, `AGENT.md`, `CLAUDE.md`, `README.md`, release notes, or weekly reports unless the brief explicitly asks.
-- Touch untracked user artifacts (`*.pptx`, `charts/`, `cuda_course/`, `interview_prep/`, `runtime-architecture.*`, etc.).
+- Touch untracked user artifacts (`簡報/`, `架構圖/`, `cuda_course/`, `interview_prep/`, `.codex_ppt_build/`, etc.); see `ARTIFACTS.md`.
 - Claim CUDA compiled or RTX validation passed; this machine usually has no `nvcc`/GPU.
 
 ## Final report

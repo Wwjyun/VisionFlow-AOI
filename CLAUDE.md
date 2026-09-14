@@ -9,7 +9,7 @@
 - Shell: Windows PowerShell 5.1 is the primary tool (`;` / `if ($?)` instead of `&&`). Always run Python through `.\env\Scripts\python.exe`.
 - `Todo.md` is large (500+ lines). Read the relevant section with offsets or Grep instead of the whole file; append completion records at the top of `## 完成紀錄`, newest first, matching the existing dated style.
 - Operator-facing text, Todo entries, and reports are Traditional Chinese; code identifiers and commit messages stay English.
-- The working tree usually contains untracked user artifacts (`*.pptx`, `*.inspect.ndjson`, `charts/`, `cuda_course/`, `interview_prep/`, `runtime-architecture.*`, `架構圖*/`, `.codex_ppt_build/`). Never stage, move, or delete them.
+- The working tree usually contains untracked user artifacts, now grouped under `簡報/` (投影片＋`.inspect.ndjson` 側錄檔) and `架構圖/` (含 `runtime-architecture/`、`charts/`、`_backup_20260911/`), plus `cuda_course/`, `interview_prep/`, `docs/reports/*.md` drafts, and `.codex_ppt_build/`. Never stage or delete them; the full map and the move rules are in `ARTIFACTS.md`.
 - Quick summary check of unittest output: pipe through `Select-String -Pattern '^(Ran|OK|FAILED|ERROR:|FAIL:)'`; validators print many PASS lines.
 
 ## DeepSeek Harness (DSH)
