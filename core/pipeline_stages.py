@@ -136,6 +136,7 @@ class InspectionResultAssembler:
         display_requested: bool,
         resident_image,
         profiler,
+        resident_upload_memory: dict | None = None,
     ) -> dict:
         return {
             "image_name": Path(image_path).name,
@@ -160,6 +161,7 @@ class InspectionResultAssembler:
                             [resident_image.height, resident_image.width, resident_image.channels]
                             if resident_image is not None else []
                         ),
+                        "device_memory_before_upload": dict(resident_upload_memory or {}),
                     },
                     "tiling": gpu_runtime.status(tiling_gpu_requested),
                     "display_requested": bool(display_requested),

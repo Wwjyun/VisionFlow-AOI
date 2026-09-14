@@ -102,7 +102,8 @@
 - [x] monitor/batch 跨多張影像重用同一個長生命週期 `GpuRuntime`/context。
 - [x] 測試尺寸增減、channel 切換、參數改變、CUDA error/OOM 後的重用與釋放。（validator 覆蓋 shape grow/shrink、1/3 channel、參數切換與 warm allocation plateau；2026-09-14 RTX 3090 真實 launch error 後 context allocation 不再增加、真實 OOM 後連續三次小批次／resident plan 與 CPU 相同且 allocation count 不變、失敗 batch 不留下 native handle）
 - [x] 偵測 sticky CUDA context error（例如 illegal memory access）後，明確停用或重建共用 `GpuExecutionSession`，並以 GUI／監控狀態提示重新啟動；目前每次 run 仍會嘗試 CUDA 後整顆 Detector CPU fallback，結果正確但會重複失敗。需在 RTX 以隔離子程序注入驗證。（2026-09-14：同一程序內重建無法恢復 primary context，因此 runtime 標記 CUDA 損毀並停用至重新啟動；RTX 3090 以 NVRTC 越界 kernel 實測 CUDA 700 通過）
-- [ ] 評估 Windows 驅動預設 CUDA sysmem fallback：佔滿專用 VRAM 時配置溢出到共用記憶體而不回傳 OOM（2026-09-14 4K plan 結果等價、新 context 首次 51 ms），需以正式大圖／批次量測溢出後的端到端延遲，決定是否以 `recommended_roi_batch_size`／監控告警限制專用 VRAM 使用量。
+- [x] 評估 Windows 驅動預設 CUDA sysmem fallback：佔滿專用 VRAM 時配置溢出到共用記憶體而不回傳 OOM（2026-09-14 4K plan 結果等價、新 context 首次 51 ms），需以正式大圖／批次量測溢出後的端到端延遲，決定是否以 `recommended_roi_batch_size`／監控告警限制專用 VRAM 使用量。（2026-09-14 以 16384×13000 合成圖／正式 401-AS-SN-1 量測：閒置佔用者時中位數不變，持續使用 VRAM 的佔用者使端到端 +58～105%，主要在整圖 resident 上傳；結果皆一致。決定不另限批次，改為上傳前記錄專用 VRAM 並在不足時警告）
+- [ ] 以正式真圖與實際並行 GPU 程式（例如其他檢測站或 AI 服務）量測 sysmem 溢出頻率與延遲，確認警告門檻與是否需要監控介面顯示。
 - [ ] 評估 `cudaMallocAsync`/memory pool；只有相容且實測有收益時採用。
 
 ### Morphology
@@ -413,6 +414,8 @@
 - [ ] 加速不得犧牲 GUI 回應、打包啟動、結果追溯、錯誤訊息或 CPU fallback。
 
 ## 完成紀錄
+
+- [x] 2026-09-14：完成 Windows CUDA sysmem fallback 評估並加入上傳前專用 VRAM 觀測。RTX 3090 以 16384×13000 合成 BGR、正式 `PRODUCT_A_NEGATIVE_401_AOI_01.yaml` 的 401-AS-SN-1 GPU resident ROI（2300×12000 grid）量測共用 session 各 5 次：另一程序佔住 23,208 MiB 但閒置時，端到端中位數 1.821→1.827 s（只有首次 2.79 s），新 session 1.81 s；佔用者持續寫入其 VRAM 時，端到端 1.75→2.77 s（+58%），新 session 3.59 s（+105%），分項顯示主要增加在 `initialization`（整圖 resident 上傳 0.08→0.93／2.03 s），Detector 0.74→0.94 s；釋放後回到 1.77～1.88 s（偶發單次 7.3 s 重新換入）。所有狀態 PASS／NG 與 125 個 defects 一致、無 fallback。因不會失敗且 `recommended_roi_batch_size` 已依可用記憶體縮批，決定不額外限制；Pipeline 在整圖上傳前查詢 `memory_info()`，專用 VRAM 可用量小於上傳量時記錄 warning，並在 `execution.gpu.resident_image.device_memory_before_upload` 回報 free／total／upload bytes 與 `dedicated_vram_low`。新增 fake runtime 測試覆蓋不足／充足兩種情況；RTX 實跑確認欄位寫入 JSON。完整 346 tests、compileall、CUDA preflight、CPU CLI 合成 NG（預期 exit 2）與 `git diff --check` 通過；未修改 CUDA source／ABI／DLL，真圖與實際並行 GPU 程式量測另列待辦。
 
 - [x] 2026-09-14：處理 sticky CUDA context error。RTX 3090 實測（隔離子程序以 NVRTC 編譯故意寫入無效 device 位址的 kernel，`cuCtxSynchronize` 回傳 700）確認 sticky 錯誤後原 runtime 每次呼叫都回 1700，同一程序新建 runtime 也因 context 建立失敗而無法恢復，但舊版 `available` 仍為 True、每張圖都會重試並失敗。`GpuRuntime` 將所有 native 失敗集中到 `_native_error()`，遇到 cudaError 214、220、226、700、702、709、710、714～719（999 不視為 sticky）即設定 `device_lost_reason`，`available`／所有 optional capability 轉為 False，原因以繁中提示需重新啟動程式並保留原始錯誤；session 的每 run 可恢復錯誤清除不會解除此狀態。另修正 `BaseDetector.run()` 改以本次開始時是否嘗試 GPU 決定 CPU 重跑，避免 runtime 在同一次 run 中轉為不可用時把例外往外拋。`validate_cuda_fault_injection.py` 新增 `sticky_context`：共用 session 的健康 run 使用 7 次 CUDA 呼叫、注入後的 run 僅 1 次呼叫即整顆 Detector CPU 重跑、下一次 run 0 次 CUDA 呼叫，三次 Pipeline 結果皆與 CPU 模式相同，strict `gpu.mode: cuda` 明確回報損毀原因；子程序輸出改用 UTF-8。新增 fake DLL 測試覆蓋 sticky 標記、非 sticky 碼（1001／1002／1999）維持可用、context 建立 1700 與後續 Detector 零呼叫 CPU 路由。完整 345 tests、fault injection（init failure、kernel launch error、device OOM、sticky context）、compileall、CUDA preflight、CLI 合成 NG（預期 exit 2）與 `git diff --check` 通過；未修改 CUDA source／ABI／DLL。
 

@@ -101,6 +101,7 @@ class AOIPipeline(LogMixin):
         with profiler.measure("initialization"):
             tile_config = recipe["tile"]
             resident_image = None
+            resident_upload_memory = {}
             detector_gpu_requested = detector_gpu_allowed and any(
                 bool(config.get("use_gpu", False))
                 and self.detector_manager.uses_native_cuda_runtime(detector_id)
@@ -113,6 +114,7 @@ class AOIPipeline(LogMixin):
                 and str(tile_config.get("mode", "grid")).lower() == "grid"
             ):
                 try:
+                    resident_upload_memory = self._check_resident_upload_memory(gpu_runtime, image)
                     resident_image = gpu_runtime.upload_image(image)
                 except Exception as exc:
                     gpu_runtime.fallback_or_raise(exc)
@@ -203,6 +205,7 @@ class AOIPipeline(LogMixin):
             tiling_gpu_requested=tiling_gpu_requested,
             display_requested=self.recipe_manager.gpu_feature_requested(gpu_config, "display"),
             resident_image=resident_image,
+            resident_upload_memory=resident_upload_memory,
             profiler=profiler,
         )
 
@@ -231,6 +234,25 @@ class AOIPipeline(LogMixin):
             self.logger.info("CUDA host metrics: %s", serializable_result["execution"]["gpu"]["metrics"])
         self._progress(100, "Inspection complete")
         return serializable_result
+
+    def _check_resident_upload_memory(self, gpu_runtime, image) -> dict:
+        """Record dedicated VRAM before the whole-image upload.
+
+        Windows drivers default to CUDA sysmem fallback: when dedicated VRAM is exhausted the
+        upload spills into shared system memory instead of failing (RTX 3090, 2026-09-14:
+        16384x13000 upload 0.08 s -> 0.9-2.0 s under contention), so only warn and report.
+        """
+        memory = gpu_runtime.memory_info()
+        upload_bytes = int(image.nbytes)
+        low = 0 < memory["total_bytes"] and memory["free_bytes"] < upload_bytes
+        if low:
+            self.logger.warning(
+                "CUDA dedicated VRAM is below the resident upload size: free=%s bytes upload=%s bytes; "
+                "the driver may spill into shared system memory and slow inspection",
+                memory["free_bytes"],
+                upload_bytes,
+            )
+        return {**memory, "upload_bytes": upload_bytes, "dedicated_vram_low": low}
 
     def _build_gpu_runtime(self, gpu_config: dict, gpu_requested: bool):
         if self.gpu_session is not None:

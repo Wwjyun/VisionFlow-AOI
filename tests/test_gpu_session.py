@@ -42,11 +42,15 @@ class _ResidentRuntime:
     device_name = "fake"
     compute_capability = "8.6"
 
-    def __init__(self, failing_uploads: int = 0):
+    def __init__(self, failing_uploads: int = 0, free_bytes: int = 1 << 34):
         self.upload_calls = 0
         self.close_calls = 0
         self.failing_uploads = int(failing_uploads)
+        self.free_bytes = int(free_bytes)
         self.last_error = ""
+
+    def memory_info(self):
+        return {"free_bytes": self.free_bytes, "total_bytes": 24 << 30}
 
     def fallback_or_raise(self, exc):
         self.last_error = str(exc)
@@ -302,6 +306,45 @@ class GpuExecutionSessionTests(unittest.TestCase):
         self.assertTrue(all(roi is not None for roi in second_detector.device_rois))
         self.assertEqual(first["final_result"], second["final_result"])
         self.assertEqual(runtime.upload_calls, 2)
+
+    def test_low_dedicated_vram_before_resident_upload_is_warned_and_reported(self):
+        recipe_path = ROOT / "recipes" / "PRODUCT_A_NEGATIVE_401_AOI_01.yaml"
+        recipe = deepcopy(AOIPipeline(recipe_path, ROOT / "outputs").recipe_manager.load(recipe_path))
+        recipe["gpu"] = {"mode": "auto", "dll_path": "fake_resident.dll", "fallback_to_cpu": True, "tiling": False}
+        for config in recipe["detectors"].values():
+            config["enabled"] = False
+        recipe["detectors"]["401-AS-SN-1"]["enabled"] = True
+        recipe["detectors"]["401-AS-SN-1"]["use_gpu"] = True
+        image = np.zeros((600, 700, 3), dtype=np.uint8)
+        output_overrides = {
+            key: False for key in ("save_overlay", "save_ng_tiles", "save_csv", "save_matrix_csv", "save_json")
+        }
+        reports = {}
+        with tempfile.TemporaryDirectory(prefix="visionflow_vram_low_") as temporary:
+            image_path = Path(temporary) / "input.png"
+            encoded, buffer = cv2.imencode(".png", image)
+            self.assertTrue(encoded)
+            image_path.write_bytes(buffer.tobytes())
+            for label, free_bytes in (("low", image.nbytes - 1), ("ample", image.nbytes * 4)):
+                runtime = _ResidentRuntime(free_bytes=free_bytes)
+                session = GpuExecutionSession(runtime, requested=True, config=recipe["gpu"])
+                pipeline = AOIPipeline(
+                    recipe_path, Path(temporary), output_overrides=output_overrides, gpu_session=session
+                )
+                pipeline.recipe_manager.load = Mock(return_value=recipe)
+                pipeline.detector_manager.create_enabled = Mock(return_value=[_RoiCapturingDetector()])
+                if label == "low":
+                    with self.assertLogs(pipeline.logger, level="WARNING") as logs:
+                        result = pipeline.run(image_path)
+                    self.assertTrue(any("dedicated VRAM" in line for line in logs.output))
+                else:
+                    result = pipeline.run(image_path)
+                reports[label] = result["execution"]["gpu"]["resident_image"]
+
+        self.assertTrue(reports["low"]["active"])
+        self.assertTrue(reports["low"]["device_memory_before_upload"]["dedicated_vram_low"])
+        self.assertEqual(reports["low"]["device_memory_before_upload"]["upload_bytes"], image.nbytes)
+        self.assertFalse(reports["ample"]["device_memory_before_upload"]["dedicated_vram_low"])
 
     def test_latency_and_throughput_sessions_select_distinct_queue_policy(self):
         recipe_path = ROOT / "recipes" / "PRODUCT_A_NEGATIVE_401_AOI_01.yaml"
