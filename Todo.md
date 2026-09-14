@@ -380,6 +380,14 @@ float32 累加、OpenCV 的 kernel 係數）與 `vf_gaussian_blur_f32_roi`，並
 **可平行推進、不依賴上述卡點的項目：**
 1. 202-CS-SN-1 其餘步驟（**不含 median，已於本輪完成**）：Gaussian 背景、遮罩、connected components
    標籤順序、component 幾何、ring CNR 統計的黃金參考與等價測試。
+   **ring CNR 的順序與精度契約已釘住**（`tests/test_detector_202_1_cnr_contract.py`，5 tests）：
+   候選順序為 CNR 遞減且**平手時依 component label 遞增順序**（Python 穩定排序造成）、
+   defect 清單順序與候選順序一致；float32 ring 統計與 float64 重算的最大偏差為
+   **5.89e-6**（相對 6.43e-7），而 73 個候選中相異 CNR 的最小間距為 **5.29e-2**，
+   比值 1.11e-4，因此**加法順序改變不會重排候選**。同時確認 `Detector202_1.detect`
+   **沒有任何 CNR 門檻**（每個候選都成為 defect），CNR 只影響 metadata 與排序，
+   所以 GPU 化不需要「判定邊界」等價，只需要排序鍵等價。量測工具：
+   `tools/cnr_ring_precision.py`。**仍待完成**：Gaussian 背景、候選遮罩、connected components。
 2. 401 系列的幾何路徑等價測試（已量測：幾何僅約 9 µs/輪廓，稀疏時佔 11%，現階段不值得 GPU 化，但需等價測試把關既有行為）。
 3. ~~README 與 `gpu/README.md` 的如實描述更新~~ **已完成**：`gpu/README.md` 的輪廓速度記載
    （先前誤記為「密集案例比 cv2 快」）與 median 狀態（先前誤記為「尚未有可啟用的實作」）已
@@ -643,6 +651,8 @@ float32 累加、OpenCV 的 kernel 係數）與 `vf_gaussian_blur_f32_roi`，並
 - [ ] 加速不得犧牲 GUI 回應、打包啟動、結果追溯、錯誤訊息或 CPU fallback。
 
 ## 完成紀錄
+
+- [x] 2026-09-15：釘住 202-CS-SN-1 ring CNR 的**順序契約與精度契約**，這是該階段 GPU 化的前置條件。新增 `tests/test_detector_202_1_cnr_contract.py`（5 tests，全套 399 → 404 tests OK）：（1）候選確實以 CNR 遞減排序；（2）**CNR 完全平手時依 component label 遞增順序**（以三個位元組完全相同、背景恆定的缺陷構造出精確平手場景，並斷言該場景真的平手，否則契約未被測到）；（3）defect 清單順序與候選順序一致且 `metadata.cnr` 遞減；（4）ring 統計與 float64 重算在 6 組參數下的偏差界線；（5）偏差與相異 CNR 最小間距的關係。關鍵發現：**`Detector202_1.detect` 沒有任何 CNR 門檻——每個候選都成為 defect**，因此 CNR 只影響 metadata 與候選排序，GPU 化**不需要**「判定邊界等價」，只需要排序鍵等價（先前把 CNR 當成判定門檻是錯誤前提，已更正）。新增 `tools/cnr_ring_precision.py` 量測 15 個場景、73 個候選：float32（產線）與 float64 重算的最大 CNR 偏差 **5.89e-6**（相對 6.43e-7）、最大 contrast 偏差 1.18e-5，而相異 CNR 的最小間距為 **5.29e-2**，偏差／間距 = 1.11e-4，故加法順序改變（GPU 化的必然結果）不會重排候選，也不會改變輸出順序。證據：`outputs_validation/cnr_profile/cnr_ring_precision.json`。未修改任何產線程式、CUDA source／ABI 或 DLL。
 
 - [x] 2026-09-15：修正 `gpu/README.md` 兩處與實測不符的記載，並補上尚未 GPU 化步驟的正確界線。修正一：輪廓抽取原記載「2000×12000 `RETR_LIST` 密集 358 條輪廓比 cv2 快」，但依 `tools/check_contour_equivalence.py`（314 案例全部逐點相同）的完整重測，`vf_find_contours_u8` **在每一個量測形狀都慢於 cv2**（512×512 稀疏 0.22×、512×512 密集 0.06×、2048×2048 密集 0.13×、2000×12000 稀疏 0.40×、中型 0.14×、大型 0.10×、`RETR_EXTERNAL` 0.01×），已改為「正確但全面較慢，判定不接入產線、不訂啟用界線」。修正二：`vf_median_f32` 原記載「仍在校正、未有可啟用的實作」，實際上已接入 `detectors/detector_202_1.py` 的 `_exact_median`，並已量到與 `np.median(float32)` 位元相同（34/34、NaN 6/6）、4M float32 快 5.6～11.8 倍、202 端到端 305.5 → 188.2 ms（1.62×），已改為已完成。另新增三項現況：`vf_gaussian_blur_f32` 進行中且尚未定界線、**connected components 與 ring CNR 統計尚未 GPU 化**（並明記「隨機遮罩標籤編號順序不同，修正前不得作為黃金標準」）、ring CNR 的 host NumPy mean/std 與 GPU 化後會有 ULP 級差異需另量測判定邊界。章節標題改為「已完成並接入產線、以及尚未接入的步驟」，並明訂接入與否以該節與 `Todo.md` 為準、不以 export 存在為準。未修改任何程式、CUDA source／ABI 或 DLL。
 
