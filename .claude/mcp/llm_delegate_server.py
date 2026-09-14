@@ -22,7 +22,7 @@ import uuid
 from pathlib import Path
 
 SERVER_NAME = "llm-delegate"
-SERVER_VERSION = "1.0.0"
+SERVER_VERSION = "1.1.0"
 SUPPORTED_PROTOCOLS = ("2025-06-18", "2025-03-26", "2024-11-05")
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -39,19 +39,20 @@ PROVIDERS = {
         "model_env": "DEEPSEEK_MODEL",
         "default_model": "deepseek-flash",
     },
+    # GLM and Qwen are routed through OpenRouter and share one key.
     "glm": {
         "base_url_env": "GLM_BASE_URL",
-        "default_base_url": "https://open.bigmodel.cn/api/paas/v4",
-        "key_env": "ZHIPUAI_API_KEY",
+        "default_base_url": "https://openrouter.ai/api/v1",
+        "key_env": "OPENROUTER_API_KEY",
         "model_env": "GLM_MODEL",
-        "default_model": None,
+        "default_model": "z-ai/glm-5.3-flash",
     },
     "qwen": {
         "base_url_env": "QWEN_BASE_URL",
-        "default_base_url": "https://dashscope-intl.aliyuncs.com/compatible-mode/v1",
-        "key_env": "DASHSCOPE_API_KEY",
+        "default_base_url": "https://openrouter.ai/api/v1",
+        "key_env": "OPENROUTER_API_KEY",
         "model_env": "QWEN_MODEL",
-        "default_model": None,
+        "default_model": "qwen/qwen3.8-flash",
     },
 }
 
@@ -205,7 +206,8 @@ def call_chat_completion(provider: dict, messages: list[dict], max_tokens: int, 
                 for choice in chunk.get("choices") or []:
                     delta = choice.get("delta") or {}
                     text = delta.get("content") or ""
-                    reasoning = delta.get("reasoning_content") or ""
+                    # DeepSeek streams `reasoning_content`; OpenRouter streams `reasoning`.
+                    reasoning = delta.get("reasoning_content") or delta.get("reasoning") or ""
                     if (text or reasoning) and first_token is None:
                         first_token = time.perf_counter()
                     reasoning_chars += len(reasoning)
@@ -336,7 +338,7 @@ class DelegateServer:
             {
                 "name": "delegate_code",
                 "description": "Send a scoped coding task plus selected repository files to an external "
-                               "OpenAI-compatible model (DeepSeek/GLM/Qwen). Returns a proposal id, a unified "
+                               "OpenAI-compatible model (DeepSeek, or GLM/Qwen via OpenRouter). Returns a proposal id, a unified "
                                "diff of the proposed edits, per-block match problems, model notes, and timing "
                                "(time to first token, tokens/s). Nothing is written until apply_proposal. "
                                "Only the listed files leave this machine.",
