@@ -266,15 +266,47 @@ class Detector202_1(Detector202):
             return float(np.median(values))
         return float(np.median(source))
 
+    def _background_blur(
+        self,
+        image_float: np.ndarray,
+        kernel: int,
+        sigma: float,
+    ) -> np.ndarray:
+        """Gaussian background, on the device when the runtime can honour ``sigma``.
+
+        Uses the optional CUDA float32 Gaussian export.  The device filter is *not* bit-identical
+        to ``cv2.GaussianBlur`` - the summation order differs - so the caller must treat the result
+        as mathematically equivalent rather than byte-equal: the measured deviation is <= 4e-4 on a
+        [0, 255] float32 operand and the candidate mask it produces is bit-identical across the
+        whole 202 final-output matrix, while the residual-derived diagnostics (``mad``,
+        ``residual_median``, ``residual_threshold``, ``robust_noise_sigma``) drift in their last
+        bits.
+
+        A missing export, an older DLL that ignores ``sigma``, or any device error falls back to
+        ``cv2.GaussianBlur`` for the whole call, so a failed GPU step never leaves the detector
+        with a background from a different filter.
+        """
+        runtime = getattr(self, "gpu_runtime", None)
+        if (
+            runtime is not None
+            and getattr(runtime, "available", False)
+            and getattr(runtime, "supports_gaussian_blur_f32", False)
+            and getattr(runtime, "supports_gaussian_f32_sigma", False)
+            and self.use_gpu
+        ):
+            try:
+                return runtime.gaussian_blur_f32(image_float, kernel, sigma)
+            except Exception:
+                pass
+        return cv2.GaussianBlur(image_float, (kernel, kernel), sigma)
+
     def _automatic_cnr_mask(self, gray: np.ndarray) -> dict:
         image_float = gray.astype(np.float32)
         height, width = gray.shape[:2]
         background_kernel = self._background_kernel(height, width)
         gaussian_sigma = float(self.params.get("gaussian_sigma", 0.0))
-        background = cv2.GaussianBlur(
-            image_float,
-            (background_kernel, background_kernel),
-            gaussian_sigma,
+        background = self._background_blur(
+            image_float, background_kernel, gaussian_sigma
         )
         residual = image_float - background
         residual_median = self._exact_median(residual)

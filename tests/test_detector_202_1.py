@@ -502,5 +502,119 @@ class Detector2021RoutingTests(unittest.TestCase):
         )
 
 
+class _GaussianRuntime(_PrimitiveRuntime):
+    """A runtime that offers the float32 Gaussian, with a call log and optional legacy mode."""
+
+    supports_gaussian_blur_f32 = True
+
+    def __init__(self, honour_sigma=True, fail=False):
+        super().__init__()
+        self.supports_gaussian_f32_sigma = honour_sigma
+        self.fail = fail
+        self.gaussian_calls = []
+
+    def gaussian_blur_f32(self, image, kernel_size, sigma=0.0):
+        self.gaussian_calls.append((image.shape, int(kernel_size), float(sigma)))
+        if self.fail:
+            raise RuntimeError("injected detector 202-1 gaussian failure")
+        if not self.supports_gaussian_f32_sigma and float(sigma) > 0.0:
+            raise RuntimeError("legacy DLL ignores sigma")
+        return cv2.GaussianBlur(image, (int(kernel_size), int(kernel_size)), float(sigma))
+
+
+class Detector2021BackgroundRoutingTests(unittest.TestCase):
+    """The CNR background runs on the device only when the DLL can honour sigma."""
+
+    @staticmethod
+    def _gray():
+        rng = np.random.default_rng(2021)
+        gray = np.full((240, 320), 150, dtype=np.float64)
+        gray += rng.normal(0.0, 2.0, gray.shape)
+        gray[90:110, 150:180] = 60.0
+        return np.clip(gray, 0, 255).astype(np.uint8)
+
+    def _analysis(self, detector):
+        gray = self._gray()
+        return detector._automatic_cnr_mask(gray)
+
+    def test_device_background_is_used_and_preserves_the_candidate_mask(self):
+        gray = self._gray()
+        runtime = _GaussianRuntime()
+        detector = Detector202_1(
+            params={"center_mask_enabled": False, "edge_mask_enabled": False},
+            use_gpu=True,
+            gpu_runtime=runtime,
+        )
+        analysis = detector._automatic_cnr_mask(gray)
+        self.assertEqual(len(runtime.gaussian_calls), 1)
+        shape, kernel, sigma = runtime.gaussian_calls[0]
+        self.assertEqual(shape, gray.shape)
+        self.assertEqual(kernel, analysis["background_kernel"])
+        self.assertEqual(sigma, 0.0)
+        # The device path is used, so the filtered image differs from cv2's in the last bits
+        # while the mask it produces must still be exactly the CPU mask.
+        reference = Detector202_1(
+            params={"center_mask_enabled": False, "edge_mask_enabled": False}
+        )._automatic_cnr_mask(gray)
+        np.testing.assert_array_equal(analysis["candidate_mask"], reference["candidate_mask"])
+
+    def test_explicit_sigma_is_forwarded_to_the_device(self):
+        gray = self._gray()
+        runtime = _GaussianRuntime()
+        detector = Detector202_1(
+            params={
+                "center_mask_enabled": False,
+                "edge_mask_enabled": False,
+                "gaussian_sigma": 1.25,
+                "background_kernel_size": 31,
+            },
+            use_gpu=True,
+            gpu_runtime=runtime,
+        )
+        analysis = detector._automatic_cnr_mask(gray)
+        self.assertEqual(runtime.gaussian_calls[0][1:], (31, 1.25))
+        self.assertEqual(analysis["gaussian_sigma"], 1.25)
+
+    def test_old_dll_that_ignores_sigma_falls_back_to_opencv(self):
+        """A DLL without the sigma parameter must not be used for the background."""
+
+        gray = self._gray()
+        runtime = _GaussianRuntime(honour_sigma=False)
+        params = {
+            "center_mask_enabled": False,
+            "edge_mask_enabled": False,
+            "gaussian_sigma": 1.25,
+            "background_kernel_size": 31,
+        }
+        detector = Detector202_1(params=params, use_gpu=True, gpu_runtime=runtime)
+        analysis = detector._automatic_cnr_mask(gray)
+        reference = Detector202_1(params=params)._automatic_cnr_mask(gray)
+        np.testing.assert_array_equal(analysis["candidate_mask"], reference["candidate_mask"])
+        self.assertEqual(
+            analysis["residual_median"], reference["residual_median"]
+        )
+
+    def test_device_gaussian_failure_falls_back_for_the_whole_call(self):
+        gray = self._gray()
+        runtime = _GaussianRuntime(fail=True)
+        params = {"center_mask_enabled": False, "edge_mask_enabled": False}
+        analysis = Detector202_1(
+            params=params, use_gpu=True, gpu_runtime=runtime
+        )._automatic_cnr_mask(gray)
+        reference = Detector202_1(params=params)._automatic_cnr_mask(gray)
+        np.testing.assert_array_equal(analysis["candidate_mask"], reference["candidate_mask"])
+        self.assertEqual(analysis["residual_median"], reference["residual_median"])
+
+    def test_cpu_run_never_calls_the_device_gaussian(self):
+        gray = self._gray()
+        runtime = _GaussianRuntime()
+        Detector202_1(
+            params={"center_mask_enabled": False, "edge_mask_enabled": False},
+            use_gpu=False,
+            gpu_runtime=runtime,
+        )._automatic_cnr_mask(gray)
+        self.assertEqual(runtime.gaussian_calls, [])
+
+
 if __name__ == "__main__":
     unittest.main()

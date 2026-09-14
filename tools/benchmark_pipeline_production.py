@@ -158,6 +158,73 @@ def _normalised(result: dict) -> dict:
     return normalised
 
 
+# The device float32 Gaussian is mathematically equivalent, not bit-identical, so four
+# residual-derived diagnostics drift in their last bits.  They are reported separately
+# instead of being hidden, and the decision-bearing fields are compared strictly.
+_DRIFTING_METADATA = {
+    "mad",
+    "residual_median",
+    "residual_threshold",
+    "robust_noise_sigma",
+}
+
+
+def _split_defects(result: dict):
+    """Return ``(decision_fields, drifting_fields, worst_drift)`` for one result."""
+
+    decision = []
+    drifting = []
+    worst = 0.0
+    for tile_result in result.get("tiles", []):
+        for detector_result in tile_result.get("detectors", []):
+            decision.append(
+                (
+                    tile_result.get("tile", {}).get("tile_id"),
+                    detector_result.get("detector_id"),
+                    detector_result.get("pass"),
+                    detector_result.get("defect_count"),
+                )
+            )
+            for defect in detector_result.get("defects", []):
+                metadata = defect.get("metadata", {}) or {}
+                decision.append(
+                    (
+                        defect.get("type"),
+                        tuple(defect.get("bbox_local") or ()),
+                        defect.get("area"),
+                        defect.get("confidence"),
+                    )
+                )
+                for name, value in sorted(metadata.items()):
+                    if name in _DRIFTING_METADATA and isinstance(value, (int, float)):
+                        drifting.append((name, float(value)))
+                    else:
+                        decision.append((name, value))
+    return decision, drifting, worst
+
+
+def _compare(cpu_result: dict, gpu_result: dict) -> dict:
+    cpu_decision, cpu_drift, _ = _split_defects(cpu_result)
+    gpu_decision, gpu_drift, _ = _split_defects(gpu_result)
+    decision_equal = cpu_decision == gpu_decision
+    drift_counts = {}
+    worst_drift = 0.0
+    for (name, cpu_value), (gpu_name, gpu_value) in zip(cpu_drift, gpu_drift):
+        if name != gpu_name:
+            decision_equal = False
+            break
+        delta = abs(cpu_value - gpu_value)
+        worst_drift = max(worst_drift, delta)
+        if delta > 0.0:
+            drift_counts[name] = drift_counts.get(name, 0) + 1
+    return {
+        "decision_equal": decision_equal,
+        "drift_counts": drift_counts,
+        "worst_drift": worst_drift,
+        "drifting_field_count": len(cpu_drift),
+    }
+
+
 def _run(recipe_path: Path, image: Path, output_dir: Path):
     started = time.perf_counter()
     result = AOIPipeline(recipe_path, output_dir).run(image)
@@ -208,8 +275,21 @@ def main() -> int:
 
     cpu_normalised = _normalised(cpu_result)
     gpu_normalised = _normalised(gpu_result)
-    identical = cpu_normalised == gpu_normalised
-    print(f"normalised results identical: {identical}")
+    strictly_identical = cpu_normalised == gpu_normalised
+    comparison = _compare(cpu_result, gpu_result)
+    print(f"normalised results strictly identical: {strictly_identical}")
+    print(
+        "decision-bearing fields identical (PASS/NG, defect count, type, bbox, area, "
+        f"confidence, remaining metadata): {comparison['decision_equal']}"
+    )
+    if comparison["drift_counts"]:
+        print(
+            f"residual-derived diagnostics that drifted: {comparison['drift_counts']} "
+            f"over {comparison['drifting_field_count']} values, "
+            f"worst |drift| {comparison['worst_drift']:.3e}"
+        )
+    else:
+        print("residual-derived diagnostics: no drift on this image")
 
     execution = gpu_result.get("execution", {}).get("gpu", {})
     split = execution.get("device_host_split")
@@ -228,9 +308,9 @@ def main() -> int:
             f"tiling: active={tiling.get('active')} tiles={tiling.get('tile_count')} "
             f"backend={tiling.get('backend')}"
         )
-    if not identical:
+    if not comparison["decision_equal"]:
         print()
-        print("first difference:")
+        print("DECISION-BEARING DIFFERENCE - the CUDA run is not equivalent:")
         cpu_tiles = cpu_normalised.get("tiles", [])
         gpu_tiles = gpu_normalised.get("tiles", [])
         for index, (cpu_tile, gpu_tile) in enumerate(zip(cpu_tiles, gpu_tiles)):
@@ -239,15 +319,45 @@ def main() -> int:
                 print(f"  tile {index}: GPU={json.dumps(gpu_tile, default=str)[:400]}")
                 break
 
-    cpu_stage = cpu_result.get("execution", {}).get("timings", {})
-    gpu_stage = gpu_result.get("execution", {}).get("timings", {})
+    # Pipeline stage timings live under execution.performance: stages_sec holds the
+    # pipeline-level stages and detector_stages_sec holds each detector's own stages.
+    cpu_stage = dict(
+        cpu_result.get("execution", {}).get("performance", {}).get("stages_sec", {})
+    )
+    gpu_stage = dict(
+        gpu_result.get("execution", {}).get("performance", {}).get("stages_sec", {})
+    )
+    cpu_detector_stage = {
+        f"{detector_id}.{stage}": seconds
+        for detector_id, stages in cpu_result.get("execution", {})
+        .get("performance", {})
+        .get("detector_stages_sec", {})
+        .items()
+        for stage, seconds in stages.items()
+    }
+    gpu_detector_stage = {
+        f"{detector_id}.{stage}": seconds
+        for detector_id, stages in gpu_result.get("execution", {})
+        .get("performance", {})
+        .get("detector_stages_sec", {})
+        .items()
+        for stage, seconds in stages.items()
+    }
+    if cpu_detector_stage or gpu_detector_stage:
+        print()
+        print(f"{'detector stage':40s} {'CPU ms':>10s} {'CUDA ms':>10s}")
+        for key in sorted(set(cpu_detector_stage) | set(gpu_detector_stage)):
+            print(
+                f"{key:40s} {cpu_detector_stage.get(key, float('nan')) * 1000.0:10.2f} "
+                f"{gpu_detector_stage.get(key, float('nan')) * 1000.0:10.2f}"
+            )
     if cpu_stage and gpu_stage:
         print()
-        print(f"{'stage':34s} {'CPU ms':>12s} {'CUDA ms':>12s}")
+        print(f"{'pipeline stage':40s} {'CPU ms':>10s} {'CUDA ms':>10s}")
         for key in sorted(set(cpu_stage) | set(gpu_stage)):
             print(
-                f"{key:34s} {cpu_stage.get(key, float('nan')):12.2f} "
-                f"{gpu_stage.get(key, float('nan')):12.2f}"
+                f"{key:40s} {cpu_stage.get(key, float('nan')) * 1000.0:10.2f} "
+                f"{gpu_stage.get(key, float('nan')) * 1000.0:10.2f}"
             )
 
     payload = {
@@ -261,18 +371,28 @@ def main() -> int:
         "gpu_final": gpu_final,
         "cpu_summary": cpu_summary,
         "gpu_summary": gpu_summary,
-        "normalised_identical": identical,
+        "normalised_identical": strictly_identical,
+        "decision_fields_identical": comparison["decision_equal"],
+        "drifting_diagnostics": comparison["drift_counts"],
+        "worst_diagnostic_drift": comparison["worst_drift"],
         "device_host_split": split,
         "resident_image": resident,
         "tiling": tiling,
-        "cpu_stage_ms": cpu_stage,
-        "gpu_stage_ms": gpu_stage,
+        "cpu_stage_ms": {key: value * 1000.0 for key, value in cpu_stage.items()},
+        "gpu_stage_ms": {key: value * 1000.0 for key, value in gpu_stage.items()},
+        "cpu_detector_stage_ms": {
+            key: value * 1000.0 for key, value in cpu_detector_stage.items()
+        },
+        "gpu_detector_stage_ms": {
+            key: value * 1000.0 for key, value in gpu_detector_stage.items()
+        },
+        "gpu_metrics": gpu_result.get("execution", {}).get("gpu", {}).get("metrics", {}),
     }
     if args.json is not None:
         args.json.parent.mkdir(parents=True, exist_ok=True)
         args.json.write_text(json.dumps(payload, indent=2, default=str, ensure_ascii=False), encoding="utf-8")
         print(f"\nwrote {args.json}")
-    return 0 if identical else 1
+    return 0 if comparison["decision_equal"] else 1
 
 
 if __name__ == "__main__":
