@@ -34,26 +34,43 @@ float 累加的逐像素一致性，不可移除。
 plan，tile metadata 以 `cpu_crossover` 路線與 `preprocess_routes` 標示。`gpu.mode: cuda`
 不啟用此路由。
 
-## 已實作但尚未接入產線的步驟
+## 已完成並接入產線、以及尚未接入的步驟
 
-以下 operator 已完成並以 RTX 3090 對 OpenCV 做等價量測，但**尚未接進任何 Detector**，因此在
-`execution.gpu.device_host_split` 中仍回報為 cpu。啟用前必須先接線並通過 PASS/NG、缺陷數、
-bbox、area、confidence、metadata 等價測試。
+以 RTX 3090 完成等價量測後才可接入產線；未接入者在 `execution.gpu.device_host_split` 中
+一律回報為 cpu。**接入與否以本節與 `Todo.md` 為準，不以 export 存在為準。**
 
 - `vf_match_template_gray_u8`（Template Anchor Grid 定位）：**已接入** `core/tiler.py`。
   與 `cv2.matchTemplate` 的定位座標在 9 個場景 9/9 相同、分數差 ≤ 4.2e-7、逐次執行決定性。
   形狀界線內（template 每邊 ≤ 128 px 且搜尋面積 ≥ 256×256）比 CPU 快 1.6～3.9 倍，
   界線外或失敗時回 CPU 參考；界線見 `core/tiler.py` 的 `gpu_anchor_shapes_supported`。
-- `vf_find_contours_u8` / `vf_find_contours_download`（輪廓抽取）：與
-  `cv2.findContours(RETR_LIST/RETR_EXTERNAL, CHAIN_APPROX_SIMPLE)` 在
-  `tools/check_contour_equivalence.py` 的 **314 個案例全部逐點相同且決定性**（含輪廓數、
-  每條 shape、點順序、子區域座標契約）。速度尚未全面勝過 CPU：2000×12000 於
-  `RETR_LIST` 密集 358 條輪廓為 8.1～9.9 ms、比 cv2（13.2～14.6 ms）快；
-  稀疏 200 條大輪廓為 39～40 ms、比 cv2（14～15 ms）慢約 2.6 倍；`RETR_EXTERNAL`
-  仍走逐列掃描、約 1227 ms，明顯較慢。因此**維持停用**，不得視為已完成步驟。
-- `vf_median_f32`（float32 精確中位數，供 202-CS-SN-1 的 median／MAD 使用）：仍在校正與等價
-  驗證中，未有可啟用的實作。量測顯示中位數運算約佔該 Detector 75% 的時間，是該 Detector
-  GPU 化的首要目標。
+- `vf_find_contours_u8` / `vf_find_contours_download`（輪廓抽取）：**正確但全面較慢，
+  已判定不接入產線**。與 `cv2.findContours(RETR_LIST/RETR_EXTERNAL,
+  CHAIN_APPROX_SIMPLE)` 在 `tools/check_contour_equivalence.py` 的 **314 個案例全部逐點
+  相同且決定性**（含輪廓數、每條 shape、點順序、子區域座標契約），但**在每一個量測形狀都
+  慢於 cv2**（GPU／CPU 毫秒）：512×512 稀疏 0.24→1.06（0.22×）、512×512 密集
+  0.23→3.91（0.06×）、2048×2048 密集 3.04→23.17（0.13×）、2000×12000 稀疏
+  13.77→34.16（0.40×）、中型 18.63→136.54（0.14×）、大型 26.97→261.85（0.10×）、
+  `RETR_EXTERNAL` 13.83→1234.75（0.01×）。**沒有任何形狀勝出，故不訂啟用界線、維持停用**；
+  此結論已更正先前的錯誤記載，日後若要重啟需先提出新的演算法（例如 tile 化後只下載輪廓點，
+  而非整張 label 影像）。
+- `vf_median_f32`（float32 精確中位數，供 202-CS-SN-1 的 median／MAD 使用）：**已接入
+  `detectors/detector_202_1.py` 的 `_exact_median`**（`gpu.mode: cuda`／支援時才走 GPU，
+  否則整個呼叫回 `np.median`）。除以 float32 轉 monotone uint32 key 後用
+  `cub::DeviceRadixSort` 排序、只讀回中間 1～2 個 key，再於 host 以 float32 平均，
+  因此與 `np.median(float32)` **位元相同**：34/34 案例一致（其中 32 個連排序後的中間值
+  圖樣也相同）、NaN 6/6、不改動輸入、決定性。4M float32 為 GPU 2.92～6.53 ms、
+  CPU 34.5～36.3 ms（**5.6～11.8×**）；202 端到端 PASS/NG、缺陷數、bbox、area、
+  confidence、metadata **完全相同**，305.5 → 188.2 ms（**1.62×**）。median 未接線前
+  約佔該 Detector 75% 時間，是該 Detector GPU 化的首要目標，現已完成。
+- **`vf_gaussian_blur_f32`（float32 Gaussian）**：進行中，等價量測與界線尚未定案前不接入
+  產線。它是把 202 的 `residual` 留在 device 上的前置條件（目前 `residual` 仍需下載後
+  才能在 host 計算 median 之外的後續步驟）。
+- **connected components 與 ring CNR 統計**：**尚未 GPU 化**。`tools/connected_components_reference.py`
+  已可與 `cv2.connectedComponentsWithStats` 在結構化遮罩上完全一致（含 label 0 描述背景像素、
+  無像素標籤的 sentinel／NaN centroid 語意），但**隨機遮罩的標籤編號順序仍不同**；
+  在該缺口修正前，此參考不得作為 GPU 化的黃金標準（細節與已排除的假設見 `Todo.md`）。
+  ring CNR 的背景 mean/std 目前以 NumPy 在 host 計算，會與 GPU 化後的加法順序有
+  ULP 級差異，判定邊界案例必須另外量測。
 
 `vf_match_template_debug_*` 與 `vf_find_contours_*` 的下載介面只供等價驗證與診斷使用，
 不屬於產線路徑。

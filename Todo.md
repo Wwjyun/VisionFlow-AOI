@@ -381,7 +381,9 @@ float32 累加、OpenCV 的 kernel 係數）與 `vf_gaussian_blur_f32_roi`，並
 1. 202-CS-SN-1 其餘步驟（**不含 median，已於本輪完成**）：Gaussian 背景、遮罩、connected components
    標籤順序、component 幾何、ring CNR 統計的黃金參考與等價測試。
 2. 401 系列的幾何路徑等價測試（已量測：幾何僅約 9 µs/輪廓，稀疏時佔 11%，現階段不值得 GPU 化，但需等價測試把關既有行為）。
-3. README 與 `gpu/README.md` 的如實描述更新（`README.md` 已描述 anchor 界線；`gpu/README.md` 尚待補）。
+3. ~~README 與 `gpu/README.md` 的如實描述更新~~ **已完成**：`gpu/README.md` 的輪廓速度記載
+   （先前誤記為「密集案例比 cv2 快」）與 median 狀態（先前誤記為「尚未有可啟用的實作」）已
+   修正為實測結果，並補上 Gaussian／connected components／ring CNR 的現況與界線。
 
 ### 全流程 GPU 化（2026-09-14 使用者需求，先列待辦、暫不動工）
 
@@ -641,6 +643,8 @@ float32 累加、OpenCV 的 kernel 係數）與 `vf_gaussian_blur_f32_roi`，並
 - [ ] 加速不得犧牲 GUI 回應、打包啟動、結果追溯、錯誤訊息或 CPU fallback。
 
 ## 完成紀錄
+
+- [x] 2026-09-15：修正 `gpu/README.md` 兩處與實測不符的記載，並補上尚未 GPU 化步驟的正確界線。修正一：輪廓抽取原記載「2000×12000 `RETR_LIST` 密集 358 條輪廓比 cv2 快」，但依 `tools/check_contour_equivalence.py`（314 案例全部逐點相同）的完整重測，`vf_find_contours_u8` **在每一個量測形狀都慢於 cv2**（512×512 稀疏 0.22×、512×512 密集 0.06×、2048×2048 密集 0.13×、2000×12000 稀疏 0.40×、中型 0.14×、大型 0.10×、`RETR_EXTERNAL` 0.01×），已改為「正確但全面較慢，判定不接入產線、不訂啟用界線」。修正二：`vf_median_f32` 原記載「仍在校正、未有可啟用的實作」，實際上已接入 `detectors/detector_202_1.py` 的 `_exact_median`，並已量到與 `np.median(float32)` 位元相同（34/34、NaN 6/6）、4M float32 快 5.6～11.8 倍、202 端到端 305.5 → 188.2 ms（1.62×），已改為已完成。另新增三項現況：`vf_gaussian_blur_f32` 進行中且尚未定界線、**connected components 與 ring CNR 統計尚未 GPU 化**（並明記「隨機遮罩標籤編號順序不同，修正前不得作為黃金標準」）、ring CNR 的 host NumPy mean/std 與 GPU 化後會有 ULP 級差異需另量測判定邊界。章節標題改為「已完成並接入產線、以及尚未接入的步驟」，並明訂接入與否以該節與 `Todo.md` 為準、不以 export 存在為準。未修改任何程式、CUDA source／ABI 或 DLL。
 
 - [x] 2026-09-15：為 202 的 connected components 建立黃金參考並把「標籤編號不符」縮小到可驗證的範圍。新增 `tools/connected_components_reference.py`（union-find 實作，含 OpenCV 的 label-0 語意）與 `tests/test_connected_components_reference.py`（5 tests，全套 394 → 399 tests OK）。結構化遮罩（全零、全滿、單像素、實心矩形、兩矩形、對角線、對角相鄰、環形孔洞、貼邊、morphology 雜訊遮罩；4 與 8 連通）的 label map、標籤順序、stats、centroids **全部與 `cv2.connectedComponentsWithStats` 相同**，並補上兩個容易漏掉的 OpenCV 語意：（1）**label 0 的 stats 描述背景像素**（50×40 影像中 16×10 白色矩形 → `[0,0,50,40,1840]`）；（2）**無像素的標籤 stats 為 sentinel `[-1, INT_MAX, 0, 0, 0]`、centroid 為 NaN**（全前景時 label 0 即如此）。**隨機遮罩**上 component 數量與像素集合永遠正確，但標籤編號順序不同；本輪以實證排除「首像素 raster 掃描順序」假設（96 個 component 中 63 個不符、第二個遮罩 69 個中 49 個不符，而結構化案例 0 個不符，故該規則只在無合併時成立），先前的「union-find root 升冪」亦已排除，因此編號取決於 OpenCV provisional label 的建立與合併後重編號細節。此缺口已由 `test_random_masks_agree_on_component_count_but_not_yet_on_label_order` 釘住並在 Todo 記錄後續兩條明確路徑；**修正前不得以此參考實作作為 connected components GPU 化的黃金標準**，202 仍使用 OpenCV，產線不受影響。未修改 runtime、CUDA source／ABI／DLL。
 
