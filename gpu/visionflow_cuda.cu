@@ -1155,6 +1155,14 @@ constexpr int MATCH_ROI_BUFFER = 3;         // context->u8[3]: search ROI gray o
 constexpr int MATCH_REDUCE_BLOCK = 256;
 // Coordinates are packed into 20 bits, so a search wider than this cannot be reported at all.
 constexpr int MATCH_MAX_OUTPUT_WIDTH = (1 << 20) - 1;
+// Output tile of the tiled score kernel and its block shape. Shared memory per block is
+// (tile_rows + template_height - 1) * (tile_cols + template_width - 1) bytes, so the caller
+// shrinks the tile when a large template would exceed the device limit.
+constexpr int MATCH_TILE_COLS = 64;
+constexpr int MATCH_TILE_ROWS = 32;
+constexpr int MATCH_BLOCK_X = 64;
+constexpr int MATCH_BLOCK_Y = 4;
+constexpr size_t MATCH_SHARED_LIMIT_BYTES = 48 * 1024;
 // Candidate slots scale with the search width, not the block size: the score kernel writes one
 // entry per output column, so a fixed small count would overflow as soon as output_width exceeds
 // it. Slots are int64-sized so the double scores stay aligned, and the result fields follow them.
@@ -1233,61 +1241,110 @@ __global__ void match_prefix_kernel(
     }
 }
 
-// One thread per output column walks every candidate window of that column. The window sum and
-// its square come from the prefix planes in O(1); the template-weighted sum is accumulated
-// directly, with consecutive threads reading consecutive ROI columns so the loads coalesce and
-// every warp shares one template row.
+// Offers one candidate for a column and keeps the best by score, breaking a tie toward the
+// smaller row and then the smaller column. The row/column fields are 20-bit values packed beside
+// the quantized score, and the whole triple is published with one compare-and-swap, so two blocks
+// writing the same column cannot interleave a score from one with a row from the other.
+__device__ __forceinline__ void match_offer_candidate(
+    double score, int column, int row, double* candidate_scores, int* candidate_ys) {
+    // No early exit: every thread that computes a candidate offers it, and the compare-and-swap
+    // converges on the best one, so the result does not depend on block or thread order.
+    double clamped = score;
+    if (clamped > 1.0) clamped = 1.0;
+    if (clamped < 0.0) clamped = 0.0;
+    const unsigned long long quantized =
+        static_cast<unsigned long long>(clamped * MATCH_SCORE_MAX + 0.5);
+    const int safe_row = row > MATCH_COORD_MASK - 1 ? MATCH_COORD_MASK - 1 : row;
+    const unsigned long long key =
+        (quantized << 40) |
+        (static_cast<unsigned long long>(MATCH_COORD_MASK - safe_row) << 20) |
+        static_cast<unsigned long long>(MATCH_COORD_MASK - column);
+    unsigned long long current = *reinterpret_cast<unsigned long long*>(&candidate_scores[column]);
+    while (key > current) {
+        const unsigned long long previous = atomicCAS(
+            reinterpret_cast<unsigned long long*>(&candidate_scores[column]), current, key);
+        if (previous == current) {
+            candidate_ys[column] = safe_row;
+            return;
+        }
+        current = previous;
+    }
+}
+
+// Tiled score kernel. Each block stages the ROI patch covering its output tile into shared memory
+// once, so the window sum, its square and the template-weighted sum are all accumulated from
+// shared memory instead of re-reading the ROI for every candidate. The template stays in global
+// memory on purpose: it is small, constant per call, and reused by every block, so it stays hot in
+// L2 without competing with the ROI patch for shared memory.
+//
+// Shared bytes: (tile_rows + template_height - 1) * (tile_cols + template_width - 1).
 __global__ void match_score_kernel(
-    const uint8_t* roi, int roi_width, int roi_height,
+    const uint8_t* roi, int roi_width,
     int output_width, int output_height,
-    int template_width, int template_height,
+    int template_width, int template_height, int template_pixels,
+    int tile_cols, int tile_rows,
+    double template_mean, double template_variance,
     const uint8_t* templ,
-    const long long* sum_prefix, const long long* square_prefix,
-    double template_mean, double template_variance, int template_pixels,
     double* candidate_scores, int* candidate_ys) {
-    const int column = blockIdx.x * blockDim.x + threadIdx.x;
-    if (column >= output_width || template_height > roi_height) return;
-    double best_score = -2.0;
-    int best_y = -1;
-    for (int row = 0; row < output_height; ++row) {
-        const size_t bottom = static_cast<size_t>(row + template_height - 1) * output_width + column;
-        long long window_sum = sum_prefix[bottom];
-        long long window_square_sum = square_prefix[bottom];
-        if (row > 0) {
-            const size_t top = static_cast<size_t>(row - 1) * output_width + column;
-            window_sum -= sum_prefix[top];
-            window_square_sum -= square_prefix[top];
-        }
-        const double mean = static_cast<double>(window_sum) / template_pixels;
-        double window_variance =
-            static_cast<double>(window_square_sum) / template_pixels - mean * mean;
-        if (window_variance < 0.0) window_variance = 0.0;
-        const double denominator = std::sqrt(window_variance * template_variance) * template_pixels;
-        double score = -1.0;
-        if (denominator > 0.0) {
-            long long weighted = 0;
-            for (int template_row = 0; template_row < template_height; ++template_row) {
-                const uint8_t* line =
-                    roi + static_cast<size_t>(row + template_row) * roi_width + column;
-                const uint8_t* template_line =
-                    templ + static_cast<size_t>(template_row) * template_width;
-                long long term = 0;
-                for (int offset = 0; offset < template_width; ++offset) {
-                    term += static_cast<long long>(line[offset]) * template_line[offset];
-                }
-                weighted += term;
-            }
-            score = (static_cast<double>(weighted) - template_mean * window_sum) / denominator;
-        }
-        if (score > 1.0) score = 1.0;
-        if (score < -1.0) score = -1.0;
-        if (score > best_score) {
-            best_score = score;
-            best_y = row;
+    extern __shared__ unsigned char shared_bytes[];
+    uint8_t* tile = shared_bytes;
+
+    const int tiles_x = (output_width + tile_cols - 1) / tile_cols;
+    const int tile_x = blockIdx.x % tiles_x;
+    const int tile_y = blockIdx.x / tiles_x;
+    const int first_column = tile_x * tile_cols;
+    const int first_row = tile_y * tile_rows;
+    const int columns = min(tile_cols, output_width - first_column);
+    const int rows = min(tile_rows, output_height - first_row);
+    const int patch_rows = rows + template_height - 1;
+    const int patch_cols = columns + template_width - 1;
+    const int pitch = patch_cols;
+
+    for (int row = threadIdx.y; row < patch_rows; row += blockDim.y) {
+        const uint8_t* source =
+            roi + static_cast<size_t>(first_row + row) * roi_width + first_column;
+        uint8_t* destination = tile + static_cast<size_t>(row) * pitch;
+        for (int column = threadIdx.x; column < patch_cols; column += blockDim.x) {
+            destination[column] = source[column];
         }
     }
-    candidate_scores[column] = best_score;
-    candidate_ys[column] = best_y;
+    __syncthreads();
+
+    for (int output_row = threadIdx.y; output_row < rows; output_row += blockDim.y) {
+        for (int output_column = threadIdx.x; output_column < columns; output_column += blockDim.x) {
+            long long window_sum = 0;
+            long long window_square = 0;
+            long long weighted = 0;
+            for (int template_row = 0; template_row < template_height; ++template_row) {
+                const uint8_t* patch =
+                    tile + static_cast<size_t>(output_row + template_row) * pitch + output_column;
+                const uint8_t* template_line =
+                    templ + static_cast<size_t>(template_row) * template_width;
+                for (int offset = 0; offset < template_width; ++offset) {
+                    const int value = patch[offset];
+                    window_sum += value;
+                    window_square += static_cast<long long>(value) * value;
+                    weighted += static_cast<long long>(value) * template_line[offset];
+                }
+            }
+            const double mean = static_cast<double>(window_sum) / template_pixels;
+            double window_variance =
+                static_cast<double>(window_square) / template_pixels - mean * mean;
+            if (window_variance < 0.0) window_variance = 0.0;
+            const double denominator =
+                std::sqrt(window_variance * template_variance) * template_pixels;
+            double score = -1.0;
+            if (denominator > 0.0) {
+                score = (static_cast<double>(weighted) - template_mean * window_sum) / denominator;
+            }
+            if (score > 1.0) score = 1.0;
+            if (score < -1.0) score = -1.0;
+            const int global_column = first_column + output_column;
+            const int global_row = first_row + output_row;
+            match_offer_candidate(
+                score, global_column, global_row, candidate_scores, candidate_ys);
+        }
+    }
 }
 
 
@@ -2779,22 +2836,39 @@ VF_CUDA_API int vf_match_template_gray_u8(
 
     double* candidate_scores = reinterpret_cast<double*>(candidate_storage);
     int* candidate_ys = reinterpret_cast<int*>(candidate_storage + match_candidate_slots(output_width));
-    const dim3 prefix_grid((output_width + MATCH_REDUCE_BLOCK - 1) / MATCH_REDUCE_BLOCK, 1);
-    const dim3 reduce_block(MATCH_REDUCE_BLOCK, 1);
-    match_prefix_kernel<<<prefix_grid, reduce_block, 0, persistent->stream>>>(
-        persistent->u8[MATCH_ROI_BUFFER], search_width, search_height,
-        output_width, template_width,
-        persistent->match_plane[MATCH_SUM_PREFIX_PLANE],
-        persistent->match_plane[MATCH_SQUARE_PREFIX_PLANE]);
-    result = visionflow_cuda::kernel_launch_result();
-    if (result != VF_CUDA_OK) return result;
-    match_score_kernel<<<prefix_grid, reduce_block, 0, persistent->stream>>>(
-        persistent->u8[MATCH_ROI_BUFFER], search_width, search_height,
+    // Shrink the tile until its shared footprint fits, because a large template widens the halo.
+    int tile_cols = MATCH_TILE_COLS;
+    int tile_rows = MATCH_TILE_ROWS;
+    size_t shared_bytes = 0;
+    for (;;) {
+        shared_bytes = static_cast<size_t>(tile_rows + template_height - 1) *
+                       static_cast<size_t>(tile_cols + template_width - 1);
+        if (shared_bytes <= MATCH_SHARED_LIMIT_BYTES) break;
+        if (tile_cols > 16) {
+            tile_cols /= 2;
+            continue;
+        }
+        if (tile_rows > 4) {
+            tile_rows /= 2;
+            continue;
+        }
+        break;
+    }
+    if (shared_bytes > MATCH_SHARED_LIMIT_BYTES) {
+        // A template this large cannot be tiled within the default shared limit; the caller falls
+        // back to the CPU reference instead of failing.
+        return VF_CUDA_UNSUPPORTED;
+    }
+    const int tiles_x = (output_width + tile_cols - 1) / tile_cols;
+    const int tiles_y = (output_height + tile_rows - 1) / tile_rows;
+    const dim3 score_grid(static_cast<unsigned int>(tiles_x) * static_cast<unsigned int>(tiles_y));
+    const dim3 score_block(MATCH_BLOCK_X, MATCH_BLOCK_Y);
+    match_score_kernel<<<score_grid, score_block, shared_bytes, persistent->stream>>>(
+        persistent->u8[MATCH_ROI_BUFFER], search_width,
         output_width, output_height, template_width, template_height,
+        template_width * template_height, tile_cols, tile_rows,
+        template_mean, template_variance,
         persistent->u8[MATCH_TEMPLATE_BUFFER],
-        persistent->match_plane[MATCH_SUM_PREFIX_PLANE],
-        persistent->match_plane[MATCH_SQUARE_PREFIX_PLANE],
-        template_mean, template_variance, template_width * template_height,
         candidate_scores, candidate_ys);
     result = visionflow_cuda::kernel_launch_result();
     if (result != VF_CUDA_OK) return result;
