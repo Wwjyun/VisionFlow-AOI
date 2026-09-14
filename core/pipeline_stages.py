@@ -136,6 +136,48 @@ class InspectionResultAssembler:
         }
 
     @staticmethod
+    def _device_host_split(
+        *,
+        gpu_runtime,
+        detectors,
+        resident_image,
+        tiling_gpu_requested: bool,
+    ) -> dict:
+        """Report which pipeline steps ran on the device and which stayed on the host.
+
+        AGENT.md requires the actual split to be reported from runtime metadata rather than
+        describing the flow as fully GPU. Only steps whose device status is known from this run are
+        listed, so a step without a device implementation is reported as CPU instead of being
+        implied by the recipe request.
+        """
+        native_detectors = [
+            detector for detector in detectors if getattr(detector, "use_gpu", False)
+        ]
+        plan_on_device = any(
+            getattr(detector, "gpu_active", False)
+            and not getattr(detector, "cpu_crossover_only", False)
+            for detector in native_detectors
+        )
+        return {
+            "image_decode": "cpu",
+            "resident_upload": "device" if resident_image is not None else "cpu",
+            "anchor_localization": "device" if resident_image is not None else "cpu",
+            "tiling_roi": "device" if tiling_gpu_requested and resident_image is not None else "cpu",
+            "preprocessing": "device" if plan_on_device else "cpu",
+            # These steps have no device implementation yet, so they are reported as host work
+            # rather than inferred from the preprocessing route.
+            "candidate_extraction": "cpu",
+            "geometry_and_statistics": "cpu",
+            "pass_ng_decision": "cpu",
+            "aggregation_and_reporting": "cpu",
+            "note": (
+                "anchor_localization 僅在形狀界線內走 device（見 core/tiler.py "
+                "gpu_anchor_shapes_supported）；candidate_extraction、geometry_and_statistics 與 "
+                "pass_ng_decision 目前仍無 device 實作，因此一律回報 cpu。"
+            ),
+        }
+
+    @staticmethod
     def build(
         *,
         image_path: Path,
@@ -183,6 +225,12 @@ class InspectionResultAssembler:
                     },
                     "tiling": gpu_runtime.status(tiling_gpu_requested),
                     "display_requested": bool(display_requested),
+                    "device_host_split": InspectionResultAssembler._device_host_split(
+                        gpu_runtime=gpu_runtime,
+                        detectors=detectors,
+                        resident_image=resident_image,
+                        tiling_gpu_requested=tiling_gpu_requested,
+                    ),
                     "detectors": {
                         detector.detector_id: InspectionResultAssembler._detector_gpu_status(
                             detector, gpu_runtime
