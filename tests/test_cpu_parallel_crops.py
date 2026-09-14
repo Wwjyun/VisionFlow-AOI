@@ -3,6 +3,7 @@ from __future__ import annotations
 import tempfile
 import threading
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from unittest import mock
 
@@ -36,12 +37,31 @@ class CpuParallelCropTests(unittest.TestCase):
         parallel = list(create_tiler(config, crop_workers=4).iter_tiles(self.image))
         self.assert_same_tiles(serial, parallel)
 
-    def test_worker_setting_is_opt_in_and_bounded(self):
+    def test_explicit_worker_setting_is_bounded(self):
         config = {"mode": "grid", "width": 32, "height": 32, "crop_workers": 3}
         with mock.patch("core.tiler.os.cpu_count", return_value=4):
             self.assertEqual(create_tiler(config).crop_workers, 3)
             self.assertEqual(create_tiler(config, crop_workers=8).crop_workers, 4)
             self.assertEqual(create_tiler(config, crop_workers="invalid").crop_workers, 1)
+
+    def test_auto_default_keeps_small_crops_serial(self):
+        with mock.patch("core.tiler.ThreadPoolExecutor") as executor:
+            tiles = list(create_tiler(
+                {"mode": "grid", "width": 32, "height": 32},
+            ).iter_tiles(self.image))
+        self.assertEqual(create_tiler({"mode": "grid", "width": 32, "height": 32}).crop_workers, "auto")
+        self.assertGreater(len(tiles), 1)
+        executor.assert_not_called()
+
+    def test_auto_default_uses_four_workers_for_large_crop_batch(self):
+        image = np.zeros((2048, 2048, 3), np.uint8)
+        with mock.patch("core.tiler.os.cpu_count", return_value=16), \
+             mock.patch("core.tiler.ThreadPoolExecutor", wraps=ThreadPoolExecutor) as executor:
+            tiles = list(create_tiler(
+                {"mode": "grid", "width": 512, "height": 512},
+            ).iter_tiles(image))
+        self.assertEqual(len(tiles), 16)
+        executor.assert_called_once_with(max_workers=4)
 
     def test_cpu_crops_run_on_multiple_threads(self):
         original_crop = tiler_module._crop_image

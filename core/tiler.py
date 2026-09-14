@@ -37,7 +37,7 @@ class Tile:
     device_roi: object | None = None
 
 
-def _iter_cropped_tiles(image, tiles: Iterator[Tile], gpu_runtime=None, crop_workers: int = 1) -> Iterator[Tile]:
+def _iter_cropped_tiles(image, tiles: Iterator[Tile], gpu_runtime=None, crop_workers: int | str = "auto") -> Iterator[Tile]:
     """Crop independent CPU ROIs concurrently while yielding tiles in source order."""
     def crop(tile: Tile) -> Tile:
         return replace(
@@ -48,12 +48,30 @@ def _iter_cropped_tiles(image, tiles: Iterator[Tile], gpu_runtime=None, crop_wor
             ),
         )
 
-    if crop_workers <= 1 or gpu_runtime is not None:
+    if gpu_runtime is not None or crop_workers == 1:
         for tile in tiles:
             yield crop(tile)
         return
     source = iter(tiles)
-    first_batch = list(islice(source, crop_workers * 4))
+    if crop_workers == "auto":
+        first_batch = list(islice(source, 16))
+        channels = 1 if image.ndim == 2 else image.shape[2]
+        crop_bytes = sum(tile.width * tile.height * channels * image.dtype.itemsize for tile in first_batch)
+        if len(first_batch) < 4 or crop_bytes < 8 * 1024 * 1024:
+            for tile in first_batch:
+                yield crop(tile)
+            for tile in source:
+                yield crop(tile)
+            return
+        crop_workers = min(4, os.cpu_count() or 1)
+    else:
+        first_batch = list(islice(source, crop_workers * 4))
+    if crop_workers <= 1:
+        for tile in first_batch:
+            yield crop(tile)
+        for tile in source:
+            yield crop(tile)
+        return
     if len(first_batch) <= 1:
         for tile in first_batch:
             yield crop(tile)
@@ -64,8 +82,10 @@ def _iter_cropped_tiles(image, tiles: Iterator[Tile], gpu_runtime=None, crop_wor
             yield from executor.map(crop, batch)
 
 
-def _crop_workers(config: dict, configured=None) -> int:
-    value = config.get("crop_workers", 1) if configured is None else configured
+def _crop_workers(config: dict, configured=None) -> int | str:
+    value = config.get("crop_workers", "auto") if configured is None else configured
+    if value == "auto":
+        return "auto"
     try:
         return max(1, min(int(value), os.cpu_count() or 1))
     except (TypeError, ValueError):
@@ -461,7 +481,7 @@ class Tiler:
         anchor_config: GridAnchorConfig | None = None,
         gpu_runtime=None,
         resident_image=None,
-        crop_workers: int = 1,
+        crop_workers: int | str = "auto",
     ):
         if width <= 0 or height <= 0:
             raise ValueError("Tile width and height must be positive.")
@@ -665,7 +685,7 @@ class Tiler:
 
 
 class ContourTiler:
-    def __init__(self, threshold: BinaryThresholdConfig, shapes: ShapeFilterConfig, gpu_runtime=None, crop_workers: int = 1):
+    def __init__(self, threshold: BinaryThresholdConfig, shapes: ShapeFilterConfig, gpu_runtime=None, crop_workers: int | str = "auto"):
         self.segmenter = BinarySegmenter(threshold)
         self.analyzer = ContourShapeAnalyzer(shapes)
         self.shape_config = shapes
@@ -725,7 +745,7 @@ class ContourTiler:
 
 
 class PatternMatchTiler:
-    def __init__(self, config: PatternMatchConfig, gpu_runtime=None, crop_workers: int = 1):
+    def __init__(self, config: PatternMatchConfig, gpu_runtime=None, crop_workers: int | str = "auto"):
         self.config = config
         self.matcher = PatternMatcher(config)
         self.gpu_runtime = gpu_runtime
