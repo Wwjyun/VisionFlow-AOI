@@ -136,6 +136,24 @@ def compare(reference: list[np.ndarray], actual: list[np.ndarray]) -> tuple[bool
     return True, "identical"
 
 
+def region_cases(mask: np.ndarray) -> list[tuple[str, tuple[int, int, int, int]]]:
+    """Sub-regions that must behave exactly like cv2.findContours on the cropped array.
+
+    The region is treated as an isolated image with a one-pixel zero frame, so a shape crossing the
+    region edge must produce the same points as cropping the mask first.
+    """
+    height, width = mask.shape
+    if height < 6 or width < 6:
+        return []
+    return [
+        ("region_top_left", (0, 0, width // 2, height // 2)),
+        (
+            "region_inner",
+            (width // 4, height // 4, max(1, width // 2), max(1, height // 2)),
+        ),
+    ]
+
+
 def time_call(function, repetitions: int) -> dict:
     samples = []
     for _ in range(repetitions):
@@ -242,6 +260,55 @@ def main() -> int:
                 }
             )
             print(rows[-1])
+
+        # Sub-region calls: the points must be 0-based inside the requested region and match the
+        # same cv2 call on the cropped mask, which is the coordinate contract the ROI path promises.
+        for region_name, region in region_cases(mask):
+            x, y, width, height = region
+            cropped = mask[y : y + height, x : x + width]
+            for mode, flag in MODES:
+                reference, _ = cv2.findContours(cropped, flag, cv2.CHAIN_APPROX_SIMPLE)
+                try:
+                    actual = runtime.find_contours_gray(mask, mode, region=region)
+                except GpuRuntimeError as exc:
+                    rows.append(f"{name}/{region_name}/{mode}: GPU error {exc}")
+                    total += 1
+                    continue
+                same, detail = compare(reference, actual)
+                identical += int(same)
+                total += 1
+                rows.append(
+                    f"{name}/{region_name}/{mode}: {'identical' if same else 'DIFFERS - ' + detail}"
+                )
+                report["cases"].append(
+                    {
+                        "name": f"{name}/{region_name}",
+                        "mode": mode,
+                        "region": list(region),
+                        "contours_cv2": len(reference),
+                        "contours_gpu": len(actual),
+                        "identical": bool(same),
+                        "detail": detail,
+                    }
+                )
+
+    # Determinism: the same mask and region must produce the same bytes on every call.
+    deterministic = True
+    for name, mask in cases():
+        if not mask.any():
+            continue
+        first = runtime.find_contours_gray(mask, "list")
+        second = runtime.find_contours_gray(mask, "list")
+        repeatable = len(first) == len(second) and all(
+            np.array_equal(left, right) for left, right in zip(first, second)
+        )
+        deterministic = deterministic and repeatable
+        if not repeatable:
+            rows.append(f"{name}: NOT DETERMINISTIC across repeated calls")
+    report["deterministic"] = bool(deterministic)
+    rows.append(f"deterministic: {deterministic}")
+    print(rows[-1])
+
     if not args.skip_benchmark:
         benchmark(runtime, rows, report)
     summary = f"identical {identical}/{total}"
@@ -255,7 +322,7 @@ def main() -> int:
     )
     print("evidence:", OUTPUT / "contour_equivalence.txt")
     runtime.close()
-    return 0 if identical == total else 1
+    return 0 if identical == total and deterministic else 1
 
 
 if __name__ == "__main__":

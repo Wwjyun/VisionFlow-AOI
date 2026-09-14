@@ -85,6 +85,14 @@ struct PersistentContext {
     size_t contour_out_point_capacity = 0;
     int* contour_counts = nullptr;
     size_t contour_count_capacity = 0;
+    // RETR_LIST transition list: one exact row count, the row segment table, and the raster-ordered
+    // padded label indices the fast scan walks.
+    int* contour_row_counts = nullptr;
+    size_t contour_row_count_capacity = 0;
+    int* contour_row_start = nullptr;
+    size_t contour_row_start_capacity = 0;
+    int32_t* contour_transitions = nullptr;
+    size_t contour_transition_capacity = 0;
     int contour_count = 0;
     int contour_point_count = 0;
     uint64_t contour_generation = 0;
@@ -126,6 +134,9 @@ struct PersistentContext {
         visionflow_cuda::free_device(contour_out_offsets);
         visionflow_cuda::free_device(contour_out_points);
         visionflow_cuda::free_device(contour_counts);
+        visionflow_cuda::free_device(contour_row_counts);
+        visionflow_cuda::free_device(contour_row_start);
+        visionflow_cuda::free_device(contour_transitions);
         visionflow_cuda::free_device(resident_u8);
         for (cudaEvent_t event : timing_events) {
             if (event != nullptr) cudaEventDestroy(event);
@@ -1785,12 +1796,68 @@ __global__ void contour_init_label_kernel(
     label[static_cast<size_t>(row) * label_stride + column] = value;
 }
 
+// Decides what the raster scan must do at a stop position: a stop is any column where the current
+// label differs from the column to its left. Returns true when a border must be opened, with
+// *is_hole set to 0 (outer) or 1 (hole). The two else-branches mirror cvFindNextContour's
+// resume_scan path, including its lnbd bookkeeping.
+__device__ __forceinline__ bool contour_stop_starts_border(
+    const signed char* image, int stride, int y, int x, int mode,
+    int* lnbd_x, int* lnbd_y, int* is_hole_out) {
+    const int prev = static_cast<int>(image[static_cast<size_t>(y) * stride + (x - 1)]);
+    const int p = static_cast<int>(image[static_cast<size_t>(y) * stride + x]);
+    *is_hole_out = 0;
+    if (!(prev == 0 && p == 1)) {
+        // Not an outer border. `p != 0 || prev < 1` also rejects a hole start where the left pixel
+        // carries the -126 right-bound mark (which is < 1).
+        if (p != 0 || prev < 1) {
+            if (p & -2) *lnbd_x = x;
+            return false;
+        }
+        *is_hole_out = 1;
+    }
+    // RETR_EXTERNAL skips hole borders and borders whose left neighbour already carries a label.
+    if (mode == VF_CONTOURS_RETR_EXTERNAL &&
+        (*is_hole_out != 0 ||
+         static_cast<int>(image[static_cast<size_t>(*lnbd_y) * stride + *lnbd_x]) > 0)) {
+        if (p & -2) *lnbd_x = x;
+        return false;
+    }
+    return true;
+}
+
+// Opens one border at (y, x) and traces it into the discovery-order scratch.
+__device__ __forceinline__ void contour_open_border(
+    signed char* image, int stride, int y, int x, int is_hole,
+    int32_t* offsets, int offset_capacity,
+    int32_t* points, int point_capacity,
+    int* contour_count, int* point_index, int* overflow) {
+    const int origin_y = y;
+    const int origin_x = x - is_hole;
+    if (*contour_count < offset_capacity) {
+        offsets[*contour_count] = *point_index;
+    } else {
+        *overflow = 1;
+    }
+    contour_fetch(
+        image, stride, origin_y, origin_x, is_hole, origin_x - 1, origin_y - 1,
+        points, point_capacity, point_index, overflow);
+    if (*contour_count + 1 < offset_capacity) {
+        offsets[*contour_count + 1] = *point_index;
+    } else {
+        *overflow = 1;
+    }
+    *contour_count += 1;
+}
+
 // Serial port of the cvStartFindContours_Impl / cvFindNextContour raster scan plus the per-border
 // trace. A single thread owns the whole scan, so the marking order is the reference order and no
 // synchronization or atomic is involved; that is what makes the operator deterministic.
 //
 // counts[0] = contour count, counts[1] = point count, counts[2] = overflow flag. The counts are
 // reported even when the buffers were too small, so the caller can retry with the exact size.
+// This literal row walk is the reference form and stays in charge of RETR_EXTERNAL, where the
+// scan's lnbd bookkeeping can be updated by stops that this walk sees and a transition list does
+// not. RETR_LIST takes contour_scan_list_kernel instead.
 __global__ void contour_scan_kernel(
     signed char* image, int stride, int width, int height, int mode,
     int32_t* offsets, int offset_capacity,
@@ -1815,54 +1882,18 @@ __global__ void contour_scan_kernel(
         while (x < scan_w) {
             while (x < scan_w && static_cast<int>(row[x]) == prev) x += 1;
             if (x >= scan_w) break;
-            const int p = static_cast<int>(row[x]);
-
             int is_hole = 0;
-            if (!(prev == 0 && p == 1)) {
-                // Not an outer border. `p != 0 || prev < 1` also rejects a hole start where the
-                // left pixel carries the -126 right-bound mark (which is < 1).
-                if (p != 0 || prev < 1) {
-                    prev = p;
-                    if (prev & -2) lnbd_x = x;
-                    x += 1;
-                    continue;
-                }
-                is_hole = 1;
+            if (contour_stop_starts_border(image, stride, y, x, mode, &lnbd_x, &lnbd_y, &is_hole)) {
+                lnbd_x = x - is_hole;
+                lnbd_y = y;
+                contour_open_border(
+                    image, stride, y, x, is_hole, offsets, offset_capacity,
+                    points, point_capacity, &contour_count, &point_index, &overflow);
+                restarted = 1;
             }
-
-            // mode == RETR_EXTERNAL skips hole borders and borders whose left neighbour already
-            // belongs to a labelled contour.
-            if (mode == VF_CONTOURS_RETR_EXTERNAL &&
-                (is_hole || static_cast<int>(image[static_cast<size_t>(lnbd_y) * stride + lnbd_x]) > 0)) {
-                prev = p;
-                if (prev & -2) lnbd_x = x;
-                x += 1;
-                continue;
-            }
-
-            const int origin_y = y;
-            const int origin_x = x - is_hole;
-            lnbd_x = x - is_hole;
-            lnbd_y = y;
-            if (contour_count < offset_capacity) {
-                offsets[contour_count] = point_index;
-            } else {
-                overflow = 1;
-            }
-            contour_fetch(
-                image, stride, origin_y, origin_x, is_hole, origin_x - 1, origin_y - 1,
-                points, point_capacity, &point_index, &overflow);
-            if (contour_count + 1 < offset_capacity) {
-                offsets[contour_count + 1] = point_index;
-            } else {
-                overflow = 1;
-            }
-            contour_count += 1;
-
             x += 1;
             prev = static_cast<int>(row[x - 1]);
-            restarted = 1;
-            break;
+            if (restarted) break;
         }
         if (restarted) continue;
         lnbd_x = 0;
@@ -1870,6 +1901,89 @@ __global__ void contour_scan_kernel(
         x = 1;
         prev = 0;
         y += 1;
+    }
+
+    counts[0] = contour_count;
+    counts[1] = point_index;
+    counts[2] = overflow;
+}
+
+// Row transition counts of the region's zero-ness: a column where the binary value differs from its
+// left neighbour (the padded frame counts as background). Every border this scan can open sits on
+// such a column, because both the outer rule (bg -> fg) and the hole rule (fg -> bg) require the
+// value change, and marking only rewrites 1 into 2 or -126, which never changes zero-ness.
+// One thread per row keeps the pass deterministic; the count is exact, so the list needs no guess.
+__global__ void contour_row_transition_counts_kernel(
+    const uint8_t* mask, int mask_stride, int x0, int y0, int width, int height,
+    int* row_counts) {
+    const int row = blockIdx.x * blockDim.x + threadIdx.x + 1;
+    if (row > height) return;
+    const uint8_t* source = mask + static_cast<size_t>(y0 + row - 1) * mask_stride + x0;
+    int previous = 0;
+    int count = 0;
+    for (int column = 1; column <= width; ++column) {
+        const int value = source[column - 1] != 0 ? 1 : 0;
+        if (value != previous) count += 1;
+        previous = value;
+    }
+    row_counts[row - 1] = count;
+}
+
+// Fills the raster-ordered list of padded label indices, one thread per row, each row writing its
+// own segment in ascending column order.
+__global__ void contour_fill_transitions_kernel(
+    const uint8_t* mask, int mask_stride, int x0, int y0, int width, int height,
+    const int* row_start, int stride, int* transitions) {
+    const int row = blockIdx.x * blockDim.x + threadIdx.x + 1;
+    if (row > height) return;
+    const uint8_t* source = mask + static_cast<size_t>(y0 + row - 1) * mask_stride + x0;
+    int previous = 0;
+    int index = row_start[row];
+    const int base = row * stride;
+    for (int column = 1; column <= width; ++column) {
+        const int value = source[column - 1] != 0 ? 1 : 0;
+        if (value != previous) {
+            transitions[index] = base + column;
+            index += 1;
+        }
+        previous = value;
+    }
+}
+
+// RETR_LIST scan over the precomputed transition list. Iterating only the value changes is exact:
+// a stop whose left neighbour keeps the same zero-ness can only take the harmless resume_scan
+// branch (it updates prev, which this kernel re-reads from the image at every stop, and lnbd_x,
+// which RETR_LIST never reads). The literal row walk and this walk therefore open the same borders
+// in the same order, while this one touches memory only where a decision can happen.
+__global__ void contour_scan_list_kernel(
+    signed char* image, int stride, int height,
+    const int32_t* transitions, const int32_t* row_start,
+    int32_t* offsets, int offset_capacity,
+    int32_t* points, int point_capacity,
+    int* counts) {
+    if (blockIdx.x != 0 || blockIdx.y != 0 || threadIdx.x != 0 || threadIdx.y != 0) return;
+    int contour_count = 0;
+    int point_index = 0;
+    int overflow = 0;
+    int lnbd_x = 0;
+    int lnbd_y = 1;
+
+    for (int y = 1; y <= height; ++y) {
+        const int end = row_start[y + 1];
+        for (int index = row_start[y]; index < end; ++index) {
+            const int position = transitions[index];
+            const int x = position - y * stride;
+            int is_hole = 0;
+            if (!contour_stop_starts_border(
+                    image, stride, y, x, VF_CONTOURS_RETR_LIST, &lnbd_x, &lnbd_y, &is_hole)) {
+                continue;
+            }
+            lnbd_x = x - is_hole;
+            lnbd_y = y;
+            contour_open_border(
+                image, stride, y, x, is_hole, offsets, offset_capacity,
+                points, point_capacity, &contour_count, &point_index, &overflow);
+        }
     }
 
     counts[0] = contour_count;
@@ -3391,8 +3505,9 @@ VF_CUDA_API int vf_find_contours_u8(
 
     const size_t resident_pitch =
         static_cast<size_t>(persistent->resident_width) * persistent->resident_channels;
-    const uint8_t* mask = persistent->resident_u8 +
-        static_cast<size_t>(y) * resident_pitch + static_cast<size_t>(x);
+    // The init kernel applies (x, y) itself: passing an already-offset pointer here would apply
+    // the region origin twice and silently trace the wrong window.
+    const uint8_t* mask = persistent->resident_u8;
 
     // First guess at the output size. Sparse production masks are far below these ratios; a denser
     // mask only costs one extra trace with the exact reported capacity.
@@ -3414,6 +3529,69 @@ VF_CUDA_API int vf_find_contours_u8(
 
     reset_timing(persistent, false);
     cudaError_t error = cudaSuccess;
+    // RETR_LIST walks the zero-ness transition list instead of every row byte. The list depends
+    // only on the mask, so it is built once, before the retry loop, and its size is exact (the
+    // per-row counts come back to the host and are prefix-summed there).
+    const bool list_mode = (mode == VF_CONTOURS_RETR_LIST);
+    if (list_mode) {
+        std::vector<int> row_counts;
+        std::vector<int> row_start;
+        try {
+            row_counts.assign(static_cast<size_t>(height), 0);
+            row_start.assign(static_cast<size_t>(height) + 2, 0);
+        } catch (const std::bad_alloc&) {
+            return VF_CUDA_ALLOCATION_FAILED;
+        }
+        result = reserve_device(
+            &persistent->contour_row_counts, &persistent->contour_row_count_capacity,
+            static_cast<size_t>(height), &persistent->allocation_count);
+        if (result != VF_CUDA_OK) return result;
+        contour_row_transition_counts_kernel<<<
+            dim3(static_cast<unsigned int>((height + 255) / 256), 1, 1), dim3(256, 1, 1), 0,
+            persistent->stream>>>(
+            mask, static_cast<int>(resident_pitch), x, y, width, height,
+            persistent->contour_row_counts);
+        result = visionflow_cuda::kernel_launch_result();
+        if (result != VF_CUDA_OK) return result;
+        error = cudaMemcpyAsync(
+            row_counts.data(), persistent->contour_row_counts,
+            sizeof(int) * static_cast<size_t>(height), cudaMemcpyDeviceToHost, persistent->stream);
+        if (error != cudaSuccess) return cuda_result(error);
+        result = visionflow_cuda::stream_result(persistent->stream);
+        if (result != VF_CUDA_OK) return result;
+
+        long long total = 0;
+        for (int row = 1; row <= height; ++row) {
+            row_start[row] = static_cast<int>(total);
+            total += row_counts[static_cast<size_t>(row - 1)];
+        }
+        if (total > INT_MAX) return VF_CUDA_INVALID_ARGUMENT;
+        row_start[height + 1] = static_cast<int>(total);
+
+        result = reserve_device(
+            &persistent->contour_transitions, &persistent->contour_transition_capacity,
+            static_cast<size_t>(total > 0 ? total : 1), &persistent->allocation_count);
+        if (result != VF_CUDA_OK) return result;
+        result = reserve_device(
+            &persistent->contour_row_start, &persistent->contour_row_start_capacity,
+            static_cast<size_t>(height) + 2, &persistent->allocation_count);
+        if (result != VF_CUDA_OK) return result;
+        error = cudaMemcpyAsync(
+            persistent->contour_row_start, row_start.data(),
+            sizeof(int) * (static_cast<size_t>(height) + 2), cudaMemcpyHostToDevice,
+            persistent->stream);
+        if (error != cudaSuccess) return cuda_result(error);
+        if (total > 0) {
+            contour_fill_transitions_kernel<<<
+                dim3(static_cast<unsigned int>((height + 255) / 256), 1, 1), dim3(256, 1, 1), 0,
+                persistent->stream>>>(
+                mask, static_cast<int>(resident_pitch), x, y, width, height,
+                persistent->contour_row_start, label_stride, persistent->contour_transitions);
+            result = visionflow_cuda::kernel_launch_result();
+            if (result != VF_CUDA_OK) return result;
+        }
+    }
+
     bool complete = false;
     for (int attempt = 0; attempt < 4 && !complete; ++attempt) {
         result = reserve_device(
@@ -3441,11 +3619,20 @@ VF_CUDA_API int vf_find_contours_u8(
         if (result != VF_CUDA_OK) return result;
         cudaEventRecord(persistent->timing_events[TIMING_AFTER_INPUT], persistent->stream);
 
-        contour_scan_kernel<<<1, 1, 0, persistent->stream>>>(
-            persistent->contour_label, label_stride, width, height, mode,
-            persistent->contour_offsets, static_cast<int>(persistent->contour_offset_capacity),
-            persistent->contour_points, static_cast<int>(persistent->contour_point_capacity / 2),
-            persistent->contour_counts);
+        if (list_mode) {
+            contour_scan_list_kernel<<<1, 1, 0, persistent->stream>>>(
+                persistent->contour_label, label_stride, height,
+                persistent->contour_transitions, persistent->contour_row_start,
+                persistent->contour_offsets, static_cast<int>(persistent->contour_offset_capacity),
+                persistent->contour_points, static_cast<int>(persistent->contour_point_capacity / 2),
+                persistent->contour_counts);
+        } else {
+            contour_scan_kernel<<<1, 1, 0, persistent->stream>>>(
+                persistent->contour_label, label_stride, width, height, mode,
+                persistent->contour_offsets, static_cast<int>(persistent->contour_offset_capacity),
+                persistent->contour_points, static_cast<int>(persistent->contour_point_capacity / 2),
+                persistent->contour_counts);
+        }
         result = visionflow_cuda::kernel_launch_result();
         if (result != VF_CUDA_OK) return result;
         cudaEventRecord(persistent->timing_events[TIMING_AFTER_KERNEL], persistent->stream);
