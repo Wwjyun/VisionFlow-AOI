@@ -124,7 +124,8 @@ AOI_CVbased/
 |-- requirements.in / requirements.lock.txt
 |-- AGENT.md                        # Codex／維護者工作規範
 |-- CLAUDE.md                       # Claude Code 入口（載入 AGENT.md）
-|-- .claude/                        # Claude Code 專案 skills 與 subagent 定義
+|-- .claude/                        # Claude Code 專案 skills、subagent 與外部模型委派 MCP
+|-- .mcp.json                       # Claude Code MCP server 註冊
 |-- Todo.md                         # 唯一專案工作清單
 |-- docs/                           # Release notes、報告與打包說明
 |   |-- release-notes/              # 依產品與版本命名的發行說明
