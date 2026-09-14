@@ -186,13 +186,31 @@
 - [x] Overlay、NG tile／sidecar、debug 與 GUI 預覽所需的 CPU 像素按需取得；（2026-09-14 RTX 3090 以合成 16384×13000、6 個 2000×12000 ROI 開啟全部輸出與 debug images 驗證：CPU／strict CUDA 各 22 個輸出檔，PNG 逐像素、JSON／sidecar 與 CSV 除耗時／後端／路徑外完全相同；resident tile 仍為 CPU 原圖零複製 view，只有 debug 開啟時才複製中間影像，GUI 預覽維持獨立 CPU 讀圖）401 等目前仍需 CPU `findContours`／幾何判定的 Detector 只下載必要的 binary mask，檢查 PASS/NG、tile 順序／座標、defect bbox／area／confidence／metadata、輸出內容與 CPU 基準等價。
 - [ ] 用同一批真實 16384×13000 圖、約六個 2300×12000 ROI 及正式 Recipe／輸出設定，在 RTX 3090 比較修改前後 cold、warm median／P95、image load、整圖 H2D、tile 建立、Detector、D2D／必要 D2H、Reporter、端到端耗時、RAM／VRAM 峰值與 100 次穩定性；未證明整體收益與完整等價前保持 production 預設不變。2026-09-14 合成尺寸基準：BGR 原圖約 609.4 MiB，六張 CPU tile 副本約 473.8 MiB，CPU 裁切 warm median 128.6 ms，整圖 H2D 85.0 ms，ROI descriptor 建立約 0.03 ms；預期省的是 CPU 副本及其約 129 ms 複製，不包含既有 H2D，端到端百分比須以目前每張總耗時為分母實測。
 
+### 全流程 GPU 化（2026-09-14 使用者需求，先列待辦、暫不動工）
+
+目標：整圖一次 H2D 後，前處理、候選抽取、幾何／統計判定都留在 GPU，只下載最終缺陷清單（或 NG／overlay 必要像素）。目前 GPU mode 只涵蓋前處理 plan；resident ROI 後已無像素 H2D，但每個 ROI 仍下載 binary mask（401／203／503／505／506）或 Gray（202-CS-SN-1）給 CPU 做後續步驟。任何移轉都必須維持 PASS/NG、缺陷 bbox／area／confidence／metadata 與排序和 CPU 基準一致，並保留整顆 Detector CPU fallback。
+
+- [ ] 202-CS-SN-1 自動 CNR 主體 GPU 化：新增共用 typed operator 與 CUDA 實作，涵蓋 float 大核 Gaussian 背景（含 sigma 自動規則）、residual、MAD（與 NumPy median 完全相同的中位數）、`max(8, 3×sigma)` 門檻 mask、形態學、8-connectivity connected components（標籤順序與 `cv2.connectedComponentsWithStats` 的 stats 完全一致）、局部背景 ring CNR 統計，只下載候選統計。2026-09-14 產線配置（16384×13000、6 個 2000×12000 ROI）CPU Detector 約 4.9 s、端到端 5.85 s，GPU 目前只做 Gray 使端到端 6.06 s（略慢），收益最大。
+- [ ] 讀圖解碼 GPU 化評估：16384×13000 大圖 CPU 解碼約 0.8 s（占 GPU 模式端到端約 55%）；評估 JPEG 用 nvJPEG、BMP 直接上傳原始像素、PNG deflate 的 GPU 可行性，保留 Windows 中文路徑、EXIF 旋轉、像素上限與壞檔錯誤語意，並量測解碼後直接成為 resident image 的端到端收益。
+- [ ] Contour 類 Detector（401 系列、203-AS-SN-1、503／505／506）候選抽取 GPU 化評估：`findContours` 為順序追蹤、無與 OpenCV 等價的 GPU 實作，先前評估 connected components 在 pixel area、孔洞 contour 數與排序語意不等價；需決定是實作 OpenCV 等價的 GPU contour／幾何，或以 GPU 候選統計預篩再只下載候選小區域給 CPU，並以 PASS/NG、bbox、area、contour 順序等價測試把關。
+- [ ] Template Anchor Grid 定位 GPU 化評估（產線配置約 0.06～0.07 s，優先度低），需與 OpenCV `matchTemplate` 分數、定位座標完全一致。
+- [ ] 上述方向決定後更新 `AGENT.md` 的 CPU/GPU 契約（目前規定 contour／幾何、YAML、彙總、報表與磁碟 I/O 留在 CPU，除非 profiling 證明值得移轉），並同步 README 與 GPU 文件。
+
+### 202-CS-SN-1／203-AS-SN-1／503-CS-SN-1／506-CS-SN-1 RTX 驗收（2026-09-14 補列）
+
+目前只有實作紀錄與 v1.4.0／v1.5.1 發行時的合成圖 CPU/GPU 等價，缺正式 Recipe、真圖與產線配置效能證據。
+
+- [ ] 為四個 Detector 各指定正式 Recipe（或使用中的產線 Recipe），並各準備至少一張 PASS 與一張 NG 可追溯真圖，納入 production manifest；RTX 3090 比較 CPU／GPU 的 tiles、PASS/NG、defect count、bbox、area、confidence、metadata 與 fallback log。
+- [ ] 以產線配置（16384×13000、6 個 2000×12000 ROI）量測 CPU、strict CUDA、auto crossover 的 Detector 與端到端 warm median／P95、上傳與 D2H，確認結果一致並記錄是否值得啟用 GPU。
+- [ ] 以正式真圖重跑上一項，確認合成圖結論在產線影像上成立，再決定四個 Detector 的建議 `gpu.mode`。
+
 ## P5：CPU 與整體 Pipeline 最佳化
 
 - [x] 分別量測 `findContours`、幾何分析、Python tile/detector 迴圈、progress callback、aggregation 與 reporter。
 - [x] 降低 progress callback 頻率，避免每個小 primitive 更新 GUI。
 - [x] 移除不必要的 detector `image.copy()` 與完整尺寸 temporary masks；必要的 non-contiguous CUDA/QImage 邊界 copy 保留。
 - [x] 相同 tile 的 CPU detectors 共用一次 gray；GPU detectors 共用 resident source，避免各自重傳原圖。
-- [ ] RTX profiler 證明有收益後，再加入跨 detector 的 device-gray／完整 preprocessing result cache。
+- [ ] RTX profiler 證明有收益後，再加入跨 detector 的 device-gray／完整 preprocessing result cache。（2026-09-14 前提未成立、暫不實作：五份正式 Recipe 各只啟用 1 個 Detector，沒有同 tile 跨 Detector 重算；產線配置 profiler 的 GPU Gray 僅 0.8 ms／preprocessing 172 ms。出現多 Detector Recipe 時再量測）
 - [x] 對小圖、小 ROI、少 tiles 建立 CPU/GPU crossover benchmark；低於門檻自動選 CPU。（2026-09-14：`gpu.mode: auto` 允許 fallback 時啟用實測路由，`gpu.mode: cuda` 不啟用；RTX 3090 小 tile、正式 512² 與 16384×13000 六個 2000×12000 ROI 皆 CPU／strict CUDA／auto 結果一致）
 - [ ] Crossover 目前只比較單一前處理 plan，不含整圖 resident 上傳（16384×13000 約 0.08～0.1 s）；評估當所有 GPU Detector 的 plan 都選 CPU 或收益小於上傳成本時，整張圖略過 resident 上傳，並以正式真圖驗證。
 - [x] Overlay、NG tiles、CSV/JSON 與純檢測計時分離；目前各 reporter 與 `detectors_total` 已獨立計時，是否背景化由實測決定。
