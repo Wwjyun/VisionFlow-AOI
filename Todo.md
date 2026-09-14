@@ -281,6 +281,25 @@
 - 177 ms 與上列各階段相加之差（約 80 ms）落在 detector 內未被單獨計時的部分
   （MAD 的 abs 運算、inclusion mask、逐 component CNR 迴圈的重複切片等），需再細分才可歸因。
 
+**第二十二次嘗試（2026-09-14）：median 上傳成本與 pinned memory 可行性。**
+
+在 32 MB（4000×2000 float32）殘差上重測（`outputs_validation/cnr_profile/median_upload_cost.txt`）：
+`np.median` 74.5 ms、**GPU median 6.22 ms（min 5.10）＝ 11.97 倍**、結果 identical。
+因此 median 的絕對成本約 6 ms，其中多數為 32 MB 的 pageable H2D。
+
+想進一步降低上傳成本時發現：**本 DLL 沒有匯出 `cudaHostRegister` / `cudaHostUnregister`**，
+無法在 Python 端把既有 NumPy 陣列註冊為 pinned memory，故無法用 pinned H2D 縮短這次傳輸。
+未來若要做，需在 CUDA 端新增匯出（或改用 `cudaHostAlloc` + 專用上傳路徑），
+但依先前 P4 的評估結論，逐張 register/upload/unregister 對 OpenCV 新建陣列並無淨收益，
+因此**不建議為了 median 單獨加 pinned 路徑**。
+
+更有效的方向仍是「讓 residual 留在 device」：目前 `residual` 由 CPU 的 `cv2.GaussianBlur` 產生，
+所以 median 必須先上傳 32 MB、遮罩又要把結果下載或再上傳一次。
+若把 Gaussian 背景（float32、kernel 51）也搬到 device，residual 可直接在 device 產生並被 median 消費，
+同時省下 median 的 H2D 與 candidate mask 的來回；但該 kernel 需要在 device 端精確重現
+OpenCV 對 float32 的邊界處理（BORDER_DEFAULT＝reflect101）與 separable 卷積順序，
+必須先做逐像素等價驗證才可使用。
+
 **可平行推進、不依賴上述卡點的項目：**
 1. 202-CS-SN-1 其餘步驟（**不含 median，已於本輪完成**）：Gaussian 背景、遮罩、connected components
    標籤順序、component 幾何、ring CNR 統計的黃金參考與等價測試。
