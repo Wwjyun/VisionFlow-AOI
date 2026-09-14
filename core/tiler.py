@@ -714,12 +714,13 @@ class Tiler:
     def _find_grid_anchor_on_device(self, image, search_rect, template_gray):
         """Locate the anchor on the resident device image when the caller opts in.
 
-        The resident image is already on the device, so this step would add no pixel H2D, but the
-        current `vf_match_template_gray_u8` kernel is not usable yet: on the RTX 3090 it is 3-14x
-        slower than the CPU reference at every measured scale, and it only agreed with OpenCV on
-        3 of 7 synthetic scenes (score deltas up to 0.96). Until the kernel is rewritten with
-        shared-memory tiling and passes the equivalence matrix, the CPU reference stays in charge
-        and this path is only reachable with an explicit opt-in.
+        The resident image is already on the device, so this step adds no pixel H2D. Measured on the
+        RTX 3090 the device path matches OpenCV's location on 9/9 scenes with a score delta of at
+        most 4.2e-7 and is deterministic across runs; it is faster than the CPU reference by 1.6x to
+        3.9x while the template is small (see `gpu_anchor_shapes_supported`), and slower for tiny
+        searches and templates of 200 px and above. Outside that bound, when no resident image or
+        export exists, or when the device call fails, `None` is returned so the caller uses the CPU
+        reference, which remains the correctness baseline.
         """
         if not self.gpu_anchor_enabled:
             return None

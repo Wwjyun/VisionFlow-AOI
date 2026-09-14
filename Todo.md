@@ -186,6 +186,39 @@
 - [x] Overlay、NG tile／sidecar、debug 與 GUI 預覽所需的 CPU 像素按需取得；（2026-09-14 RTX 3090 以合成 16384×13000、6 個 2000×12000 ROI 開啟全部輸出與 debug images 驗證：CPU／strict CUDA 各 22 個輸出檔，PNG 逐像素、JSON／sidecar 與 CSV 除耗時／後端／路徑外完全相同；resident tile 仍為 CPU 原圖零複製 view，只有 debug 開啟時才複製中間影像，GUI 預覽維持獨立 CPU 讀圖）401 等目前仍需 CPU `findContours`／幾何判定的 Detector 只下載必要的 binary mask，檢查 PASS/NG、tile 順序／座標、defect bbox／area／confidence／metadata、輸出內容與 CPU 基準等價。
 - [ ] 用同一批真實 16384×13000 圖、約六個 2300×12000 ROI 及正式 Recipe／輸出設定，在 RTX 3090 比較修改前後 cold、warm median／P95、image load、整圖 H2D、tile 建立、Detector、D2D／必要 D2H、Reporter、端到端耗時、RAM／VRAM 峰值與 100 次穩定性；未證明整體收益與完整等價前保持 production 預設不變。2026-09-14 合成尺寸基準：BGR 原圖約 609.4 MiB，六張 CPU tile 副本約 473.8 MiB，CPU 裁切 warm median 128.6 ms，整圖 H2D 85.0 ms，ROI descriptor 建立約 0.03 ms；預期省的是 CPU 副本及其約 129 ms 複製，不包含既有 H2D，端到端百分比須以目前每張總耗時為分母實測。
 
+#### 目前卡點與可平行推進的項目（2026-09-14 使用者指示：卡住的寫清楚，先往下做別的）
+
+已完成並預設啟用的步驟：
+- 整圖一次 H2D、之後不再上傳像素（resident image／device ROI），以及 crossover 實測 CPU 較快時連上傳都省略。
+- Template Anchor Grid 定位：device 端與 OpenCV `matchTemplate` 座標 9/9 相同、分數差 ≤ 4.2e-7、逐次執行決定性；
+  形狀界線內比 CPU 快 1.6～3.9 倍（界線外與失敗時回 CPU 參考）。`execution.gpu.device_host_split` 如實回報。
+
+**卡點 1：contour 追蹤已等價但慢 95～107 倍，無法啟用。**
+- 現況：`vf_find_contours_u8` 與 `cv2.findContours` 在 `tools/check_contour_equivalence.py` 的 102 個案例
+  （12 種遮罩 × 2 模式 × 多組 ROI，含 2000×12000）**全部逐點 identical 且決定性**；但 2000×12000 上
+  operator 約 1300～1334 ms，對比 cv2 的 12.1～13.5 ms，且 kernel 佔 1296～1330 ms、h2d 0 ms，
+  證明瓶頸是**單一 thread 的序列掃描＋追蹤**。
+- 為什麼不能直接把影像切 row band 平行掃描：`contour_scan_kernel` 的掃描決策相依於前一條輪廓寫入的標記
+  （`prev < 1` 與 `image[lnbd] > 0` 兩處直接讀標記），OpenCV 的 `nbd` 遞增與 RETR_EXTERNAL 左鄰檢查同樣序列相依；
+  切 band 會產生與 cv2 不同的輪廓集合。
+- 可行方向（未實作）：外邊界起點判定「只看 0→非 0 轉換、與標記無關」，可平行找；孔洞起點與 RETR_EXTERNAL 判定
+  才相依標記。因此可先平行找出外邊界起點，再序列處理孔洞與追蹤，最後依 raster 順序輸出（反序）以維持 OpenCV 順序。
+  預期可平行化但成本未知，須先以現有 102 案例 gate 把關。
+- 因為慢 95 倍，**不得啟用**；`candidate_extraction` 仍回報 cpu。
+
+**卡點 2：median 精確中位數尚未有可用的 CUDA 實作。**
+- 已完成：`np.median`（float32）語意確認；縮減式演算法在 NumPy 逐位正確；量測確認 median＋MAD 佔
+  CNR detector 約 75%（68.7 ms＋159.7 ms vs 全 detector 305.2 ms）。
+- 失敗並已回退：直方圖縮減版 CUDA 實作（device 端錯誤，誤差 1.7e-1～2.1e-1，且比 CPU 慢）。
+- 進行中：由單一 subagent 以 cub radix sort 實作（float32→單調 uint32 key、整數排序、只回讀中間 1～2 個 key、
+  host 端 float32 取平均），需要 `/Zc:preprocessor` 旗標且須重跑既有全部 GPU 證據。
+- 此卡點**不阻擋** CNR 其他步驟（Gaussian 背景、遮罩、幾何、ring CNR 統計）以 CPU 參考先建立黃金標準並驗證。
+
+**可平行推進、不依賴上述卡點的項目：**
+1. 202-CS-SN-1 其餘步驟的黃金參考與等價測試（connected components 標籤順序、component 幾何、ring CNR 統計）。
+2. 401 系列的幾何路徑等價測試（已量測：幾何僅約 9 µs/輪廓，稀疏時佔 11%，現階段不值得 GPU 化，但需等價測試把關既有行為）。
+3. README 與 `gpu/README.md` 的如實描述更新（`README.md` 已描述 anchor 界線；`gpu/README.md` 尚待補）。
+
 ### 全流程 GPU 化（2026-09-14 使用者需求，先列待辦、暫不動工）
 
 目標：整圖一次 H2D 後，前處理、候選抽取、幾何／統計判定都留在 GPU，只下載最終缺陷清單（或 NG／overlay 必要像素）。目前 GPU mode 只涵蓋前處理 plan；resident ROI 後已無像素 H2D，但每個 ROI 仍下載 binary mask（401／203／503／505／506）或 Gray（202-CS-SN-1）給 CPU 做後續步驟。任何移轉都必須維持 PASS/NG、缺陷 bbox／area／confidence／metadata 與排序和 CPU 基準一致，並保留整顆 Detector CPU fallback。
