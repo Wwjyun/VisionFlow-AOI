@@ -343,6 +343,28 @@ float32 累加、OpenCV 的 kernel 係數）與 `vf_gaussian_blur_f32_roi`，並
 （1）浮點背景的等價測試（記錄容差與最大差），（2）202 端到端 PASS/NG 與缺陷欄位等價矩陣，
 （3）啟用後量測是否真的省下 median 的 H2D 與遮罩來回。
 
+**第二十四次嘗試（2026-09-14）：connected components 參考實作（202 候選抽取的另一個前置）。**
+
+202 的 `_collect_candidates` 以 `cv2.connectedComponentsWithStats` 取得標籤，**依標籤順序**走訪候選，
+因此最終缺陷清單的順序取決於標籤編號；GPU 化必須連標籤順序一起等價，不能只得到相同的 component 集合。
+新增 `tools/connected_components_reference.py`（union-find＋OpenCV 的 label-0 語意）與
+`tests/test_connected_components_reference.py`（5 tests，全套由 394 → 399 tests OK）。
+
+已驗證（結構化遮罩、4 與 8 連通，逐項比對 label map、標籤順序、stats、centroids）：
+全零、全滿、單像素、實心矩形、兩個矩形、對角線（4 連通下為 10 個 component）、對角相鄰、
+環形孔洞、貼邊、morphology 後的雜訊遮罩 —— **全部與 OpenCV 相同**。
+另確認並實作 OpenCV 的兩個容易漏掉的語意：
+（1）**label 0 的 stats 描述的是背景像素**（例如 50×40 影像中 16×10 白色矩形 → `[0,0,50,40,1840]`）；
+（2）**某標籤若無像素，stats 為 sentinel `[-1, INT_MAX, 0, 0, 0]`、centroid 為 NaN**（全前景時 label 0 即如此）。
+
+**已知限制（尚未解決）**：**隨機遮罩**上 component 數量與像素集合正確，但**標籤編號順序不同**
+（例：96 個 component 數量相同，但 cv2 把 `(19,0)` 編為 5、參考實作編為 4）。
+目前推測是 provisional label 的指派／合併後重編號規則尚未完全一致；此缺口已由專門的測試
+（`test_random_masks_agree_on_component_count_but_not_yet_on_label_order`）釘住，
+**不影響既有產線**（202 仍使用 OpenCV），但**在修正前不得以本參考實作作為 GPU 化的黃金標準**。
+下一步：對照 OpenCV `connectedComponents_subset`／`icvLabelBlobs` 的 provisional 指派與
+`icvSortAndCompressLabels`（或等價的 labels 重編號）逐行修正，再擴大隨機遮罩矩陣。
+
 **可平行推進、不依賴上述卡點的項目：**
 1. 202-CS-SN-1 其餘步驟（**不含 median，已於本輪完成**）：Gaussian 背景、遮罩、connected components
    標籤順序、component 幾何、ring CNR 統計的黃金參考與等價測試。
