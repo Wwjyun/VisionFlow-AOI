@@ -256,7 +256,7 @@
 - [x] 新增 `core/result_types.py` TypedDict 結果契約與 runtime contract test。
 - [x] 新增 Windows Unicode 路徑安全的 P9 regression tests，固定 serial/parallel 結果等價、cache invalidation、batch/GC policy、輸出參數、overlay decode/downscale 與 debug payload 隔離。
 - [ ] 使用固定 production 資料集量測 worker 上限、GC interval、PNG compression、NG write workers 的 median/P95、peak RSS 與檔案大小，再決定量產建議值。
-- [ ] 在 RTX 3090 驗證 `AOI_TILE_WORKERS>1` 不會使 GPU detector/resident image 進入平行路徑，且 GPU queue/VRAM 無競爭或累積。
+- [x] 在 RTX 3090 驗證 `AOI_TILE_WORKERS>1` 不會使 GPU detector/resident image 進入平行路徑，且 GPU queue/VRAM 無競爭或累積。（2026-09-14 完成，見完成紀錄）
 
 ## P10：OOP 責任邊界重構
 
@@ -415,6 +415,8 @@
 - [ ] 加速不得犧牲 GUI 回應、打包啟動、結果追溯、錯誤訊息或 CPU fallback。
 
 ## 完成紀錄
+
+- [x] 2026-09-14：在 RTX 3090 驗證 tile 平行不會進入 GPU 路徑。設定 `AOI_TILE_WORKERS=8`，以正式 401-AS-SN-1 參數、2048×2048 合成圖（grid 512²＋overlap 64，每張 25 tiles）並監看 `BaseDetector.run` 的執行緒與同時執行數、`_inspect_tiles_parallel` 呼叫：CPU Recipe 走平行路徑（2 張圖 2 次、同時最多 8 個 Detector、16 個執行緒），`gpu.mode: auto` 與 strict `cuda` 的 resident ROI Recipe 皆 0 次平行呼叫、同時最多 1 個、單一執行緒，兩張圖結果（NG 32／42 defects）與 CPU 相同。另以 `BatchInspectionProcessor(max_workers=4)` 處理 8 張圖共用 throughput session，auto／cuda 皆 0 次 tile 平行、同時最多 1 個 Detector，8 張 NG、296 defects 一致，`nvidia-smi` 顯示 batch 前後 VRAM 1,552→1,508 與 1,508→1,507 MiB，無累積。未修改 runtime、CUDA source／ABI／DLL。
 
 - [x] 2026-09-14：完成大圖 GPU resident ROI 路徑的輸出等價驗收。以合成 16384×13000 BMP、正式 401-AS-SN-1 參數、Template Anchor Grid 6 個 2000×12000 ROI，開啟 overlay、NG tiles、CSV、矩陣 CSV、JSON 與 `save_debug_images`，分別以 `gpu.mode: cpu` 與 strict `gpu.mode: cuda`（backend `cuda_dll`、resident ROI）執行。兩者皆 NG、6 tiles、6 NG tiles、597 defects，各產生 22 個檔案且相對路徑（去除時間戳記）一致：13 張 PNG（overlay、NG tile、debug 階段影像）解碼後逐像素相同，7 份 JSON（檢測結果與 NG tile sidecar）與 2 份 CSV 在排除耗時、執行後端與輸出路徑後完全相同。Detector 仍只下載必要 binary mask，tile 影像維持 CPU 原圖零複製 view，debug 影像只在開啟時複製；未修改 runtime、CUDA source／ABI／DLL。真圖端到端收益仍依下一項。
 
