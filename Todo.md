@@ -168,7 +168,7 @@
 ### Phase2 GPU 加速簡報第 14 頁工作包對照（2026-09-14）
 
 - A（ROI batch 進 plan）：上方已有 `execute_plan_roi_batch` optional ABI 待辦；現有 ROI batch API 只負責 ROI 資料配置／下載，不等於整批 plan 一次提交、一次同步。
-- [ ] B（CUDA Graphs）：先以 profiler 確認 kernel launch／host 提交確實是瓶頸，再針對固定 shape、plan、ROI 批次與 context 的重複執行建立 capture／replay 原型；測 graph 建立與重建成本、參數／尺寸變更、context 釋放、錯誤後整顆 Detector fallback，並以相同資料交錯比較 warm median／P95 與端到端收益。未量得收益不加入正式路徑。
+- [x] B（CUDA Graphs）：（2026-09-14 前提不成立、不建立原型：產線配置 6 個 2000×12000 ROI 的 warm preprocessing host 時間 172.4 ms，CUDA event 各階段合計 167.4 ms，168 次 kernel launch 與 6 次 plan 呼叫的 host 開銷約 5 ms，占 Detector 330 ms 約 1.5%；CUDA 13.3 雖提供 `cudaStreamBeginCaptureToGraph`／`cudaGraphLaunch`，可省上限不足以抵銷 capture／重建與失效管理複雜度。真圖若 launch 占比明顯不同再重評）先以 profiler 確認 kernel launch／host 提交確實是瓶頸，再針對固定 shape、plan、ROI 批次與 context 的重複執行建立 capture／replay 原型；測 graph 建立與重建成本、參數／尺寸變更、context 釋放、錯誤後整顆 Detector fallback，並以相同資料交錯比較 warm median／P95 與端到端收益。未量得收益不加入正式路徑。
 - C（可分離形態學）：上方已有 5×5 open、iterations=10 的基準、等價與實機收益待辦。
 - D（pinned memory＋stream 重疊）：上方已有評估待辦；須以多張圖片的批次／監控流程量測 H2D、kernel、必要 D2H 的實際重疊、host RAM／VRAM 峰值與端到端吞吐，單張圖片的序列時間不能直接當成可重疊收益。
 - [ ] E（向量化／`__restrict__`／`__ldg`）：以 profiler 選出受記憶體存取限制的 kernel，再分別試向量化載入／儲存及適用的編譯器讀取提示；確認對齊、stride、1／3 channel、ROI 邊界與 OpenCV 輸出語意，逐項測 kernel、Detector 和端到端收益。`__restrict__`／`__ldg` 不預設有效，沒有可重現收益即不採用。
