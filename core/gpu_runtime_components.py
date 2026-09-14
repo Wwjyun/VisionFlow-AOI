@@ -111,6 +111,11 @@ class GpuCapabilities:
             and self.has_exports(("vf_find_contours_u8", "vf_find_contours_download"))
         )
 
+    @property
+    def exact_median(self) -> bool:
+        """Optional bit-exact float32 median over host values (never reads the resident image)."""
+        return self.has_exports(("vf_median_f32",))
+
 
 @dataclass(slots=True)
 class GpuResourceRegistry:

@@ -139,6 +139,11 @@ $cudart = [string](Get-OptionalProperty -Object $nvccConfig -Name "cudart" -Defa
 $testOptimization = [string](Get-OptionalProperty -Object $nvccConfig -Name "test_optimization" -DefaultValue "-O2")
 # Exact OpenCV float semantics (for example INTER_AREA accumulation) require no fused multiply-add.
 $fmad = if ([bool](Get-OptionalProperty -Object $nvccConfig -Name "fmad" -DefaultValue $true)) { "true" } else { "false" }
+# Extra cl.exe switches for both the DLL and the native smoke target. CUB/CCCL refuses to compile
+# under the traditional MSVC preprocessor, so /Zc:preprocessor is the declared default and a normal
+# rebuild reproduces the same DLL without an ad-hoc command line.
+$msvcFlags = @(Get-OptionalProperty -Object $nvccConfig -Name "msvc_flags" -DefaultValue @("/Zc:preprocessor"))
+$compilerFlags = (@("/MD", "/utf-8") + ($msvcFlags | ForEach-Object { [string]$_ })) -join ","
 
 $dllArguments = @(
     "--std=c++17",
@@ -147,7 +152,7 @@ $dllArguments = @(
     "--cudart=$cudart",
     "--fmad=$fmad",
     "-arch=$Architecture",
-    "-Xcompiler=/MD,/utf-8",
+    "-Xcompiler=$compilerFlags",
     "-Xlinker", "/IMPLIB:$importLibraryPath"
 )
 foreach ($includeDir in $resolvedIncludeDirs) {
@@ -190,7 +195,7 @@ foreach ($target in $testTargets) {
         "--cudart=$cudart",
         "--fmad=$fmad",
         "-arch=$Architecture",
-        "-Xcompiler=/MD,/utf-8"
+        "-Xcompiler=$compilerFlags"
     )
     foreach ($includeDir in $resolvedIncludeDirs) {
         $testArguments += "-I$includeDir"

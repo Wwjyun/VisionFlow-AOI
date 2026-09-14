@@ -190,6 +190,10 @@ class GpuRuntime:
     def supports_find_contours(self) -> bool:
         return self._capabilities.find_contours
 
+    @property
+    def supports_exact_median(self) -> bool:
+        return self._capabilities.exact_median
+
     def status(self, requested: bool = False) -> dict:
         active = bool(requested and self.available and not self.last_error)
         return {
@@ -209,6 +213,7 @@ class GpuRuntime:
                 "fused_401_2": self.supports_fused_401_2,
                 "template_match": self.supports_template_match,
                 "find_contours": self.supports_find_contours,
+                "exact_median": self.supports_exact_median,
             },
             "queue": {
                 "depth": self.queue_depth,
@@ -518,6 +523,49 @@ class GpuRuntime:
         if code not in (CUDA_CONTOURS_EXTERNAL, CUDA_CONTOURS_LIST):
             raise GpuRuntimeError(f"Contour mode must be 0 (external) or 1 (list), got {mode!r}")
         return code
+
+    def median_f32(self, values: np.ndarray) -> np.float32:
+        """Return the bit-exact ``np.median`` of a float32 array.
+
+        Every value is uploaded once, mapped to a monotone-orderable order key, radix-sorted on the
+        device, and only the one or two middle keys are copied back; the even-count average is a
+        float32 add and a float32 divide by two on the host, which is what ``np.median`` computes.
+        The operand is only read, never written, and the result is deterministic.
+
+        ``values`` must already be float32 so the caller, not this bridge, decides any narrowing.
+        An unsupported DLL raises ``GpuRuntimeError`` so the caller can restart on the CPU
+        reference instead of receiving an approximate median. A NaN anywhere in ``values`` returns
+        NaN, mirroring NumPy; compare that case with a NaN-aware test because ``NaN != NaN``.
+        """
+        if not self.supports_exact_median:
+            raise GpuRuntimeError("CUDA DLL has no exact median export (vf_median_f32)")
+        array = np.asarray(values)
+        if array.dtype != np.float32:
+            raise GpuRuntimeError(
+                f"vf_median_f32 requires float32 input, got {array.dtype}; "
+                "convert explicitly so the narrowing is the caller's decision"
+            )
+        source = np.ascontiguousarray(array).reshape(-1)
+        if source.size == 0:
+            raise GpuRuntimeError("vf_median_f32 requires at least one value")
+        median_value = ctypes.c_float(0.0)
+        queued = time.perf_counter()
+        with self._queue_slots, self._lock:
+            lock_acquired = time.perf_counter()
+            result = int(self._dll.vf_median_f32(
+                self._context,
+                source.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+                ctypes.c_longlong(int(source.size)),
+                ctypes.byref(median_value),
+            ))
+            completed = time.perf_counter()
+            self._record_performance(
+                "vf_median_f32", int(source.nbytes), int(ctypes.sizeof(ctypes.c_float)),
+                completed - lock_acquired, lock_acquired - queued,
+            )
+        if result != 0:
+            raise self._native_error("vf_median_f32", result)
+        return np.float32(median_value.value)
 
     def match_template_debug_key(self) -> int:
         """Return the raw packed winning key of the last localization call (diagnostics only)."""
@@ -934,6 +982,7 @@ class GpuRuntime:
         self._load_optional_roi_batch()
         self._load_optional_template_match()
         self._load_optional_find_contours()
+        self._load_optional_exact_median()
 
     def _load_optional_native_plan(self) -> None:
         query = getattr(self._dll, "vf_plan_query", None)
@@ -1069,6 +1118,17 @@ class GpuRuntime:
                 ctypes.POINTER(ctypes.c_int32), ctypes.c_int,
             ]
             download.restype = ctypes.c_int
+
+    def _load_optional_exact_median(self) -> None:
+        median = getattr(self._dll, "vf_median_f32", None)
+        if median is None:
+            return
+        median.argtypes = [
+            ctypes.c_void_p,
+            ctypes.POINTER(ctypes.c_float), ctypes.c_longlong,
+            ctypes.POINTER(ctypes.c_float),
+        ]
+        median.restype = ctypes.c_int
 
     @staticmethod
     def _native_plan_descriptor(plan, image: np.ndarray) -> tuple[_VfPlanDescV1, object]:

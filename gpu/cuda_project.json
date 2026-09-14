@@ -20,6 +20,9 @@
     "dll_optimization": "-O3",
     "test_optimization": "-O2",
     "cudart": "static",
-    "fmad": false
+    "fmad": false,
+    "msvc_flags": [
+      "/Zc:preprocessor"
+    ]
   }
 }
