@@ -41,12 +41,15 @@ ROOT = Path(__file__).resolve().parent.parent
 
 CANVAS = (4000, 6000)  # (width, height) = 2 ROI widths x 3 ROI heights
 ROI = (2000, 2000)  # (height, width)
-# Production geometry recorded in Todo.md: six 2000x12000 ROIs, which is the shape the
-# CPU detector was measured at ~4.9 s.  It needs a 6000x24000 canvas (432 MB as BGR),
-# so it is opt-in via ``--profile production`` while the quick 2000x2000 geometry is the
-# default.
-PRODUCTION_CANVAS = (6000, 24000)
-PRODUCTION_ROI = (12000, 2000)
+# Production geometry recorded in Todo.md: six 2000x12000 ROIs (height x width), which
+# is the shape the CPU detector was measured at ~4.9 s.  Two columns of width 12000 and
+# three rows of height 2000 need a 24000x6000 canvas, i.e. 432 MB as BGR, so it is
+# opt-in via ``--profile production`` while the quick 2000x2000 geometry is the default.
+# Note the shape matters: 2000x12000 and 12000x2000 have the same pixel count but very
+# different cache behaviour for a 51-pixel separable filter, so the orientation is part
+# of the measurement rather than an implementation detail.
+PRODUCTION_CANVAS = (24000, 6000)
+PRODUCTION_ROI = (2000, 12000)
 
 
 def _roi_origins(roi: tuple[int, int], columns: int, rows: int):
@@ -60,7 +63,7 @@ def _roi_origins(roi: tuple[int, int], columns: int, rows: int):
 # so the tool validates the *pipeline* path and the CPU/CUDA agreement at production-like
 # sizes.
 ROI_ORIGINS = _roi_origins(ROI, columns=2, rows=3)
-PRODUCTION_ROI_ORIGINS = _roi_origins(PRODUCTION_ROI, columns=3, rows=2)
+PRODUCTION_ROI_ORIGINS = _roi_origins(PRODUCTION_ROI, columns=2, rows=3)
 
 DETECTOR_ID = "202-CS-SN-1"
 DETECTOR_PARAMS = {
