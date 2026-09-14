@@ -86,8 +86,27 @@ class ConnectedComponentsReferenceTests(unittest.TestCase):
                 with self.subTest(label=label, connectivity=connectivity):
                     self._assert_matches(mask, connectivity)
 
+    def test_random_masks_match_exactly_for_four_connectivity(self):
+        """4-connectivity is fully equivalent, including the label numbering.
+
+        OpenCV's ``flattenL`` numbers a component by the rank of its smallest
+        provisional label, and its 4-connectivity scan creates provisional labels
+        in raster order, which is exactly what this reference reproduces.
+        """
+        for label, mask in cases():
+            if not label.startswith("random_seed"):
+                continue
+            with self.subTest(label=label):
+                self._assert_matches(mask, 4)
+
     def test_random_masks_agree_on_component_count_but_not_yet_on_label_order(self):
-        """Documents the known gap: count and pixel set agree, label numbering does not."""
+        """Documents the remaining 8-connectivity gap.
+
+        OpenCV labels 8-connectivity with the Bolelli 2x2 block scan, so
+        provisional labels are created per block corner rather than per pixel and
+        the numbering differs even though the component count, the pixel sets and
+        the per-component stats all agree.
+        """
         for label, mask in cases():
             if not label.startswith("random_seed"):
                 continue
@@ -97,6 +116,13 @@ class ConnectedComponentsReferenceTests(unittest.TestCase):
             count, labels, stats, _ = connected_components_with_stats(mask, 8)
             self.assertEqual(count, count_ref, label)
             self.assertEqual(stats[1:, 4].sum(), stats_ref[1:, 4].sum(), label)
+            # Same components, different numbering: the multiset of component
+            # bounding boxes must still agree.
+            self.assertEqual(
+                sorted(map(tuple, stats[1:, :4])),
+                sorted(map(tuple, stats_ref[1:, :4])),
+                label,
+            )
             self.assertFalse(np.array_equal(labels, labels_ref), label)
 
     def test_is_deterministic_and_does_not_mutate_the_input(self):

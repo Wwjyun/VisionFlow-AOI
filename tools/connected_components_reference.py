@@ -1,9 +1,15 @@
 """OpenCV reference implementation of connected components with stats.
 
-Verified equivalent to `cv2.connectedComponentsWithStats` for both 4- and 8-connectivity: the label
-map, the label numbering and order, the per-label stats and the centroids all match. This matters
-because the 202-CS-SN-1 detector walks components in label order, so its candidate ordering - and
-therefore its defect list - depends on that order.
+``connectivity=4`` is **fully equivalent** to ``cv2.connectedComponentsWithStats``: the label map,
+the label numbering, the per-label stats and the centroids all match, including on random masks.
+
+``connectivity=8`` is equivalent in the component count, the pixel sets and the per-component
+stats, but **not in the label numbering**: OpenCV labels 8-connectivity with the Bolelli 2x2 block
+scan, which creates provisional labels per block corner instead of per pixel.  Until that scan is
+reproduced, this reference must not be used as the golden standard for an 8-connectivity
+replacement.
+
+The numbering rule itself is reproduced faithfully and documented in ``_numbering`` below.
 
 Only the two connectivities and the 8-bit single-channel input the detectors use are covered.
 """
@@ -68,20 +74,29 @@ def connected_components_with_stats(mask: np.ndarray, connectivity: int = 8):
                     root = union(root, other)
                 labels[y, x] = find(root)
 
-    # OpenCV numbers components in the order their provisional label first appears in the raster
-    # scan, so replay that order over the discovery list and map every root to its position.
-    ordered_roots: list[int] = []
-    for provisional in appearance:
-        root = find(provisional)
-        if root not in ordered_roots:
-            ordered_roots.append(root)
+    # OpenCV's ``flattenL`` walks the union-find array ``P`` in ascending *label index*
+    # order and hands out consecutive numbers to the roots it meets:
+    #
+    #     k = 1
+    #     for i in 1..lunique-1:
+    #         if P[i] < i: P[i] = P[P[i]]   # non-root: adopt the root's number
+    #         else:        P[i] = k; k += 1 # root: take the next number
+    #
+    # ``set_union`` always keeps the smaller provisional label as the root, so a
+    # component's root is the smallest provisional label it ever received.  The final
+    # number of a component is therefore the rank of that smallest provisional label
+    # among all components - *not* the order in which the component first appeared in
+    # the raster scan.  The two orders coincide only when no merge ever lowers a
+    # component's root, which is why structured masks agreed and random masks did not.
+    roots = sorted({find(provisional) for provisional in appearance})
+    rank_of_root = {root: index + 1 for index, root in enumerate(roots)}
     canonical = np.zeros_like(labels)
     for y in range(height):
         for x in range(width):
             if labels[y, x]:
-                canonical[y, x] = ordered_roots.index(find(labels[y, x])) + 1
+                canonical[y, x] = rank_of_root[find(labels[y, x])]
 
-    count = len(ordered_roots) + 1
+    count = len(roots) + 1
     stats = np.zeros((count, 5), dtype=np.int32)
     centroids = np.zeros((count, 2), dtype=np.float64)
     for label in range(count):

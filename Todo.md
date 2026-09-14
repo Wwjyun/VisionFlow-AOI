@@ -357,23 +357,36 @@ float32 累加、OpenCV 的 kernel 係數）與 `vf_gaussian_blur_f32_roi`，並
 （1）**label 0 的 stats 描述的是背景像素**（例如 50×40 影像中 16×10 白色矩形 → `[0,0,50,40,1840]`）；
 （2）**某標籤若無像素，stats 為 sentinel `[-1, INT_MAX, 0, 0, 0]`、centroid 為 NaN**（全前景時 label 0 即如此）。
 
-**已知限制（尚未解決，已縮小範圍）**：**隨機遮罩**上 component 數量與像素集合正確，但**標籤編號順序不同**
-（例：96 個 component 數量相同，但 cv2 把 `(19,0)` 編為 5、參考實作編為 4）。
-目前推測是 provisional label 的指派／合併後重編號規則尚未完全一致；此缺口已由專門的測試
+**已知限制（尚未解決，已縮小到單一具體原因）**：**隨機遮罩**上 component 數量與像素集合正確，但
+**8 連通的標籤編號順序不同**（例：96 個 component 數量相同，但 cv2 把 `(19,0)` 編為 5、參考實作編為 4）。
+**4 連通已完全正確**（4 個隨機遮罩全部 count／label map／stats／centroids 相同）。此缺口已由專門的測試
 （`test_random_masks_agree_on_component_count_but_not_yet_on_label_order`）釘住，
 **不影響既有產線**（202 仍使用 OpenCV），但**在修正前不得以本參考實作作為 GPU 化的黃金標準**。
+
+已確認的編號規則（由 OpenCV 原始碼 `modules/imgproc/src/connectedcomponents.cpp` 確認，非推測）：
+- 最終編號由 `flattenL`／`flattenLParallel` 決定：**依 `P` 的索引（provisional 標籤）升冪掃描，
+  遇到 root 就配下一個連續編號**；`set_union` 永遠保留**較小的 provisional 標籤**當 root。
+  因此某個 component 的最終編號＝**它所收過的最小 provisional 標籤在所有 component 中的名次**，
+  **不是**它在光柵掃描中首次出現的順序。兩者只在「從未發生過降低 root 的合併」時才一致。
+- 這解釋了先前的全部現象：結構化遮罩（無合併或合併不降低 root）完全相符，隨機遮罩則大量不符。
+  依此規則改寫參考實作後，**4 連通的所有隨機遮罩案例全部通過**。
+- **8 連通仍不符的原因已定位**：OpenCV 的 8 連通預設走 Bolelli 的 **2×2 區塊式 Spaghetti 掃描**
+  （`LabelingBolelliParallel`／`LabelingBolelli`），而不是逐像素 Rosenfeld 掃描；provisional 標籤在
+  「每個 2×2 區塊的左上像素」建立，且平行分條時起始標籤由
+  `stripeFirstLabel8Connectivity(y, w) = ((y)/2) * ((w+1)/2) + 1` 決定。4 連通另有
+  `LabelingBolelli4C`（逐像素、但以 2 欄為一組跳躍），與 8 連通的建立順序不同，這正是 4 連通正確、
+  8 連通不正確的原因。
+
 已排除的假設（實證，非推測）：
 - **不是「首像素的 raster 掃描順序」**：以此規則檢查隨機遮罩，96 個 component 中有 **63 個不符**
   （例：cv2 label 4 的首像素是 (16,1)，但掃描順序上它應為 8；cv2 label 5 的首像素 (19,0) 應為 4）。
-  第二個隨機遮罩（69 個 component）有 49 個不符。結構化案例（實心矩形、合併的 L 形等）在此規則下 0 個不符，
-  所以此規則只在「無合併」的情境成立。
-- **不是「union-find root 升冪」**：先前已試過，同樣不符。
-- 因此編號取決於 OpenCV provisional label 的**建立與合併後重編號**細節
-  （`icvLabelBlobs` 的 `lbl` 配置與 `icvSortAndCompressLabels` 的重排），需逐行對照原始碼才能確定。
+  第二個隨機遮罩（69 個 component）有 49 個不符。
 
-後續處理建議（以此為界，不要再盲目試規則）：
-1. 直接對照 OpenCV `connectedComponents_subset` 的兩段式實作逐行移植，特別是合併時標籤的處理順序。
-2. 或以「小型合成遮罩逐一枚舉」的方式反推：對每個會產生合併的 3×3／4×4 圖樣比較 cv2 標籤，建立規則表後再推廣。
+後續處理建議（剩餘工作已收斂為單一路徑）：
+1. **只差 8 連通**：把 8 連通改為 Bolelli 2×2 區塊掃描（`LabelingBolelli`）的單條紋版本，
+   以「區塊左上像素建立 provisional 標籤」的順序產生 `P`，再套用已確認的 `flattenL` 編號規則。
+   平行分條的起始標籤公式已知，但單條紋（單一執行緒）即足以作為黃金標準。
+2. 修正後必須把隨機遮罩矩陣（4／8 連通）全部轉為嚴格相等斷言，才可作為 GPU 化的黃金標準。
 3. 在修正並通過全部隨機遮罩矩陣之前，**不得**以本參考實作作為 connected components GPU 化的黃金標準；
    202 目前仍使用 OpenCV，產線不受影響。
 
@@ -651,6 +664,8 @@ float32 累加、OpenCV 的 kernel 係數）與 `vf_gaussian_blur_f32_roi`，並
 - [ ] 加速不得犧牲 GUI 回應、打包啟動、結果追溯、錯誤訊息或 CPU fallback。
 
 ## 完成紀錄
+
+- [x] 2026-09-15：在**產線 ROI 尺寸**上實測已接線的 GPU median，並把 202 遮罩階段的成本完整歸因，決定下一個 GPU 目標。新增 `tools/benchmark_median_202.py`（真 Detector、真 Gaussian 背景、真遮罩鏈）：2000×4000 CPU 295.3 → 164.1 ms（**1.80×**）、2000×12000 CPU 907.9 → 504.9 ms（**1.80×**），兩者的缺陷清單（bbox、area、confidence、cnr、contrast、background_area）**逐欄完全相同**；先前的 1.62× 是合成 ROI 量到的，此為產線形狀的複驗。新增 `tools/profile_202_mask_stage.py`（以 wrapper 計數 runtime 呼叫以證明走的是 device 路徑，非推測）：2000×12000 遮罩階段 CPU 833.4 → GPU median 380.7 ms，逐項為 gray 25.1／23.5、Gaussian+residual 57.0／59.0、**median(residual) 211.2／15.6（13.6×）**、**median(MAD) 309.8／70.6（4.4×）**、threshold+mask 95.7／94.0、morphology+inclusion 39.4／32.9、connected components 27.7／25.4、ring CNR 67.5／59.7；runtime median 呼叫數 CPU 0 次、GPU **12 次（2,880 萬×2 值）**，證明兩次 median 都真的在 device 上。**下一個目標由量測決定**：remaining 瓶頸是 `threshold_and_mask`（94 ms）與 Gaussian+residual（59 ms）的**反覆全圖 elementwise 運算**，兩者合計 153 ms；把 residual 留在 device 上一次完成 median、絕對值、門檻與遮罩，預期可再省下約 150 ms（1.80× → 約 2.8×），`vf_gaussian_blur_f32` 是此前置條件。另把 connected components 的編號缺口收斂到單一原因（見 Todo「全流程 GPU 化」）：已由 OpenCV 原始碼確認最終編號為 `flattenL` 依 provisional 標籤索引升冪配號、`set_union` 保留較小標籤，據此改寫參考實作後 **4 連通全部隨機遮罩通過**；8 連通仍不符的原因是 OpenCV 走 Bolelli 的 2×2 區塊掃描（`LabelingBolelli`），剩餘工作已收斂為單一路徑。證據：`outputs_validation/cnr_profile/median_202_production_shapes.json`、`outputs_validation/cnr_profile/mask_stage_split.json`。未修改任何產線程式、CUDA source／ABI 或 DLL（量測使用既有 DLL）。
 
 - [x] 2026-09-15：釘住 202-CS-SN-1 ring CNR 的**順序契約與精度契約**，這是該階段 GPU 化的前置條件。新增 `tests/test_detector_202_1_cnr_contract.py`（5 tests，全套 399 → 404 tests OK）：（1）候選確實以 CNR 遞減排序；（2）**CNR 完全平手時依 component label 遞增順序**（以三個位元組完全相同、背景恆定的缺陷構造出精確平手場景，並斷言該場景真的平手，否則契約未被測到）；（3）defect 清單順序與候選順序一致且 `metadata.cnr` 遞減；（4）ring 統計與 float64 重算在 6 組參數下的偏差界線；（5）偏差與相異 CNR 最小間距的關係。關鍵發現：**`Detector202_1.detect` 沒有任何 CNR 門檻——每個候選都成為 defect**，因此 CNR 只影響 metadata 與候選排序，GPU 化**不需要**「判定邊界等價」，只需要排序鍵等價（先前把 CNR 當成判定門檻是錯誤前提，已更正）。新增 `tools/cnr_ring_precision.py` 量測 15 個場景、73 個候選：float32（產線）與 float64 重算的最大 CNR 偏差 **5.89e-6**（相對 6.43e-7）、最大 contrast 偏差 1.18e-5，而相異 CNR 的最小間距為 **5.29e-2**，偏差／間距 = 1.11e-4，故加法順序改變（GPU 化的必然結果）不會重排候選，也不會改變輸出順序。證據：`outputs_validation/cnr_profile/cnr_ring_precision.json`。未修改任何產線程式、CUDA source／ABI 或 DLL。
 
