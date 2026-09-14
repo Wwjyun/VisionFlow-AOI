@@ -780,8 +780,11 @@ detectors:
   --recipe C:\AOI_TEST\negative_anchor_grid.yaml `
   --dll .\gpu\visionflow_cuda.dll `
   --runs 10 `
+  --gui-runs 10 `
   --output .\outputs_validation\401_profile_baseline.json
 ```
+
+`--gui-runs` 會再以 offscreen GUI `InspectionWorker` 與單一 latency session cache 連續執行指定次數，記錄使用者等待時間、context allocation 增量、resident generation，並要求每次 ROI／defects／PASS-NG 與 CPU 相同且無 fallback。
 
 JSON 會輸出整張圖所有 ROI 的 template match、ROI generation、context/allocation、H2D、resident ROI D2D gather、Gaussian、Morphology total、Gray、Adaptive Mean、D2H、synchronize、CPU findContours、後處理、detector total、ROI/launch 數、peak context working set、backend/fallback 狀態，以及 mean/median/P95/min/max。此外會分開記錄 `pipeline_before_reporting_ms`、`reporting_ms`、`pipeline_end_to_end_ms` 與 profiler 外層的 `profile_host_wall_ms`；不可把這些與 `total_detector_ms` 當成同一口徑。ABI v1 尚未拆出 erosion/dilation 各自的 CUDA event，因此兩欄明確為 `null`，不以理論比例估算；正式優化前應先用這份報告確認實際瓶頸。
 

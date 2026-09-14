@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 from copy import deepcopy
 import json
+import os
 from pathlib import Path
 import statistics
 import sys
@@ -40,11 +41,81 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--recipe", required=True)
     parser.add_argument("--dll", default="gpu/visionflow_cuda.dll")
     parser.add_argument("--runs", type=int, default=10, help="Warm GPU and CPU repetitions.")
+    parser.add_argument(
+        "--gui-runs", type=int, default=0,
+        help="Also run the GUI InspectionWorker this many times through one cached latency session (offscreen).",
+    )
     parser.add_argument("--output", required=True)
     args = parser.parse_args()
     if args.runs < 10:
         parser.error("--runs must be at least 10")
+    if args.gui_runs < 0:
+        parser.error("--gui-runs cannot be negative")
     return args
+
+
+def _tile_signature(result: dict) -> tuple[list, list]:
+    coordinates = [[tile["tile"][key] for key in ("x", "y", "width", "height")] for tile in result.get("tiles", [])]
+    defects = [
+        defect
+        for tile in result.get("tiles", [])
+        for detector in tile.get("detectors", [])
+        for defect in detector.get("defects", [])
+    ]
+    return coordinates, defects
+
+
+def _run_gui_workers(image: Path, recipe: Path, output: Path, runs: int, cpu_result: dict) -> dict:
+    """Repeat the GUI single-image worker path; the cache keeps one warm CUDA session."""
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    from PySide6.QtWidgets import QApplication
+    from core.gpu_session import GpuExecutionSessionCache
+    from gui.workers import InspectionWorker
+
+    application = QApplication.instance() or QApplication([])
+    cpu_coordinates, cpu_defects = _tile_signature(cpu_result)
+    cache = GpuExecutionSessionCache(workload="latency")
+    rows = []
+    try:
+        for index in range(runs):
+            captured: dict = {}
+            worker = InspectionWorker(image, recipe, output / f"gui_{index}", gpu_session_cache=cache)
+            worker.finished.connect(lambda result, store=captured: store.setdefault("result", result))
+            worker.failed.connect(lambda message, store=captured: store.setdefault("error", message))
+            started = time.perf_counter()
+            worker.run()
+            application.processEvents()
+            wall_ms = (time.perf_counter() - started) * 1000.0
+            if "error" in captured:
+                raise AssertionError(f"GUI worker run {index + 1} failed: {captured['error']}")
+            result = captured["result"]
+            gpu = result["execution"]["gpu"]
+            status = gpu["detectors"].get("401-AS-SN-1", {})
+            coordinates, defects = _tile_signature(result)
+            rows.append({
+                "run": index + 1,
+                "user_wait_ms": round(wall_ms, 3),
+                "final_result": result["final_result"],
+                "gpu_backend_active": bool(status.get("active")),
+                "fallback_reason": str(status.get("fallback_reason", "")),
+                "allocation_count": gpu["metrics"]["persistent_context"]["allocation_count"],
+                "resident_generation": gpu["resident_image"]["generation"],
+                "roi_and_defects_identical_to_cpu": coordinates == cpu_coordinates and defects == cpu_defects,
+            })
+    finally:
+        cache.close()
+    waits = [row["user_wait_ms"] for row in rows[1:]] or [rows[0]["user_wait_ms"]]
+    return {
+        "runs": rows,
+        "cold_user_wait_ms": rows[0]["user_wait_ms"],
+        "warm_user_wait_median_ms": round(statistics.median(waits), 3),
+        "allocation_growth_after_first": rows[-1]["allocation_count"] - rows[0]["allocation_count"],
+        "all_identical_to_cpu": all(
+            row["roi_and_defects_identical_to_cpu"] and row["final_result"] == cpu_result["final_result"]
+            for row in rows
+        ),
+        "no_silent_fallback": all(row["gpu_backend_active"] and not row["fallback_reason"] for row in rows),
+    }
 
 
 def _absolute_template_paths(recipe: dict, recipe_path: Path) -> None:
@@ -201,8 +272,10 @@ def main() -> int:
         )
 
         cpu_rows = []
+        cpu_reference = None
         for index in range(args.runs):
             result = _run_pipeline(image_path, cpu_recipe, temp / f"cpu_{index}")
+            cpu_reference = cpu_reference or result
             row, _ = _run_metrics(result)
             cpu_rows.append(row)
 
@@ -221,6 +294,10 @@ def main() -> int:
                 result = _run_pipeline(image_path, gpu_recipe, temp / f"gpu_warm_{index}", session)
                 row, previous = _run_metrics(result, previous)
                 warm_rows.append(row)
+        gui = (
+            _run_gui_workers(image_path, gpu_recipe, temp / "gui", args.gui_runs, cpu_reference)
+            if args.gui_runs else None
+        )
 
     reference_coordinates = cpu_rows[0]["roi_coordinates"]
     coordinate_equivalent = all(row["roi_coordinates"] == reference_coordinates for row in warm_rows)
@@ -235,10 +312,14 @@ def main() -> int:
         "cold_gpu": cold,
         "warm_gpu": {"runs": warm_rows, "summary": _summary(warm_rows)},
         "cpu": {"runs": cpu_rows, "summary": _summary(cpu_rows)},
+        "gui": gui,
         "checks": {
             "roi_coordinates_identical": coordinate_equivalent,
             "final_pass_ng_identical": final_equivalent,
             "no_silent_fallback": no_fallback,
+            "gui_identical_without_fallback": (
+                None if gui is None else bool(gui["all_identical_to_cpu"] and gui["no_silent_fallback"])
+            ),
         },
         "profiling_limitations": [
             "ABI v1 exposes total morphology time but not separate erosion/dilation CUDA events; "
@@ -246,7 +327,7 @@ def main() -> int:
             "peak_vram_bytes is the maximum context-reserved working set, not whole-process GPU memory.",
         ],
     }
-    if not coordinate_equivalent or not final_equivalent or not no_fallback:
+    if not coordinate_equivalent or not final_equivalent or not no_fallback or report["checks"]["gui_identical_without_fallback"] is False:
         raise AssertionError(f"Profiling correctness gate failed: {report['checks']}")
     output = Path(args.output)
     output.parent.mkdir(parents=True, exist_ok=True)
