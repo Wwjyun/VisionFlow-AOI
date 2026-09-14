@@ -261,6 +261,60 @@ VF_CUDA_API int vf_match_template_debug_roi(void* context, uint8_t* out_values, 
 VF_CUDA_API int vf_match_template_debug_candidates(
     void* context, double* out_scores, int* out_rows, int count, int* candidate_slots);
 
+/*
+ * Optional contour extension: cv2.findContours(binary, mode, CHAIN_APPROX_SIMPLE) equivalence.
+ *
+ * Input path. The operator reads `width` x `height` pixels at (x, y) of the context's *resident*
+ * image and treats every non-zero pixel as foreground, exactly like OpenCV binarizes the padded
+ * image with THRESH_BINARY. The caller uploads the binary mask itself with vf_context_upload_u8
+ * as a single-channel image (1 byte per pixel); the colour image is never uploaded for this step.
+ * A resident colour image is reported as VF_CUDA_UNSUPPORTED because reinterpreting it as a mask
+ * would silently change the foreground rule.
+ *
+ * The uploaded region is treated as an isolated image: a one-pixel zero frame is added on the
+ * device, so pixels outside the region never influence the result. That is what makes a
+ * sub-region call identical to cv2.findContours on the same sub-array.
+ *
+ * Semantics. Port of tools/contour_reference.py, which is verified point-for-point against
+ * cv2.findContours (Suzuki-Abe border following, icvFetchContour with CHAIN_APPROX_SIMPLE):
+ *   - VF_CONTOURS_RETR_LIST     == cv2.RETR_LIST
+ *   - VF_CONTOURS_RETR_EXTERNAL == cv2.RETR_EXTERNAL
+ *   - contour order: OpenCV reports the flat list in *reverse discovery order*; this operator
+ *     already returns that order.
+ *   - point coordinates: 0-based within the requested region (add x/y for image coordinates).
+ *   - deterministic: one serialized thread performs the raster scan and the border traces, no
+ *     atomics are used, and the auxiliary kernels write every output element from exactly one
+ *     thread. The same resident mask and region therefore always produce the same bytes.
+ *
+ * Output layout (two calls, mirroring vf_roi_batch_create / vf_roi_batch_download_u8):
+ *   vf_find_contours_u8() runs the trace into context-owned device scratch and reports how many
+ *     contours and how many points the result holds.
+ *   vf_find_contours_download() copies that result to host buffers:
+ *     out_offsets: int32[contour_count + 1]; contour j owns point indices
+ *                  [out_offsets[j], out_offsets[j + 1]). Use those as *point* indices into
+ *                  out_points, which holds point pairs.
+ *     out_points:  int32[2 * point_count] as (x, y) pairs; point_capacity counts pairs.
+ *   offset_capacity must be at least contour_count + 1 and point_capacity at least point_count;
+ *   a short buffer is rejected with VF_CUDA_INVALID_ARGUMENT instead of being filled partially.
+ *   The scratch keeps the most recent call only, and a download is rejected when the resident
+ *   image changed (generation) after the trace ran.
+ */
+enum VisionFlowContourMode {
+    VF_CONTOURS_RETR_EXTERNAL = 0,
+    VF_CONTOURS_RETR_LIST = 1
+};
+
+VF_CUDA_API int vf_find_contours_u8(
+    void* context,
+    uint64_t generation,
+    int x, int y, int width, int height, int mode,
+    int* out_contour_count, int* out_point_count);
+
+VF_CUDA_API int vf_find_contours_download(
+    void* context,
+    int32_t* out_offsets, int offset_capacity,
+    int32_t* out_points, int point_capacity);
+
 VF_CUDA_API int vf_preprocess_401_2_u8(
     void* context,
     const uint8_t* src, int width, int height, int src_stride, int src_channels,

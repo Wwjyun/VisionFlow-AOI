@@ -1,6 +1,7 @@
 #define VISIONFLOW_CUDA_EXPORTS
 #include "visionflow_cuda.h"
 #include "visionflow_cuda_internal.cuh"
+// which gpu/cuda_project.json now opts into for the whole project.
 #include <algorithm>
 #include <cfloat>
 #include <climits>
@@ -70,6 +71,24 @@ struct PersistentContext {
     long long* match_candidates = nullptr;
     size_t match_candidate_capacity = 0;
     int match_candidate_output_width = 0;
+    // Contour extension scratch: the padded label image, the discovery-order result, and the
+    // OpenCV-order result the download export copies out. All grow-only.
+    signed char* contour_label = nullptr;
+    size_t contour_label_capacity = 0;
+    int32_t* contour_offsets = nullptr;
+    size_t contour_offset_capacity = 0;
+    int32_t* contour_points = nullptr;
+    size_t contour_point_capacity = 0;
+    int32_t* contour_out_offsets = nullptr;
+    size_t contour_out_offset_capacity = 0;
+    int32_t* contour_out_points = nullptr;
+    size_t contour_out_point_capacity = 0;
+    int* contour_counts = nullptr;
+    size_t contour_count_capacity = 0;
+    int contour_count = 0;
+    int contour_point_count = 0;
+    uint64_t contour_generation = 0;
+    bool contour_result_valid = false;
     unsigned long long allocation_count = 0;
     cudaStream_t stream = nullptr;
     cudaError_t initialization_error = cudaSuccess;
@@ -101,6 +120,12 @@ struct PersistentContext {
         for (void* pointer : dag_u8) visionflow_cuda::free_device(pointer);
         for (long long* plane : match_plane) visionflow_cuda::free_device(plane);
         visionflow_cuda::free_device(match_candidates);
+        visionflow_cuda::free_device(contour_label);
+        visionflow_cuda::free_device(contour_offsets);
+        visionflow_cuda::free_device(contour_points);
+        visionflow_cuda::free_device(contour_out_offsets);
+        visionflow_cuda::free_device(contour_out_points);
+        visionflow_cuda::free_device(contour_counts);
         visionflow_cuda::free_device(resident_u8);
         for (cudaEvent_t event : timing_events) {
             if (event != nullptr) cudaEventDestroy(event);
@@ -1625,6 +1650,253 @@ void launch_area_resize(
         src, dst, source_width, target_width, target_height, tables.mode, tables.scale_x,
         tables.scale_y, tables.inverse_area, tables.x_entries, tables.indices, tables.alphas);
 }
+
+// ---------------------------------------------------------------------------------------------
+// Contour extension: cv2.findContours(RETR_LIST | RETR_EXTERNAL, CHAIN_APPROX_SIMPLE) equivalence.
+//
+// This is a direct port of tools/contour_reference.py, which was verified point-for-point against
+// cv2.findContours. The reference follows OpenCV contours.cpp:
+//   cvStartFindContours_Impl -> 1-pixel zero frame, THRESH_BINARY binarization, scanner state
+//   cvFindNextContour        -> raster scan, outer/hole classification, lnbd bookkeeping
+//   icvFetchContour          -> the 8-neighbour border trace, CHAIN_APPROX_SIMPLE point rule
+//
+// Two properties keep the port cheap and exact:
+//   - CHAIN_APPROX_SIMPLE compression is inherent to the trace (a point is emitted only where the
+//     step direction changes), so no separate compression pass exists.
+//   - The trace only ever tests whether a neighbour is non-zero, and marking only rewrites 1 into
+//     2 or -126 (both still non-zero), so the trace of a border is independent of the marks left
+//     by other borders. Only the raster scan is order-dependent, which is why it stays serial.
+//
+// OpenCV reports the flat contour list in reverse discovery order (icvEndProcessContour prepends to
+// frame->v_next), so a final kernel reverses the discovery-order scratch into the output.
+// ---------------------------------------------------------------------------------------------
+constexpr int CONTOUR_NBD = 2;        // const schar nbd = 2 inside icvFetchContour
+constexpr int CONTOUR_MARKED = -126;  // (schar)(nbd | -128)
+
+// CV_INIT_3X3_DELTAS(deltas, step, 1): index 0..7 is E, NE, N, NW, W, SW, S, SE and 8..15 mirrors
+// it. `index & 7` reproduces the 16-entry table exactly, including the exhausted search (15).
+__device__ __forceinline__ void contour_ring_step(int index, int* dy, int* dx) {
+    const int ring_dx[8] = {1, 1, 0, -1, -1, -1, 0, 1};
+    const int ring_dy[8] = {0, -1, -1, -1, 0, 1, 1, 1};
+    const int slot = index & 7;
+    *dx = ring_dx[slot];
+    *dy = ring_dy[slot];
+}
+
+// Appends one point; a full buffer sets the overflow flag instead of truncating the contour.
+__device__ __forceinline__ void contour_store_point(
+    int32_t* points, int point_capacity, int* point_index, int* overflow, int px, int py) {
+    const int index = *point_index;
+    if (index < point_capacity) {
+        points[static_cast<size_t>(index) * 2] = px;
+        points[static_cast<size_t>(index) * 2 + 1] = py;
+    } else {
+        *overflow = 1;
+    }
+    *point_index = index + 1;
+}
+
+// Port of icvFetchContour(ptr, step, pt, contour, CV_CHAIN_APPROX_SIMPLE). The padded label image
+// is mutated in place exactly like OpenCV does (marks 2 / -126).
+__device__ void contour_fetch(
+    signed char* image, int stride, int i0_y, int i0_x, int is_hole, int pt_x, int pt_y,
+    int32_t* points, int point_capacity, int* point_index, int* overflow) {
+    int s_end = is_hole ? 0 : 4;
+    int s = s_end;
+    int i1_y = i0_y;
+    int i1_x = i0_x;
+    for (;;) {
+        s = (s - 1) & 7;
+        int dy = 0;
+        int dx = 0;
+        contour_ring_step(s, &dy, &dx);
+        i1_y = i0_y + dy;
+        i1_x = i0_x + dx;
+        if (image[static_cast<size_t>(i1_y) * stride + i1_x] != 0) break;
+        if (s == s_end) break;
+    }
+
+    if (s == s_end) {
+        // Single-pixel domain: mark the pixel and emit exactly one point.
+        image[static_cast<size_t>(i0_y) * stride + i0_x] = static_cast<signed char>(CONTOUR_MARKED);
+        contour_store_point(points, point_capacity, point_index, overflow, pt_x, pt_y);
+        return;
+    }
+
+    int i3_y = i0_y;
+    int i3_x = i0_x;
+    int prev_s = s ^ 4;
+    int i4_y = 0;
+    int i4_x = 0;
+    for (;;) {
+        s_end = s;
+        // `s` is always in 0..7 here, so C's `s = min(s, MAX_SIZE - 1)` is a no-op.
+        while (s < 15) {
+            s += 1;
+            int dy = 0;
+            int dx = 0;
+            contour_ring_step(s, &dy, &dx);
+            i4_y = i3_y + dy;
+            i4_x = i3_x + dx;
+            if (image[static_cast<size_t>(i4_y) * stride + i4_x] != 0) break;
+        }
+        s &= 7;
+
+        // Right-bound marking: (unsigned)(s - 1) < (unsigned)s_end means 1 <= s <= s_end.
+        if (s >= 1 && (s - 1) < s_end) {
+            image[static_cast<size_t>(i3_y) * stride + i3_x] =
+                static_cast<signed char>(CONTOUR_MARKED);
+        } else if (image[static_cast<size_t>(i3_y) * stride + i3_x] == 1) {
+            image[static_cast<size_t>(i3_y) * stride + i3_x] = static_cast<signed char>(CONTOUR_NBD);
+        }
+
+        if (s != prev_s) {
+            contour_store_point(points, point_capacity, point_index, overflow, pt_x, pt_y);
+            prev_s = s;
+        }
+
+        int dy = 0;
+        int dx = 0;
+        contour_ring_step(s, &dy, &dx);
+        pt_y += dy;
+        pt_x += dx;
+
+        if (i4_y == i0_y && i4_x == i0_x && i3_y == i1_y && i3_x == i1_x) break;
+        i3_y = i4_y;
+        i3_x = i4_x;
+        s = (s + 4) & 7;
+    }
+}
+
+// Builds the 1-pixel-zero-framed label image of the requested region. Every padded pixel is
+// written by exactly one thread, so the buffer is a pure function of the mask.
+__global__ void contour_init_label_kernel(
+    const uint8_t* mask, int mask_stride, int x, int y, int width, int height,
+    signed char* label, int label_stride) {
+    const int column = blockIdx.x * blockDim.x + threadIdx.x;
+    const int row = blockIdx.y * blockDim.y + threadIdx.y;
+    if (column > width + 1 || row > height + 1) return;
+    signed char value = 0;
+    if (column >= 1 && column <= width && row >= 1 && row <= height) {
+        const uint8_t* source =
+            mask + static_cast<size_t>(y + row - 1) * mask_stride + static_cast<size_t>(x + column - 1);
+        value = (*source != 0) ? static_cast<signed char>(1) : static_cast<signed char>(0);
+    }
+    label[static_cast<size_t>(row) * label_stride + column] = value;
+}
+
+// Serial port of the cvStartFindContours_Impl / cvFindNextContour raster scan plus the per-border
+// trace. A single thread owns the whole scan, so the marking order is the reference order and no
+// synchronization or atomic is involved; that is what makes the operator deterministic.
+//
+// counts[0] = contour count, counts[1] = point count, counts[2] = overflow flag. The counts are
+// reported even when the buffers were too small, so the caller can retry with the exact size.
+__global__ void contour_scan_kernel(
+    signed char* image, int stride, int width, int height, int mode,
+    int32_t* offsets, int offset_capacity,
+    int32_t* points, int point_capacity,
+    int* counts) {
+    if (blockIdx.x != 0 || blockIdx.y != 0 || threadIdx.x != 0 || threadIdx.y != 0) return;
+    const int scan_w = width + 1;  // scanner->img_size.width  = W + 2 - 1
+    const int scan_h = height + 1; // scanner->img_size.height = H + 2 - 1
+    int contour_count = 0;
+    int point_index = 0;
+    int overflow = 0;
+
+    int x = 1;
+    int y = 1;
+    int lnbd_x = 0;
+    int lnbd_y = 1;
+    int prev = static_cast<int>(image[static_cast<size_t>(y) * stride + (x - 1)]);
+
+    while (y < scan_h) {
+        int restarted = 0;
+        signed char* row = image + static_cast<size_t>(y) * stride;
+        while (x < scan_w) {
+            while (x < scan_w && static_cast<int>(row[x]) == prev) x += 1;
+            if (x >= scan_w) break;
+            const int p = static_cast<int>(row[x]);
+
+            int is_hole = 0;
+            if (!(prev == 0 && p == 1)) {
+                // Not an outer border. `p != 0 || prev < 1` also rejects a hole start where the
+                // left pixel carries the -126 right-bound mark (which is < 1).
+                if (p != 0 || prev < 1) {
+                    prev = p;
+                    if (prev & -2) lnbd_x = x;
+                    x += 1;
+                    continue;
+                }
+                is_hole = 1;
+            }
+
+            // mode == RETR_EXTERNAL skips hole borders and borders whose left neighbour already
+            // belongs to a labelled contour.
+            if (mode == VF_CONTOURS_RETR_EXTERNAL &&
+                (is_hole || static_cast<int>(image[static_cast<size_t>(lnbd_y) * stride + lnbd_x]) > 0)) {
+                prev = p;
+                if (prev & -2) lnbd_x = x;
+                x += 1;
+                continue;
+            }
+
+            const int origin_y = y;
+            const int origin_x = x - is_hole;
+            lnbd_x = x - is_hole;
+            lnbd_y = y;
+            if (contour_count < offset_capacity) {
+                offsets[contour_count] = point_index;
+            } else {
+                overflow = 1;
+            }
+            contour_fetch(
+                image, stride, origin_y, origin_x, is_hole, origin_x - 1, origin_y - 1,
+                points, point_capacity, &point_index, &overflow);
+            if (contour_count + 1 < offset_capacity) {
+                offsets[contour_count + 1] = point_index;
+            } else {
+                overflow = 1;
+            }
+            contour_count += 1;
+
+            x += 1;
+            prev = static_cast<int>(row[x - 1]);
+            restarted = 1;
+            break;
+        }
+        if (restarted) continue;
+        lnbd_x = 0;
+        lnbd_y = y + 1;
+        x = 1;
+        prev = 0;
+        y += 1;
+    }
+
+    counts[0] = contour_count;
+    counts[1] = point_index;
+    counts[2] = overflow;
+}
+
+// Reverses the discovery-order scratch into the OpenCV order. Each contour is copied by one thread
+// that also derives its output offset from the monotonic offset table, so the result is a pure
+// function of the scratch.
+__global__ void contour_reverse_kernel(
+    const int32_t* offsets, const int32_t* points, int contour_count, int point_count,
+    int32_t* out_offsets, int32_t* out_points) {
+    const int index = blockIdx.x * blockDim.x + threadIdx.x;
+    if (index >= contour_count) return;
+    const int source = contour_count - 1 - index;
+    const int source_start = offsets[source];
+    const int source_end = offsets[source + 1];
+    const int target_start = point_count - offsets[contour_count - index];
+    out_offsets[index] = target_start;
+    if (index == 0) out_offsets[contour_count] = point_count;
+    for (int point = source_start; point < source_end; ++point) {
+        const int target = target_start + (point - source_start);
+        out_points[static_cast<size_t>(target) * 2] = points[static_cast<size_t>(point) * 2];
+        out_points[static_cast<size_t>(target) * 2 + 1] = points[static_cast<size_t>(point) * 2 + 1];
+    }
+}
 }
 
 static int execute_linear_plan_device(
@@ -3085,6 +3357,170 @@ VF_CUDA_API int vf_match_template_debug_candidates(
     if (error == cudaSuccess) {
         error = cudaMemcpyAsync(
             out_rows, rows, sizeof(int) * count, cudaMemcpyDeviceToHost, persistent->stream);
+    }
+    if (error != cudaSuccess) return cuda_result(error);
+    return visionflow_cuda::stream_result(persistent->stream);
+}
+
+// Contour trace of the requested region of the resident binary mask. Scratch buffers are grow-only;
+// when the first guess at the output size is too small the kernel reports the exact requirement and
+// the whole trace is re-run with that capacity, so a result is never truncated silently.
+VF_CUDA_API int vf_find_contours_u8(
+    void* context,
+    uint64_t generation,
+    int x, int y, int width, int height, int mode,
+    int* out_contour_count, int* out_point_count) {
+    PersistentContext* persistent = static_cast<PersistentContext*>(context);
+    if (persistent == nullptr || out_contour_count == nullptr || out_point_count == nullptr ||
+        generation == 0 || generation != persistent->resident_generation ||
+        persistent->resident_u8 == nullptr ||
+        (mode != VF_CONTOURS_RETR_EXTERNAL && mode != VF_CONTOURS_RETR_LIST)) {
+        return VF_CUDA_INVALID_ARGUMENT;
+    }
+    // A colour resident image cannot be reinterpreted as a binary mask without changing the
+    // foreground rule, so the caller restarts this step on the CPU reference instead.
+    if (persistent->resident_channels != 1) return VF_CUDA_UNSUPPORTED;
+    if (x < 0 || y < 0 || width <= 0 || height <= 0 ||
+        x > persistent->resident_width - width ||
+        y > persistent->resident_height - height) {
+        return VF_CUDA_INVALID_ARGUMENT;
+    }
+    const int label_stride = width + 2;
+    const size_t padded = static_cast<size_t>(label_stride) * static_cast<size_t>(height + 2);
+    if (padded > static_cast<size_t>(INT_MAX)) return VF_CUDA_INVALID_ARGUMENT;
+
+    const size_t resident_pitch =
+        static_cast<size_t>(persistent->resident_width) * persistent->resident_channels;
+    const uint8_t* mask = persistent->resident_u8 +
+        static_cast<size_t>(y) * resident_pitch + static_cast<size_t>(x);
+
+    // First guess at the output size. Sparse production masks are far below these ratios; a denser
+    // mask only costs one extra trace with the exact reported capacity.
+    int contour_hint = static_cast<int>(std::min<long long>(
+        std::max<long long>(static_cast<long long>(padded) / 64, 64), 1LL << 20));
+    int point_hint = static_cast<int>(std::min<long long>(
+        std::max<long long>(static_cast<long long>(padded) / 8, 256), 1LL << 22));
+
+    int counts[3] = {0, 0, 0};
+    int result = reserve_device(
+        &persistent->contour_label, &persistent->contour_label_capacity, padded,
+        &persistent->allocation_count);
+    if (result != VF_CUDA_OK) return result;
+    // The scan reports the contour count, the point count and the overflow flag in one block.
+    result = reserve_device(
+        &persistent->contour_counts, &persistent->contour_count_capacity, static_cast<size_t>(4),
+        &persistent->allocation_count);
+    if (result != VF_CUDA_OK) return result;
+
+    reset_timing(persistent, false);
+    cudaError_t error = cudaSuccess;
+    bool complete = false;
+    for (int attempt = 0; attempt < 4 && !complete; ++attempt) {
+        result = reserve_device(
+            &persistent->contour_offsets, &persistent->contour_offset_capacity,
+            static_cast<size_t>(contour_hint) + 1, &persistent->allocation_count);
+        if (result != VF_CUDA_OK) return result;
+        result = reserve_device(
+            &persistent->contour_points, &persistent->contour_point_capacity,
+            static_cast<size_t>(point_hint) * 2, &persistent->allocation_count);
+        if (result != VF_CUDA_OK) return result;
+        result = reserve_device(
+            &persistent->contour_out_offsets, &persistent->contour_out_offset_capacity,
+            static_cast<size_t>(contour_hint) + 1, &persistent->allocation_count);
+        if (result != VF_CUDA_OK) return result;
+        result = reserve_device(
+            &persistent->contour_out_points, &persistent->contour_out_point_capacity,
+            static_cast<size_t>(point_hint) * 2, &persistent->allocation_count);
+        if (result != VF_CUDA_OK) return result;
+
+        contour_init_label_kernel<<<
+            grid2d(label_stride, height + 2), dim3(BLOCK_X, BLOCK_Y), 0, persistent->stream>>>(
+            mask, static_cast<int>(resident_pitch), x, y, width, height,
+            persistent->contour_label, label_stride);
+        result = visionflow_cuda::kernel_launch_result();
+        if (result != VF_CUDA_OK) return result;
+        cudaEventRecord(persistent->timing_events[TIMING_AFTER_INPUT], persistent->stream);
+
+        contour_scan_kernel<<<1, 1, 0, persistent->stream>>>(
+            persistent->contour_label, label_stride, width, height, mode,
+            persistent->contour_offsets, static_cast<int>(persistent->contour_offset_capacity),
+            persistent->contour_points, static_cast<int>(persistent->contour_point_capacity / 2),
+            persistent->contour_counts);
+        result = visionflow_cuda::kernel_launch_result();
+        if (result != VF_CUDA_OK) return result;
+        cudaEventRecord(persistent->timing_events[TIMING_AFTER_KERNEL], persistent->stream);
+
+        error = cudaMemcpyAsync(
+            counts, persistent->contour_counts, sizeof(counts), cudaMemcpyDeviceToHost,
+            persistent->stream);
+        if (error != cudaSuccess) return cuda_result(error);
+        cudaEventRecord(persistent->timing_events[TIMING_AFTER_OUTPUT], persistent->stream);
+        result = visionflow_cuda::stream_result(persistent->stream);
+        if (result != VF_CUDA_OK) return result;
+
+        if (counts[2] != 0) {
+            // Grow to the exact capacity the trace reported and run it again; the second run has
+            // enough room by construction, and identical input always yields identical counts.
+            contour_hint = counts[0];
+            point_hint = counts[1];
+            continue;
+        }
+
+        if (counts[0] > 0) {
+            contour_reverse_kernel<<<
+                dim3(static_cast<unsigned int>((counts[0] + 127) / 128), 1, 1), dim3(128, 1, 1),
+                0, persistent->stream>>>(
+                persistent->contour_offsets, persistent->contour_points, counts[0], counts[1],
+                persistent->contour_out_offsets, persistent->contour_out_points);
+            result = visionflow_cuda::kernel_launch_result();
+            if (result != VF_CUDA_OK) return result;
+        }
+        complete = true;
+    }
+    if (!complete) return VF_CUDA_INTERNAL_ERROR;
+    result = visionflow_cuda::stream_result(persistent->stream);
+    if (result != VF_CUDA_OK) return result;
+    finalize_timing(persistent);
+
+    persistent->contour_count = counts[0];
+    persistent->contour_point_count = counts[1];
+    persistent->contour_generation = generation;
+    persistent->contour_result_valid = true;
+    *out_contour_count = counts[0];
+    *out_point_count = counts[1];
+    return VF_CUDA_OK;
+}
+
+// Copies the most recent contour result to the caller. A short buffer is an error, never a partial
+// result, and a stale result (the resident image changed after the trace) is rejected.
+VF_CUDA_API int vf_find_contours_download(
+    void* context,
+    int32_t* out_offsets, int offset_capacity,
+    int32_t* out_points, int point_capacity) {
+    PersistentContext* persistent = static_cast<PersistentContext*>(context);
+    if (persistent == nullptr || out_offsets == nullptr || !persistent->contour_result_valid ||
+        persistent->contour_generation != persistent->resident_generation) {
+        return VF_CUDA_INVALID_ARGUMENT;
+    }
+    const int contour_count = persistent->contour_count;
+    const int point_count = persistent->contour_point_count;
+    if (offset_capacity < contour_count + 1) return VF_CUDA_INVALID_ARGUMENT;
+    if (point_count > 0 && (out_points == nullptr || point_capacity < point_count)) {
+        return VF_CUDA_INVALID_ARGUMENT;
+    }
+    if (contour_count == 0) {
+        out_offsets[0] = 0;
+        return VF_CUDA_OK;
+    }
+    cudaError_t error = cudaMemcpyAsync(
+        out_offsets, persistent->contour_out_offsets,
+        sizeof(int32_t) * static_cast<size_t>(contour_count + 1), cudaMemcpyDeviceToHost,
+        persistent->stream);
+    if (error == cudaSuccess && point_count > 0) {
+        error = cudaMemcpyAsync(
+            out_points, persistent->contour_out_points,
+            sizeof(int32_t) * 2 * static_cast<size_t>(point_count), cudaMemcpyDeviceToHost,
+            persistent->stream);
     }
     if (error != cudaSuccess) return cuda_result(error);
     return visionflow_cuda::stream_result(persistent->stream);

@@ -6,12 +6,21 @@ compares the contour count, every contour's shape, and every point in order, for
 modes. While the operator is not implemented yet the script reports that clearly and exits 0, so it
 can live in the tree as the ready-made gate.
 
-Usage: .\\env\\Scripts\\python.exe tools/check_contour_equivalence.py
+It also measures the operator against ``cv2.findContours`` on the production ROI shape
+(2000x12000) and writes JSON evidence under ``outputs_validation/contour_equivalence/``.
+
+Usage:
+    .\\env\\Scripts\\python.exe tools/check_contour_equivalence.py
+    .\\env\\Scripts\\python.exe tools/check_contour_equivalence.py --dll gpu/visionflow_cuda.dll
 """
 
 from __future__ import annotations
 
+import argparse
+import json
+import statistics
 import sys
+import time
 from pathlib import Path
 
 import cv2
@@ -26,6 +35,7 @@ DLL = ROOT / "gpu" / "visionflow_cuda.dll"
 OUTPUT = ROOT / "outputs_validation" / "contour_equivalence"
 
 MODES = (("list", cv2.RETR_LIST), ("external", cv2.RETR_EXTERNAL))
+BENCHMARK_SHAPE = (12000, 2000)  # production ROI: height x width
 
 
 def cases() -> list[tuple[str, np.ndarray]]:
@@ -55,6 +65,11 @@ def cases() -> list[tuple[str, np.ndarray]]:
     lines[55, 55] = 255
     shapes.append(("thin_lines", lines))
 
+    diagonal = np.zeros((64, 80), dtype=np.uint8)
+    for step in range(40):
+        diagonal[10 + step, 10 + step] = 255  # 8-connected 1-pixel diagonal
+    shapes.append(("thin_diagonal", diagonal))
+
     border = np.zeros((64, 80), dtype=np.uint8)
     border[0:6, 0:6] = 255
     border[:, -1] = 255
@@ -70,6 +85,15 @@ def cases() -> list[tuple[str, np.ndarray]]:
     nested[22:42, 28:52] = 255
     shapes.append(("nested_rings", nested))
 
+    single = np.zeros((64, 80), dtype=np.uint8)
+    single[32, 40] = 255
+    shapes.append(("single_pixel", single))
+
+    comb = np.zeros((64, 80), dtype=np.uint8)
+    comb[10:54, 10:70] = 255
+    comb[10:54, 10:70:4] = 0
+    shapes.append(("comb_holes", comb))
+
     for seed in (1, 2, 3, 4, 5):
         random_mask = (rng.integers(0, 100, (64, 80)) > 80).astype(np.uint8) * 255
         shapes.append((
@@ -77,6 +101,23 @@ def cases() -> list[tuple[str, np.ndarray]]:
             cv2.morphologyEx(random_mask, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8)),
         ))
     return shapes
+
+
+def benchmark_masks(shape: tuple[int, int] = BENCHMARK_SHAPE) -> list[tuple[str, np.ndarray]]:
+    """Production-shaped masks: many separated blobs, then a denser opened noise field."""
+    height, width = shape
+    rng = np.random.default_rng(4242)
+
+    sparse = np.zeros(shape, dtype=np.uint8)
+    for index in range(200):
+        row = 40 + (index // 10) * (height - 200) // 20
+        column = 40 + (index % 10) * (width - 200) // 10
+        sparse[row : row + 60, column : column + 40] = 255
+
+    dense = (rng.integers(0, 100, shape) > 70).astype(np.uint8) * 255
+    dense = cv2.morphologyEx(dense, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
+    dense[0:20, 0:20] = 255
+    return [("roi_sparse_2000x12000", sparse), ("roi_dense_2000x12000", dense)]
 
 
 def compare(reference: list[np.ndarray], actual: list[np.ndarray]) -> tuple[bool, str]:
@@ -95,9 +136,64 @@ def compare(reference: list[np.ndarray], actual: list[np.ndarray]) -> tuple[bool
     return True, "identical"
 
 
+def time_call(function, repetitions: int) -> dict:
+    samples = []
+    for _ in range(repetitions):
+        started = time.perf_counter()
+        function()
+        samples.append((time.perf_counter() - started) * 1000.0)
+    return {
+        "repetitions": repetitions,
+        "median_ms": statistics.median(samples),
+        "min_ms": min(samples),
+        "max_ms": max(samples),
+    }
+
+
+def benchmark(runtime: GpuRuntime, rows: list[str], report: dict) -> None:
+    for name, mask in benchmark_masks():
+        reference, _ = cv2.findContours(mask, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
+        cpu = time_call(
+            lambda: cv2.findContours(mask, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE), 3
+        )
+        # One warm-up call, then a single measured call: the serialized device trace is expected to
+        # be far slower than the CPU reference, so the gate reports it instead of hiding it.
+        contours = runtime.find_contours_gray(mask, "list")
+        gpu = time_call(lambda: runtime.find_contours_gray(mask, "list"), 1)
+        timings = runtime.performance_stats().get("native_timings_ms") or {}
+        same, detail = compare(reference, contours)
+        entry = {
+            "name": name,
+            "shape": list(mask.shape),
+            "contours": len(reference),
+            "points": int(sum(contour.shape[0] for contour in reference)),
+            "identical": bool(same),
+            "detail": detail,
+            "cv2": cpu,
+            "operator": gpu,
+            "operator_vs_cv2": gpu["median_ms"] / cpu["median_ms"] if cpu["median_ms"] else 0.0,
+            "native_timings_ms": timings,
+        }
+        report["benchmark"].append(entry)
+        line = (
+            f"{name}: contours={entry['contours']} identical={same} "
+            f"cv2={cpu['median_ms']:.2f} ms operator={gpu['median_ms']:.2f} ms "
+            f"({entry['operator_vs_cv2']:.2f}x cv2) "
+            f"h2d={timings.get('h2d_ms', 0.0):.2f} kernel={timings.get('kernel_ms', 0.0):.2f} "
+            f"d2h={timings.get('d2h_ms', 0.0):.2f}"
+        )
+        rows.append(line)
+        print(line)
+
+
 def main() -> int:
+    parser = argparse.ArgumentParser(description="Compare the CUDA contour operator with OpenCV.")
+    parser.add_argument("--dll", default=str(DLL), help="CUDA DLL path")
+    parser.add_argument("--skip-benchmark", action="store_true", help="skip the 2000x12000 timing")
+    args = parser.parse_args()
+
     OUTPUT.mkdir(parents=True, exist_ok=True)
-    runtime = GpuRuntime(str(DLL), fallback_to_cpu=True)
+    runtime = GpuRuntime(str(args.dll), fallback_to_cpu=True)
     export = getattr(runtime._dll, "vf_find_contours_u8", None) if runtime._dll is not None else None
     if not runtime.available or export is None:
         message = (
@@ -110,6 +206,13 @@ def main() -> int:
         runtime.close()
         return 0
 
+    report = {
+        "dll": str(args.dll),
+        "device": runtime.device_name,
+        "compute_capability": runtime.compute_capability,
+        "cases": [],
+        "benchmark": [],
+    }
     identical = 0
     total = 0
     rows = []
@@ -120,16 +223,37 @@ def main() -> int:
                 actual = runtime.find_contours_gray(mask, mode)
             except GpuRuntimeError as exc:
                 rows.append(f"{name}/{mode}: GPU error {exc}")
+                report["cases"].append({"name": name, "mode": mode, "error": str(exc)})
                 total += 1
                 continue
             same, detail = compare(reference, actual)
             identical += int(same)
             total += 1
             rows.append(f"{name}/{mode}: {'identical' if same else 'DIFFERS - ' + detail}")
+            report["cases"].append(
+                {
+                    "name": name,
+                    "mode": mode,
+                    "contours_cv2": len(reference),
+                    "contours_gpu": len(actual),
+                    "shape": list(mask.shape),
+                    "identical": bool(same),
+                    "detail": detail,
+                }
+            )
             print(rows[-1])
+    if not args.skip_benchmark:
+        benchmark(runtime, rows, report)
     summary = f"identical {identical}/{total}"
     print(summary)
+    report["identical"] = identical
+    report["total"] = total
+    report["summary"] = summary
     (OUTPUT / "contour_equivalence.txt").write_text("\n".join([*rows, summary]) + "\n", encoding="utf-8")
+    (OUTPUT / "contour_equivalence.json").write_text(
+        json.dumps(report, indent=2) + "\n", encoding="utf-8"
+    )
+    print("evidence:", OUTPUT / "contour_equivalence.txt")
     runtime.close()
     return 0 if identical == total else 1
 

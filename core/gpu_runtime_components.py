@@ -103,6 +103,14 @@ class GpuCapabilities:
         """Optional Template Anchor Grid localization that reads the resident image."""
         return bool(self.resident_roi and self.has_exports(("vf_match_template_gray_u8",)))
 
+    @property
+    def find_contours(self) -> bool:
+        """Optional OpenCV-equivalent contour trace over the resident binary mask."""
+        return bool(
+            self.resident_roi
+            and self.has_exports(("vf_find_contours_u8", "vf_find_contours_download"))
+        )
+
 
 @dataclass(slots=True)
 class GpuResourceRegistry:

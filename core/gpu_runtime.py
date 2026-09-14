@@ -29,6 +29,12 @@ class GpuRuntimeError(RuntimeError):
 
 
 CUDA_RUNTIME_ERROR_BASE = 1000
+# Native error codes the bridge exposes to callers that must restart a step on the CPU reference.
+CUDA_ERROR_UNSUPPORTED = 8
+# cv2.RETR_EXTERNAL / cv2.RETR_LIST, which the contour export reuses as its mode codes.
+CUDA_CONTOURS_EXTERNAL = 0
+CUDA_CONTOURS_LIST = 1
+CONTOUR_MODES = {"list": CUDA_CONTOURS_LIST, "external": CUDA_CONTOURS_EXTERNAL}
 # cudaError_t values that leave the process CUDA context unusable until the process exits.
 STICKY_CUDA_ERRORS = frozenset({214, 220, 226, 700, 702, 709, 710, 714, 715, 716, 717, 718, 719})
 
@@ -180,6 +186,10 @@ class GpuRuntime:
     def supports_template_match(self) -> bool:
         return self._capabilities.template_match
 
+    @property
+    def supports_find_contours(self) -> bool:
+        return self._capabilities.find_contours
+
     def status(self, requested: bool = False) -> dict:
         active = bool(requested and self.available and not self.last_error)
         return {
@@ -198,6 +208,7 @@ class GpuRuntime:
                 "roi_batch": self.supports_roi_batch,
                 "fused_401_2": self.supports_fused_401_2,
                 "template_match": self.supports_template_match,
+                "find_contours": self.supports_find_contours,
             },
             "queue": {
                 "depth": self.queue_depth,
@@ -425,6 +436,88 @@ class GpuRuntime:
             "height": int(match[3]),
             "score": float(score.value),
         }
+
+    def find_contours_gray(self, mask: np.ndarray, mode, region=None) -> list[np.ndarray]:
+        """Reproduce ``cv2.findContours(mask, mode, cv2.CHAIN_APPROX_SIMPLE)`` on the device.
+
+        ``mask`` is the single-channel ``uint8`` *binary* mask whose non-zero pixels are foreground;
+        it is uploaded as the context's resident image (1 byte per pixel, never the 3 bytes per
+        pixel of the colour image), and only the contour result is copied back. ``mode`` accepts
+        ``"list"``/``"external"`` or the OpenCV constants ``cv2.RETR_LIST``/``cv2.RETR_EXTERNAL``.
+        ``region`` optionally restricts the trace to ``(x, y, width, height)`` of the mask; the
+        returned points are then 0-based within that region, exactly like ``cv2.findContours`` on
+        the same sub-array (the region is treated as an isolated image with a zero border).
+
+        Returns the contours in OpenCV order as ``(N, 1, 2)`` ``int32`` arrays. An unsupported
+        semantic (a colour resident image, or a too-small output buffer) raises ``GpuRuntimeError``
+        with ``error_code`` set, so the caller restarts the step on the CPU reference instead of
+        receiving a partial or reinterpreted result.
+        """
+        if not self.supports_find_contours:
+            raise GpuRuntimeError("CUDA DLL has no contour trace export (vf_find_contours_u8)")
+        source = self._u8_image(mask, channels=(1,))
+        mode_code = self._contour_mode_code(mode)
+        if region is None:
+            x, y, width, height = 0, 0, int(source.shape[1]), int(source.shape[0])
+        else:
+            x, y, width, height = (int(value) for value in region)
+            if (
+                x < 0 or y < 0 or width <= 0 or height <= 0
+                or x + width > source.shape[1] or y + height > source.shape[0]
+            ):
+                raise GpuRuntimeError(
+                    f"Contour region is out of bounds: {region}, mask={source.shape}"
+                )
+        # The mask becomes the resident image, so the trace reads a device ROI with no further H2D.
+        resident = self.upload_image(source)
+        contour_count = ctypes.c_int(0)
+        point_count = ctypes.c_int(0)
+        offsets = np.empty(0, dtype=np.int32)
+        points = np.empty(0, dtype=np.int32)
+        queued = time.perf_counter()
+        with self._queue_slots, self._lock:
+            lock_acquired = time.perf_counter()
+            result = int(self._dll.vf_find_contours_u8(
+                self._context,
+                ctypes.c_uint64(resident.generation),
+                x, y, width, height, mode_code,
+                ctypes.byref(contour_count), ctypes.byref(point_count),
+            ))
+            if result == 0:
+                # The capacities are exactly what the trace reported, so a short buffer is a bug
+                # here rather than a silent truncation; the native side rejects it either way.
+                offsets = np.empty(int(contour_count.value) + 1, dtype=np.int32)
+                points = np.empty(max(int(point_count.value), 1) * 2, dtype=np.int32)
+                result = int(self._dll.vf_find_contours_download(
+                    self._context,
+                    offsets.ctypes.data_as(ctypes.POINTER(ctypes.c_int32)), int(offsets.size),
+                    points.ctypes.data_as(ctypes.POINTER(ctypes.c_int32)), int(point_count.value),
+                ))
+            completed = time.perf_counter()
+            self._record_performance(
+                "vf_find_contours_u8", int(source.nbytes),
+                int(offsets.nbytes + points.nbytes),
+                completed - lock_acquired, lock_acquired - queued,
+            )
+        if result != 0:
+            raise self._native_error("vf_find_contours_u8", result)
+        return [
+            points[int(offsets[index]) * 2 : int(offsets[index + 1]) * 2].reshape(-1, 1, 2).copy()
+            for index in range(int(contour_count.value))
+        ]
+
+    @staticmethod
+    def _contour_mode_code(mode) -> int:
+        """Map the reference's mode names or the OpenCV constants onto the native mode code."""
+        if isinstance(mode, str):
+            key = mode.strip().lower()
+            if key not in CONTOUR_MODES:
+                raise GpuRuntimeError(f"Contour mode must be one of {sorted(CONTOUR_MODES)}, got {mode!r}")
+            return CONTOUR_MODES[key]
+        code = int(mode)
+        if code not in (CUDA_CONTOURS_EXTERNAL, CUDA_CONTOURS_LIST):
+            raise GpuRuntimeError(f"Contour mode must be 0 (external) or 1 (list), got {mode!r}")
+        return code
 
     def match_template_debug_key(self) -> int:
         """Return the raw packed winning key of the last localization call (diagnostics only)."""
@@ -840,6 +933,7 @@ class GpuRuntime:
         self._load_optional_resident_roi()
         self._load_optional_roi_batch()
         self._load_optional_template_match()
+        self._load_optional_find_contours()
 
     def _load_optional_native_plan(self) -> None:
         query = getattr(self._dll, "vf_plan_query", None)
@@ -957,6 +1051,24 @@ class GpuRuntime:
             ctypes.POINTER(ctypes.c_int), ctypes.POINTER(ctypes.c_float),
         ]
         match.restype = ctypes.c_int
+
+    def _load_optional_find_contours(self) -> None:
+        trace = getattr(self._dll, "vf_find_contours_u8", None)
+        download = getattr(self._dll, "vf_find_contours_download", None)
+        if trace is not None:
+            trace.argtypes = [
+                ctypes.c_void_p, ctypes.c_uint64,
+                ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+                ctypes.POINTER(ctypes.c_int), ctypes.POINTER(ctypes.c_int),
+            ]
+            trace.restype = ctypes.c_int
+        if download is not None:
+            download.argtypes = [
+                ctypes.c_void_p,
+                ctypes.POINTER(ctypes.c_int32), ctypes.c_int,
+                ctypes.POINTER(ctypes.c_int32), ctypes.c_int,
+            ]
+            download.restype = ctypes.c_int
 
     @staticmethod
     def _native_plan_descriptor(plan, image: np.ndarray) -> tuple[_VfPlanDescV1, object]:
@@ -1207,7 +1319,10 @@ class GpuRuntime:
     def _native_error(self, function_name: str, error_code: int) -> GpuRuntimeError:
         message = f"{function_name} failed with CUDA DLL error {error_code}: {self._error_message(error_code)}"
         self._mark_device_lost_if_sticky(error_code, message)
-        return GpuRuntimeError(message)
+        error = GpuRuntimeError(message)
+        # Callers that must restart a step on the CPU reference need the code, not the text.
+        error.error_code = int(error_code)
+        return error
 
     def _mark_device_lost_if_sticky(self, error_code: int, message: str) -> None:
         if int(error_code) - CUDA_RUNTIME_ERROR_BASE not in STICKY_CUDA_ERRORS or self.device_lost_reason:
