@@ -303,6 +303,82 @@ class Detector202_1(Detector202):
                 pass
         return cv2.GaussianBlur(image_float, (kernel, kernel), sigma), "opencv_cpu"
 
+    def _residual_statistics(
+        self,
+        image_float: np.ndarray,
+        background: np.ndarray,
+        residual: np.ndarray,
+        candidate_max_value: int,
+        mad_scale: float,
+        noise_sigma_floor: float,
+        residual_threshold_floor: float,
+        residual_sigma_multiplier: float,
+    ) -> tuple[np.ndarray, float, float, float, str]:
+        """Residual central-moment threshold and candidate mask, on the device when possible.
+
+        Returns ``(candidate_mask, residual_median, mad, residual_threshold, backend)``.
+
+        The device path is one additive export, ``vf_cnr_mask_f32``: it builds the
+        residual and its absolute deviation on the device from the image and background
+        planes, computes both medians with the same bit-exact machinery as
+        ``vf_median_f32``, evaluates the threshold in double exactly as the Python does,
+        and compares in float32 (which is what NumPy does against a Python float).
+        Measured agreement is exact on every compared field - ``residual_median`` and
+        ``mad`` bit-exact, ``threshold`` double-exact and the mask byte-exact across the
+        whole equivalence sweep - so unlike the Gaussian background this step adds no
+        drift of its own.
+
+        ``residual`` is passed in because the caller needs it for the debug overlay; the
+        device path does not upload it, it only uses it on the CPU fallback.
+
+        Any missing export or device error falls back to the NumPy reference for the
+        whole step, so a failed GPU step never produces a partially device-derived mask.
+        """
+
+        runtime = getattr(self, "gpu_runtime", None)
+        if (
+            runtime is not None
+            and getattr(runtime, "available", False)
+            and getattr(runtime, "supports_cnr_mask_f32", False)
+            and self.use_gpu
+        ):
+            try:
+                device = runtime.cnr_mask_f32(
+                    image_float,
+                    background,
+                    sigma_multiplier=residual_sigma_multiplier,
+                    threshold_floor=residual_threshold_floor,
+                    absolute_floor=noise_sigma_floor,
+                    mad_scale=mad_scale,
+                    candidate_value=candidate_max_value,
+                )
+                expected_shape = (image_float.shape[0], image_float.shape[1])
+                if device["mask"].shape == expected_shape:
+                    return (
+                        device["mask"],
+                        float(device["residual_median"]),
+                        float(device["mad"]),
+                        float(device["threshold"]),
+                        "cuda_f32",
+                    )
+            except Exception:
+                pass
+
+        residual_median = self._exact_median(residual)
+        mad = self._exact_median(np.abs(residual - residual_median))
+        robust_noise_sigma = float(max(mad_scale * mad, noise_sigma_floor))
+        residual_threshold = float(
+            max(
+                residual_threshold_floor,
+                residual_sigma_multiplier * robust_noise_sigma,
+            )
+        )
+        candidate_mask = (
+            (np.abs(residual - residual_median) > residual_threshold).astype(np.uint8)
+            * candidate_max_value
+        )
+        return candidate_mask, residual_median, mad, residual_threshold, "numpy_cpu"
+
     def _automatic_cnr_mask(self, gray: np.ndarray) -> dict:
         image_float = gray.astype(np.float32)
         height, width = gray.shape[:2]
@@ -312,28 +388,32 @@ class Detector202_1(Detector202):
             image_float, background_kernel, gaussian_sigma
         )
         residual = image_float - background
-        residual_median = self._exact_median(residual)
-        mad = self._exact_median(np.abs(residual - residual_median))
         mad_scale = float(self.params.get("mad_scale", 1.4826))
         noise_sigma_floor = float(self.params.get("noise_sigma_floor", 0.000001))
-        robust_noise_sigma = float(max(mad_scale * mad, noise_sigma_floor))
         residual_threshold_floor = float(
             self.params.get("residual_threshold_floor", 8.0)
         )
         residual_sigma_multiplier = float(
             self.params.get("residual_sigma_multiplier", 3.0)
         )
-        residual_threshold = float(
-            max(
-                residual_threshold_floor,
-                residual_sigma_multiplier * robust_noise_sigma,
-            )
-        )
         candidate_max_value = int(self.params.get("candidate_max_value", 255))
-        candidate_mask = (
-            (np.abs(residual - residual_median) > residual_threshold).astype(np.uint8)
-            * candidate_max_value
+        (
+            candidate_mask,
+            residual_median,
+            mad,
+            residual_threshold,
+            mask_backend,
+        ) = self._residual_statistics(
+            image_float,
+            background,
+            residual,
+            candidate_max_value,
+            mad_scale,
+            noise_sigma_floor,
+            residual_threshold_floor,
+            residual_sigma_multiplier,
         )
+        robust_noise_sigma = float(max(mad_scale * mad, noise_sigma_floor))
         morph_operation = str(self.params.get("morph_operation", "open")).lower()
         morph_kernel = int(self.params.get("morph_kernel", 3))
         morph_iterations = int(self.params.get("morph_iterations", 1))
@@ -377,6 +457,7 @@ class Detector202_1(Detector202):
             "inclusion_mask": inclusion_mask.astype(bool),
             "background_kernel": background_kernel,
             "background_backend": background_backend,
+            "residual_backend": mask_backend,
             "gaussian_sigma": gaussian_sigma,
             "residual_median": residual_median,
             "mad": mad,
@@ -545,12 +626,15 @@ class Detector202_1(Detector202):
                 "residual_threshold": float(analysis["residual_threshold"]),
                 "background_kernel": int(analysis["background_kernel"]),
                 "background_backend": str(analysis["background_backend"]),
+                "residual_backend": str(analysis["residual_backend"]),
                 "background_precision_note": (
                     "background_backend=opencv_cpu 時背景與 OpenCV 逐位相同；"
                     "background_backend=cuda_f32 時 device 的加法順序與 OpenCV 不同，"
                     "候選遮罩與 PASS/NG 判定已實測完全相同，但 mad／residual_median／"
                     "residual_threshold／robust_noise_sigma 這四個殘差衍生診斷值會有"
-                    "尾位（約 1e-5）差異。"
+                    "尾位（約 1e-5）差異。residual_backend 則不引入任何額外差異："
+                    "cuda_f32（vf_cnr_mask_f32）的 residual_median／mad 逐位元相同、"
+                    "residual_threshold double 完全相同、候選遮罩逐位元組相同。"
                 ),
                 "background_kernel_config": {
                     "configured_size": int(

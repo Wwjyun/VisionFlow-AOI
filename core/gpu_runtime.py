@@ -209,6 +209,11 @@ class GpuRuntime:
         """Whether the float32 Gaussian export honours an explicit sigma (load-time probe)."""
         return self._capabilities.gaussian_blur_f32_sigma
 
+    @property
+    def supports_cnr_mask_f32(self) -> bool:
+        """Optional device-side 202-CS-SN-1 residual threshold and candidate mask export."""
+        return self._capabilities.cnr_mask_f32
+
     def status(self, requested: bool = False) -> dict:
         active = bool(requested and self.available and not self.last_error)
         return {
@@ -232,6 +237,7 @@ class GpuRuntime:
                 "gaussian_blur_f32": self.supports_gaussian_blur_f32,
                 "gaussian_blur_f32_roi": self.supports_gaussian_blur_f32_roi,
                 "gaussian_blur_f32_sigma": self.supports_gaussian_f32_sigma,
+                "cnr_mask_f32": self.supports_cnr_mask_f32,
             },
             "queue": {
                 "depth": self.queue_depth,
@@ -584,6 +590,118 @@ class GpuRuntime:
         if result != 0:
             raise self._native_error("vf_median_f32", result)
         return np.float32(median_value.value)
+
+    def cnr_mask_f32(
+        self,
+        image: np.ndarray,
+        background: np.ndarray,
+        *,
+        sigma_multiplier: float,
+        threshold_floor: float,
+        absolute_floor: float,
+        mad_scale: float,
+        candidate_value: int = 255,
+    ) -> dict[str, object]:
+        """Run the 202-CS-SN-1 residual threshold and candidate mask on the device.
+
+        The two operands are uploaded once each and every derived array - the residual, its absolute
+        deviation, the two exact medians, the threshold and the mask - is computed on the device, so
+        no derived array is materialised on the host. Both operands must already be float32;
+        conversion is the caller's decision, exactly as for ``median_f32`` and ``gaussian_blur_f32``.
+        Non-contiguous views are accepted and passed through by their byte strides instead of being
+        copied, so a rectangular ROI of a wider plane costs nothing extra.
+
+        Returns a mapping with the keys ``residual_median``, ``mad``, ``threshold`` and ``mask`` (the
+        shape ``execute_dag_plan`` uses for a multi-output step, so a caller names what it reads).
+        The two medians are the
+        device's bit-exact ``np.median`` of the residual and of its absolute deviation (NaN if that
+        operand held a NaN: compare NaN-aware). ``threshold`` is the double the detector's
+        ``residual_threshold`` is, and ``mask`` is a uint8 array of the same shape whose bytes equal
+        ``((np.abs(residual - residual_median) > threshold).astype(np.uint8) * candidate_value)``.
+
+        An unsupported DLL or a rejected request raises ``GpuRuntimeError`` so the caller can restart
+        the whole step on the CPU reference instead of receiving an approximate result. The native
+        document in ``gpu/include/visionflow_cuda.h`` states the exact contracts and the refusal
+        cases (null pointers, non-positive shape, a candidate value outside 0..255, a plane too large
+        for the radix-sort offset type).
+        """
+        if not self.supports_cnr_mask_f32:
+            raise GpuRuntimeError("CUDA DLL has no CNR mask export (vf_cnr_mask_f32)")
+        source = self._f32_operand(image, "vf_cnr_mask_f32")
+        reference = self._f32_operand(background, "vf_cnr_mask_f32")
+        if source.shape != reference.shape:
+            raise GpuRuntimeError(
+                f"vf_cnr_mask_f32 requires image and background of the same shape, got "
+                f"{source.shape} and {reference.shape}"
+            )
+        candidate = int(candidate_value)
+        if candidate < 0 or candidate > 255:
+            raise GpuRuntimeError(
+                f"vf_cnr_mask_f32 candidate_value must be 0..255, got {candidate_value!r}"
+            )
+        height, width = int(source.shape[0]), int(source.shape[1])
+        mask = np.empty((height, width), dtype=np.uint8)
+        residual_median = ctypes.c_float(0.0)
+        mad = ctypes.c_float(0.0)
+        threshold = ctypes.c_double(0.0)
+        input_bytes = int(source.nbytes + reference.nbytes)
+        # Only the mask plane crosses PCIe: the two medians and the threshold are decoded on the host
+        # and written straight into the ctypes scalars, so they add no transfer.
+        output_bytes = int(mask.nbytes)
+        queued = time.perf_counter()
+        with self._queue_slots, self._lock:
+            lock_acquired = time.perf_counter()
+            result = int(self._dll.vf_cnr_mask_f32(
+                self._context,
+                source.ctypes.data_as(ctypes.POINTER(ctypes.c_float)), int(source.strides[0]),
+                reference.ctypes.data_as(ctypes.POINTER(ctypes.c_float)), int(reference.strides[0]),
+                width, height,
+                ctypes.c_double(float(sigma_multiplier)),
+                ctypes.c_double(float(threshold_floor)),
+                ctypes.c_double(float(absolute_floor)),
+                ctypes.c_double(float(mad_scale)),
+                candidate,
+                ctypes.byref(residual_median), ctypes.byref(mad), ctypes.byref(threshold),
+                mask.ctypes.data_as(ctypes.POINTER(ctypes.c_uint8)),
+                ctypes.c_longlong(int(mask.size)),
+            ))
+            completed = time.perf_counter()
+            self._record_performance(
+                "vf_cnr_mask_f32", input_bytes, output_bytes,
+                completed - lock_acquired, lock_acquired - queued,
+            )
+        if result != 0:
+            raise self._native_error("vf_cnr_mask_f32", result)
+        return {
+            "residual_median": np.float32(residual_median.value),
+            "mad": np.float32(mad.value),
+            "threshold": float(threshold.value),
+            "mask": mask,
+        }
+
+    @staticmethod
+    def _f32_operand(image: np.ndarray, function_name: str) -> np.ndarray:
+        """Validate a single-channel float32 operand while preserving its byte strides.
+
+        Unlike ``_f32_image`` this does not force contiguity: the native CNR export takes byte
+        strides, so a non-contiguous ROI is passed through instead of being copied on the host. The
+        dtype must already be float32 so the caller, not this bridge, decides any narrowing.
+        """
+        array = np.asarray(image)
+        if array.dtype != np.float32:
+            raise GpuRuntimeError(
+                f"{function_name} requires float32 input, got {array.dtype}; "
+                "convert explicitly so the narrowing is the caller's decision"
+            )
+        if array.ndim != 2 or array.size == 0:
+            raise GpuRuntimeError(
+                f"{function_name} requires a non-empty 2-D single-channel image, got {array.shape}"
+            )
+        if int(array.strides[0]) < int(array.shape[1]) * 4:
+            raise GpuRuntimeError(
+                f"{function_name} requires a row-major float32 image, got strides {array.strides}"
+            )
+        return array
 
     def gaussian_blur_f32(
         self, image: np.ndarray, kernel_size: int, sigma: float = 0.0
@@ -1169,6 +1287,7 @@ class GpuRuntime:
         self._load_optional_find_contours()
         self._load_optional_exact_median()
         self._load_optional_gaussian_blur_f32()
+        self._load_optional_cnr_mask_f32()
 
     def _load_optional_native_plan(self) -> None:
         query = getattr(self._dll, "vf_plan_query", None)
@@ -1338,6 +1457,23 @@ class GpuRuntime:
             roi.restype = ctypes.c_int
         if blur is not None:
             self._gaussian_f32_sigma_supported = self._probe_gaussian_f32_sigma()
+
+    def _load_optional_cnr_mask_f32(self) -> None:
+        mask = getattr(self._dll, "vf_cnr_mask_f32", None)
+        if mask is None:
+            return
+        mask.argtypes = [
+            ctypes.c_void_p,
+            ctypes.POINTER(ctypes.c_float), ctypes.c_int,
+            ctypes.POINTER(ctypes.c_float), ctypes.c_int,
+            ctypes.c_int, ctypes.c_int,
+            ctypes.c_double, ctypes.c_double, ctypes.c_double, ctypes.c_double,
+            ctypes.c_int,
+            ctypes.POINTER(ctypes.c_float), ctypes.POINTER(ctypes.c_float),
+            ctypes.POINTER(ctypes.c_double),
+            ctypes.POINTER(ctypes.c_uint8), ctypes.c_longlong,
+        ]
+        mask.restype = ctypes.c_int
 
     @staticmethod
     def _native_plan_descriptor(plan, image: np.ndarray) -> tuple[_VfPlanDescV1, object]:

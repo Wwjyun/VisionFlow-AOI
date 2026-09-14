@@ -142,6 +142,15 @@ class GpuCapabilities:
             and getattr(self.runtime, "_gaussian_f32_sigma_supported", False)
         )
 
+    @property
+    def cnr_mask_f32(self) -> bool:
+        """Optional device-side 202-CS-SN-1 residual threshold and candidate mask.
+
+        A DLL built before this additive export exists does not export the name at all, so probing on
+        the export is enough: there is no same-name legacy variant that could ignore an argument.
+        """
+        return self.has_exports(("vf_cnr_mask_f32",))
+
 
 @dataclass(slots=True)
 class GpuResourceRegistry:

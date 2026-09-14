@@ -168,6 +168,15 @@ _DRIFTING_METADATA = {
     "robust_noise_sigma",
 }
 
+# Fields that exist precisely to say *which* backend produced the record.  They must
+# differ between the CPU and CUDA runs, so comparing them as decision-bearing would
+# report a difference on every defect and hide a real mismatch.
+_BACKEND_PROVENANCE = {
+    "background_backend",
+    "residual_backend",
+    "background_precision_note",
+}
+
 
 def _split_defects(result: dict):
     """Return ``(decision_fields, drifting_fields, worst_drift)`` for one result."""
@@ -198,6 +207,8 @@ def _split_defects(result: dict):
                 for name, value in sorted(metadata.items()):
                     if name in _DRIFTING_METADATA and isinstance(value, (int, float)):
                         drifting.append((name, float(value)))
+                    elif name in _BACKEND_PROVENANCE:
+                        continue
                     else:
                         decision.append((name, value))
     return decision, drifting, worst

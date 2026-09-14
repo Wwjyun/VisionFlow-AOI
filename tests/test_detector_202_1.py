@@ -646,5 +646,181 @@ class Detector2021BackgroundRoutingTests(unittest.TestCase):
         )
 
 
+class _FusedRuntime(_GaussianRuntime):
+    """A runtime that also offers the fused residual/mask export."""
+
+    supports_cnr_mask_f32 = True
+
+    def __init__(self, honour_sigma=True, fail_gaussian=False, fail_fused=False):
+        super().__init__(honour_sigma=honour_sigma, fail=fail_gaussian)
+        self.fail_fused = fail_fused
+        self.fused_calls = []
+        self.median_calls = 0
+
+    def median_f32(self, values):
+        self.median_calls += 1
+        return super().median_f32(values)
+
+    def cnr_mask_f32(
+        self,
+        image,
+        background,
+        *,
+        sigma_multiplier,
+        threshold_floor,
+        absolute_floor,
+        mad_scale,
+        candidate_value,
+    ):
+        self.fused_calls.append(
+            {
+                "shape": image.shape,
+                "sigma_multiplier": float(sigma_multiplier),
+                "threshold_floor": float(threshold_floor),
+                "absolute_floor": float(absolute_floor),
+                "mad_scale": float(mad_scale),
+                "candidate_value": int(candidate_value),
+            }
+        )
+        if self.fail_fused:
+            raise RuntimeError("injected detector 202-1 fused mask failure")
+        residual = image - background
+        median = float(np.median(residual))
+        mad = float(np.median(np.abs(residual - median)))
+        robust = max(mad_scale * mad, absolute_floor)
+        threshold = max(threshold_floor, sigma_multiplier * robust)
+        mask = (
+            np.abs(residual - median).astype(np.float32) > np.float32(threshold)
+        ).astype(np.uint8) * candidate_value
+        return {
+            "mask": mask,
+            "residual_median": np.float32(median),
+            "mad": np.float32(mad),
+            "threshold": float(threshold),
+        }
+
+
+class Detector2021FusedResidualRoutingTests(unittest.TestCase):
+    """The fused residual/mask export is used when present and falls back cleanly."""
+
+    @staticmethod
+    def _gray():
+        rng = np.random.default_rng(77)
+        gray = np.full((200, 260), 150, dtype=np.float64)
+        gray += rng.normal(0.0, 2.0, gray.shape)
+        gray[80:100, 120:150] = 60.0
+        return np.clip(gray, 0, 255).astype(np.uint8)
+
+    @staticmethod
+    def _params(**overrides):
+        params = {"center_mask_enabled": False, "edge_mask_enabled": False}
+        params.update(overrides)
+        return params
+
+    def test_fused_export_replaces_both_medians_and_the_host_mask(self):
+        gray = self._gray()
+        runtime = _FusedRuntime()
+        detector = Detector202_1(
+            params=self._params(), use_gpu=True, gpu_runtime=runtime
+        )
+        analysis = detector._automatic_cnr_mask(gray)
+        self.assertEqual(len(runtime.fused_calls), 1)
+        self.assertEqual(analysis["residual_backend"], "cuda_f32")
+        # The whole point of the export: no separate median uploads happen any more.
+        self.assertEqual(runtime.median_calls, 0)
+        reference = Detector202_1(params=self._params())._automatic_cnr_mask(gray)
+        np.testing.assert_array_equal(
+            analysis["candidate_mask"], reference["candidate_mask"]
+        )
+
+    def test_detector_parameters_reach_the_export(self):
+        gray = self._gray()
+        runtime = _FusedRuntime()
+        params = self._params(
+            mad_scale=2.0,
+            noise_sigma_floor=0.25,
+            residual_threshold_floor=6.0,
+            residual_sigma_multiplier=2.5,
+            candidate_max_value=200,
+        )
+        Detector202_1(
+            params=params, use_gpu=True, gpu_runtime=runtime
+        )._automatic_cnr_mask(gray)
+        call = runtime.fused_calls[0]
+        self.assertEqual(call["mad_scale"], 2.0)
+        self.assertEqual(call["absolute_floor"], 0.25)
+        self.assertEqual(call["threshold_floor"], 6.0)
+        self.assertEqual(call["sigma_multiplier"], 2.5)
+        self.assertEqual(call["candidate_value"], 200)
+
+    def test_fused_failure_falls_back_to_the_numpy_reference(self):
+        gray = self._gray()
+        runtime = _FusedRuntime(fail_fused=True)
+        analysis = Detector202_1(
+            params=self._params(), use_gpu=True, gpu_runtime=runtime
+        )._automatic_cnr_mask(gray)
+        self.assertEqual(analysis["residual_backend"], "numpy_cpu")
+        # This runtime offers no separate median export either, so the fallback is the
+        # pure NumPy reference; the point is that a fused failure still produces exactly
+        # the reference mask rather than a partially device-derived one.
+        self.assertEqual(runtime.median_calls, 0)
+        reference = Detector202_1(params=self._params())._automatic_cnr_mask(gray)
+        np.testing.assert_array_equal(
+            analysis["candidate_mask"], reference["candidate_mask"]
+        )
+        self.assertEqual(analysis["residual_median"], reference["residual_median"])
+
+    def test_fused_failure_with_a_median_export_falls_back_to_the_device_medians(self):
+        """With both exports present, a fused failure degrades to the two median calls."""
+
+        gray = self._gray()
+        runtime = _FusedRuntime(fail_fused=True)
+        runtime.supports_exact_median = True
+
+        def median_f32(values):
+            runtime.median_calls += 1
+            return np.float32(np.median(np.asarray(values, dtype=np.float32)))
+
+        runtime.median_f32 = median_f32
+        params = self._params()
+        analysis = Detector202_1(
+            params=params, use_gpu=True, gpu_runtime=runtime
+        )._automatic_cnr_mask(gray)
+        self.assertEqual(analysis["residual_backend"], "numpy_cpu")
+        self.assertGreater(runtime.median_calls, 0)
+        reference = Detector202_1(params=params)._automatic_cnr_mask(gray)
+        np.testing.assert_array_equal(
+            analysis["candidate_mask"], reference["candidate_mask"]
+        )
+
+    def test_runtime_without_the_export_keeps_the_median_path(self):
+        gray = self._gray()
+        runtime = _GaussianRuntime()
+        analysis = Detector202_1(
+            params=self._params(), use_gpu=True, gpu_runtime=runtime
+        )._automatic_cnr_mask(gray)
+        self.assertEqual(len(runtime.gaussian_calls), 1)
+        self.assertEqual(analysis["residual_backend"], "numpy_cpu")
+
+    def test_cpu_run_never_calls_the_fused_export(self):
+        gray = self._gray()
+        runtime = _FusedRuntime()
+        Detector202_1(
+            params=self._params(), use_gpu=False, gpu_runtime=runtime
+        )._automatic_cnr_mask(gray)
+        self.assertEqual(runtime.fused_calls, [])
+        self.assertEqual(runtime.median_calls, 0)
+
+    def test_reported_metadata_names_the_residual_backend(self):
+        gray = self._gray()
+        image = np.dstack([gray] * 3)
+        cpu_defect = Detector202_1(params=self._params()).run(image)["defects"][0]
+        self.assertEqual(cpu_defect["metadata"]["residual_backend"], "numpy_cpu")
+        fused_defect = Detector202_1(
+            params=self._params(), use_gpu=True, gpu_runtime=_FusedRuntime()
+        ).run(image)["defects"][0]
+        self.assertEqual(fused_defect["metadata"]["residual_backend"], "cuda_f32")
+
+
 if __name__ == "__main__":
     unittest.main()

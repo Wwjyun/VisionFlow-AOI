@@ -425,6 +425,89 @@ VF_CUDA_API int vf_gaussian_blur_f32_roi(
     float* dst, int dst_stride,
     int kernel_size, double sigma);
 
+/*
+ * Optional residual-threshold extension: the "automatic CNR mask" of 202-CS-SN-1
+ * (detectors/detector_202_1.py::_automatic_cnr_mask) reduced to the two device medians, the
+ * threshold and the candidate mask in one call, so the residual and its absolute deviation never
+ * cross PCIe.
+ *
+ * Motivation. The median export above is called twice per ROI with a *derived* operand each time:
+ * once with the residual and once with |residual - median|. For a 2000 x 12000 ROI that is two
+ * 96 MiB host-to-device uploads of arrays that only exist to feed the sort. This export uploads the
+ * operands the caller already has (the float32 image and the float32 background) and builds every
+ * derived array on the device:
+ *
+ *   residual[i] = image[i] - background[i]                      (float32 subtraction)
+ *   residual_median = np.median(residual)                       (bit-exact, see vf_median_f32)
+ *   absdev[i]   = |residual[i] - residual_median|               (float32 fabsf = np.abs sign clear)
+ *   mad         = np.median(absdev)                             (bit-exact)
+ *   robust      = max(mad_scale * mad, absolute_floor)          (Python max, in double)
+ *   threshold   = max(threshold_floor, sigma_multiplier * robust)  (Python max, in double)
+ *   out_mask[i] = (absdev[i] > threshold) ? candidate_value : 0    (strict >, in float32)
+ *
+ * Bit-exactness. The medians reuse the key/sort machinery of vf_median_f32 unchanged (monotone
+ * float32 -> uint32 order keys, cub::DeviceRadixSort, middle-key-only readback, host float32
+ * even-count average, quiet NaN when any input is a NaN), and the mask subtracts that decoded
+ * float32 value, never an approximation through the order keys. The mask comparison happens in
+ * float32 because NumPy compares a float32 array against a Python float with the scalar narrowed to
+ * the array dtype (NEP 50 weak scalar), which is also why `threshold` is computed in double and only
+ * then narrowed for the comparison: the detector holds mad as a Python float, so
+ * `mad_scale * mad`, `max(...)` and `sigma_multiplier * robust` are double operations there.
+ * Python's two-argument max is reproduced exactly (the first argument wins unless the second is
+ * strictly greater, so a NaN first argument propagates and a NaN second argument is ignored).
+ *
+ * Parameters. `image` and `background` are host pointers to single-channel row-major float32 planes
+ * of `width` x `height` pixels; `image_stride`/`background_stride` are byte strides and must be at
+ * least `width * 4`. Both planes are uploaded once each with a 2D copy and are only read. Passing
+ * the same array for both produces an exactly zero residual. `width * height` must not exceed
+ * INT_MAX (the radix-sort offset type); a larger request is refused with VF_CUDA_UNSUPPORTED so the
+ * caller can restart the step on the CPU reference.
+ *
+ * `sigma_multiplier`, `threshold_floor`, `absolute_floor` and `mad_scale` are doubles so the
+ * caller's values are never narrowed on the way in - the threshold arithmetic is a double
+ * computation in the reference. `candidate_value` is an int validated to 0..255 and is refused with
+ * VF_CUDA_INVALID_ARGUMENT otherwise (a narrower type would silently wrap).
+ *
+ * Outputs. `out_residual_median` and `out_mad` receive the two decoded float32 medians (quiet NaN if
+ * that operand held a NaN; compare NaN-aware because NaN != NaN). `out_threshold` receives the
+ * double threshold before it is narrowed for the comparison, so it is bit-identical to the
+ * detector's `residual_threshold`. `out_mask` receives `width` x `height` bytes, tightly packed, and
+ * `out_mask_capacity` must be at least `width * height`; a short buffer is refused with
+ * VF_CUDA_INVALID_ARGUMENT instead of being filled partially.
+ *
+ * Traffic for a `width` x `height` plane (N = width * height): host-to-device 2 * N * 4 bytes
+ * (image + background) and device-to-host N bytes (the mask plane; the two medians and the threshold
+ * are decoded on the host and written straight into the caller's scalars, without a further copy).
+ * The two vf_median_f32 calls this replaces also move 2 * N * 4 bytes per plane, because they upload
+ * the derived residual and its absolute deviation instead, so the isolated median stage's upload
+ * volume is unchanged: what this export removes is the two N-element host temporaries, the host
+ * arithmetic that fills them, and the surrounding stage's extra traffic. The measured numbers that
+ * quantify all three stages - this export, the isolated two-median baseline and the current detector
+ * stage - are recorded in outputs_validation/cnr_profile/cnr_mask_f32_equivalence.txt.
+ *
+ * Determinism and failure. Identical input bytes always produce identical output bytes; the two
+ * sorts and the three elementwise passes are deterministic. Null pointers, a non-positive width or
+ * height, a stride below `width * 4`, a `candidate_value` outside 0..255 and a short mask buffer are
+ * refused with VF_CUDA_INVALID_ARGUMENT before any work is launched. The scratch buffers (uploaded
+ * image and background, residual, absolute deviation, device mask) are owned by the context,
+ * grow-only, and separate from the plan, median and Gaussian scratch.
+ */
+VF_CUDA_API int vf_cnr_mask_f32(
+    void* context,
+    const float* image, int image_stride,
+    const float* background, int background_stride,
+    int width, int height,
+    double sigma_multiplier,
+    double threshold_floor,
+    double absolute_floor,
+    double mad_scale,
+    int candidate_value,
+    float* out_residual_median,
+    float* out_mad,
+    double* out_threshold,
+    unsigned char* out_mask,
+    long long out_mask_capacity);
+
 #ifdef __cplusplus
 }
 #endif

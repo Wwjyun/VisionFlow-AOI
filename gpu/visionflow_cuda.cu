@@ -133,6 +133,19 @@ struct PersistentContext {
     size_t gaussian_f32_intermediate_capacity = 0;
     float* gaussian_f32_output = nullptr;
     size_t gaussian_f32_output_capacity = 0;
+    // CNR mask scratch for the optional vf_cnr_mask_f32 export: the uploaded float32 image and
+    // background, the residual, its absolute deviation, and the device mask that is copied back.
+    // Grow-only and separate from the median and Gaussian scratch for the same reason.
+    float* cnr_mask_image = nullptr;
+    size_t cnr_mask_image_capacity = 0;
+    float* cnr_mask_background = nullptr;
+    size_t cnr_mask_background_capacity = 0;
+    float* cnr_mask_residual = nullptr;
+    size_t cnr_mask_residual_capacity = 0;
+    float* cnr_mask_absdev = nullptr;
+    size_t cnr_mask_absdev_capacity = 0;
+    unsigned char* cnr_mask_mask = nullptr;
+    size_t cnr_mask_mask_capacity = 0;
     unsigned long long allocation_count = 0;
     cudaStream_t stream = nullptr;
     cudaError_t initialization_error = cudaSuccess;
@@ -181,6 +194,11 @@ struct PersistentContext {
         visionflow_cuda::free_device(gaussian_f32_input);
         visionflow_cuda::free_device(gaussian_f32_intermediate);
         visionflow_cuda::free_device(gaussian_f32_output);
+        visionflow_cuda::free_device(cnr_mask_image);
+        visionflow_cuda::free_device(cnr_mask_background);
+        visionflow_cuda::free_device(cnr_mask_residual);
+        visionflow_cuda::free_device(cnr_mask_absdev);
+        visionflow_cuda::free_device(cnr_mask_mask);
         visionflow_cuda::free_device(resident_u8);
         for (cudaEvent_t event : timing_events) {
             if (event != nullptr) cudaEventDestroy(event);
@@ -3926,27 +3944,12 @@ float median_key_to_value(uint32_t key) {
     return value;
 }
 
-// Bit-exact np.median for a host float32 array. The full contract is documented in
-// include/visionflow_cuda.h: monotone keys, device radix sort, middle-key-only readback, and the
-// float32 even-count average on the host.
-VF_CUDA_API int vf_median_f32(
-    void* context,
-    const float* values,
-    long long count,
-    float* out_median) {
-    PersistentContext* persistent = static_cast<PersistentContext*>(context);
-    if (persistent == nullptr || values == nullptr || out_median == nullptr || count <= 0 ||
-        count > static_cast<long long>(INT_MAX)) {
-        return VF_CUDA_INVALID_ARGUMENT;
-    }
-    const int items = static_cast<int>(count);
+// Reserves the exact-median scratch for `items` values and sizes the CUB radix-sort temporary
+// storage with the same offset type the sorting calls below use. Shared by vf_median_f32 and
+// vf_cnr_mask_f32 so both exports sort through one code path and one set of grow-only buffers.
+int reserve_median_scratch(PersistentContext* persistent, int items) {
     const size_t item_count = static_cast<size_t>(items);
-
     int result = reserve_device(
-        &persistent->median_values, &persistent->median_value_capacity, item_count,
-        &persistent->allocation_count);
-    if (result != VF_CUDA_OK) return result;
-    result = reserve_device(
         &persistent->median_keys, &persistent->median_key_capacity, item_count,
         &persistent->allocation_count);
     if (result != VF_CUDA_OK) return result;
@@ -3959,33 +3962,49 @@ VF_CUDA_API int vf_median_f32(
         static_cast<size_t>(1), &persistent->allocation_count);
     if (result != VF_CUDA_OK) return result;
 
-    // Size the CUB temporary storage with the same offset type the sorting call below uses.
     size_t sort_storage_bytes = 0;
     cudaError_t error = cub::DeviceRadixSort::SortKeys(
         nullptr, sort_storage_bytes, persistent->median_keys, persistent->median_sorted_keys,
         items, 0, static_cast<int>(sizeof(uint32_t) * 8), persistent->stream);
     if (error != cudaSuccess) return cuda_result(error);
-    const size_t sort_storage_required = sort_storage_bytes;
-    if (sort_storage_required == 0) return VF_CUDA_INTERNAL_ERROR;
-    result = reserve_device(
+    if (sort_storage_bytes == 0) return VF_CUDA_INTERNAL_ERROR;
+    return reserve_device(
         &persistent->median_sort_scratch, &persistent->median_sort_scratch_capacity,
-        sort_storage_required, &persistent->allocation_count);
-    if (result != VF_CUDA_OK) return result;
+        sort_storage_bytes, &persistent->allocation_count);
+}
 
-    reset_timing(persistent, true);
-    error = cudaMemcpyAsync(
-        persistent->median_values, values, sizeof(float) * item_count, cudaMemcpyHostToDevice,
-        persistent->stream);
+// Bit-exact np.median of `items` float32 values that are already resident on the device, so the
+// operand never crosses PCIe. The full contract is documented in include/visionflow_cuda.h:
+// monotone float32 -> uint32 order keys, cub::DeviceRadixSort, middle-key-only readback, and the
+// float32 even-count average on the host. NaN presence is reported through the one-word flag and
+// decoded into a quiet NaN, mirroring NumPy's _median_nancheck.
+//
+// reserve_median_scratch() must have run for the same `items` first. `record_timing` preserves the
+// event placement vf_median_f32 has always reported (AFTER_KERNEL after the sort, AFTER_OUTPUT
+// after the middle-key readback); a caller that owns the whole timing window passes false.
+int run_device_median(
+    PersistentContext* persistent,
+    const float* device_values,
+    int items,
+    float* out_median,
+    bool record_timing) {
+    size_t sort_storage_bytes = 0;
+    cudaError_t error = cub::DeviceRadixSort::SortKeys(
+        nullptr, sort_storage_bytes, persistent->median_keys, persistent->median_sorted_keys,
+        items, 0, static_cast<int>(sizeof(uint32_t) * 8), persistent->stream);
     if (error != cudaSuccess) return cuda_result(error);
-    cudaEventRecord(persistent->timing_events[TIMING_AFTER_INPUT], persistent->stream);
+    if (sort_storage_bytes == 0 || persistent->median_sort_scratch == nullptr ||
+        persistent->median_sort_scratch_capacity < sort_storage_bytes) {
+        return VF_CUDA_INTERNAL_ERROR;
+    }
 
     error = cudaMemsetAsync(persistent->median_nan_flag, 0, sizeof(int), persistent->stream);
     if (error != cudaSuccess) return cuda_result(error);
     constexpr int MEDIAN_THREADS = 256;
     median_order_key_kernel<<<
         (items + MEDIAN_THREADS - 1) / MEDIAN_THREADS, MEDIAN_THREADS, 0, persistent->stream>>>(
-        persistent->median_values, persistent->median_keys, persistent->median_nan_flag, items);
-    result = visionflow_cuda::kernel_launch_result();
+        device_values, persistent->median_keys, persistent->median_nan_flag, items);
+    int result = visionflow_cuda::kernel_launch_result();
     if (result != VF_CUDA_OK) return result;
 
     error = cub::DeviceRadixSort::SortKeys(
@@ -3993,7 +4012,9 @@ VF_CUDA_API int vf_median_f32(
         persistent->median_sorted_keys, items, 0, static_cast<int>(sizeof(uint32_t) * 8),
         persistent->stream);
     if (error != cudaSuccess) return cuda_result(error);
-    cudaEventRecord(persistent->timing_events[TIMING_AFTER_KERNEL], persistent->stream);
+    if (record_timing) {
+        cudaEventRecord(persistent->timing_events[TIMING_AFTER_KERNEL], persistent->stream);
+    }
 
     // Only the middle one or two keys cross PCIe, plus the four-byte NaN-presence word.
     const bool even = (items % 2) == 0;
@@ -4012,10 +4033,11 @@ VF_CUDA_API int vf_median_f32(
             persistent->stream);
     }
     if (error != cudaSuccess) return cuda_result(error);
-    cudaEventRecord(persistent->timing_events[TIMING_AFTER_OUTPUT], persistent->stream);
+    if (record_timing) {
+        cudaEventRecord(persistent->timing_events[TIMING_AFTER_OUTPUT], persistent->stream);
+    }
     result = visionflow_cuda::stream_result(persistent->stream);
     if (result != VF_CUDA_OK) return result;
-    finalize_timing(persistent);
 
     if (host_nan != 0) {
         const uint32_t quiet_nan_bits = 0x7FC00000u;
@@ -4031,6 +4053,42 @@ VF_CUDA_API int vf_median_f32(
     // np.median averages the two middle values in the input dtype: a float32 add, then a float32
     // divide by two. Reproduce both operations exactly, including their overflow and rounding.
     *out_median = (low + high) / 2.0f;
+    return VF_CUDA_OK;
+}
+
+// Bit-exact np.median for a host float32 array. The operand is uploaded once into the context's
+// grow-only median buffer and the rest of the work is run_device_median(), so this export and
+// vf_cnr_mask_f32 share the key/sort machinery instead of duplicating it.
+VF_CUDA_API int vf_median_f32(
+    void* context,
+    const float* values,
+    long long count,
+    float* out_median) {
+    PersistentContext* persistent = static_cast<PersistentContext*>(context);
+    if (persistent == nullptr || values == nullptr || out_median == nullptr || count <= 0 ||
+        count > static_cast<long long>(INT_MAX)) {
+        return VF_CUDA_INVALID_ARGUMENT;
+    }
+    const int items = static_cast<int>(count);
+    const size_t item_count = static_cast<size_t>(items);
+
+    int result = reserve_device(
+        &persistent->median_values, &persistent->median_value_capacity, item_count,
+        &persistent->allocation_count);
+    if (result != VF_CUDA_OK) return result;
+    result = reserve_median_scratch(persistent, items);
+    if (result != VF_CUDA_OK) return result;
+
+    reset_timing(persistent, true);
+    cudaError_t error = cudaMemcpyAsync(
+        persistent->median_values, values, sizeof(float) * item_count, cudaMemcpyHostToDevice,
+        persistent->stream);
+    if (error != cudaSuccess) return cuda_result(error);
+    cudaEventRecord(persistent->timing_events[TIMING_AFTER_INPUT], persistent->stream);
+
+    result = run_device_median(persistent, persistent->median_values, items, out_median, true);
+    if (result != VF_CUDA_OK) return result;
+    finalize_timing(persistent);
     return VF_CUDA_OK;
 }
 
@@ -4152,4 +4210,181 @@ VF_CUDA_API int vf_gaussian_blur_f32_roi(
     if (kernel_status != VF_CUDA_OK) return kernel_status;
     return gaussian_blur_f32_device(
         persistent, src, src_stride, x, y, width, height, dst, dst_stride, kernel_size, sigma);
+}
+
+// ---- vf_cnr_mask_f32: the 202-CS-SN-1 automatic CNR mask with the residual kept on the device ----
+
+// residual[i] = image[i] - background[i]. Plain float32 subtraction, matching the NumPy
+// `image_float - background` of the reference; gpu/cuda_project.json builds with --fmad=false, so
+// nothing is contracted and the result is the IEEE round-to-nearest difference.
+__global__ void cnr_residual_kernel(
+    const float* image, const float* background, float* residual, int count) {
+    const int index = blockIdx.x * blockDim.x + threadIdx.x;
+    if (index >= count) return;
+    residual[index] = image[index] - background[index];
+}
+
+// absdev[i] = |residual[i] - residual_median|. `np.abs` on a float32 array only clears the sign bit,
+// which is exactly what fabsf does, and the subtraction is the same float32 operation the reference
+// performs against the Python float holding the decoded median.
+__global__ void cnr_absdev_kernel(
+    const float* residual, float* absdev, int count, float residual_median) {
+    const int index = blockIdx.x * blockDim.x + threadIdx.x;
+    if (index >= count) return;
+    absdev[index] = fabsf(residual[index] - residual_median);
+}
+
+// mask[i] = (absdev[i] > threshold) ? candidate_value : 0. The comparison is the strict `>` of
+// `np.abs(residual - residual_median) > residual_threshold`, performed in float32 because NumPy
+// narrows the Python float scalar to the array dtype. Reading the absolute deviation that the
+// previous pass already computed is the same value the reference compares.
+__global__ void cnr_mask_kernel(
+    const float* absdev, unsigned char* mask, int count, float threshold,
+    unsigned char candidate_value) {
+    const int index = blockIdx.x * blockDim.x + threadIdx.x;
+    if (index >= count) return;
+    mask[index] = absdev[index] > threshold ? candidate_value : static_cast<unsigned char>(0);
+}
+
+// Python's two-argument max(): the first argument is returned unless the second is strictly greater.
+// That keeps a NaN first argument (Python's max propagates it) and ignores a NaN second argument,
+// which is what the detector's threshold expressions rely on: `max(mad_scale * mad, noise_floor)`
+// is NaN when the operand holds a NaN, while `max(residual_threshold_floor, ...)` then falls back to
+// the floor. fmax/fmaxf would resolve both the other way.
+double python_max(double first, double second) { return second > first ? second : first; }
+
+// The residual central-moment threshold and candidate mask of 202-CS-SN-1, one additive ABI v1
+// export. The full contract is documented in include/visionflow_cuda.h.
+VF_CUDA_API int vf_cnr_mask_f32(
+    void* context,
+    const float* image, int image_stride,
+    const float* background, int background_stride,
+    int width, int height,
+    double sigma_multiplier,
+    double threshold_floor,
+    double absolute_floor,
+    double mad_scale,
+    int candidate_value,
+    float* out_residual_median,
+    float* out_mad,
+    double* out_threshold,
+    unsigned char* out_mask,
+    long long out_mask_capacity) {
+    PersistentContext* persistent = static_cast<PersistentContext*>(context);
+    if (persistent == nullptr || image == nullptr || background == nullptr ||
+        out_residual_median == nullptr || out_mad == nullptr || out_threshold == nullptr ||
+        out_mask == nullptr) {
+        return VF_CUDA_INVALID_ARGUMENT;
+    }
+    if (width <= 0 || height <= 0 ||
+        width > INT_MAX / static_cast<int>(sizeof(float))) {
+        return VF_CUDA_INVALID_ARGUMENT;
+    }
+    const int minimum_stride = width * static_cast<int>(sizeof(float));
+    if (image_stride < minimum_stride || background_stride < minimum_stride) {
+        return VF_CUDA_INVALID_ARGUMENT;
+    }
+    if (candidate_value < 0 || candidate_value > 255) return VF_CUDA_INVALID_ARGUMENT;
+    const long long requested =
+        static_cast<long long>(width) * static_cast<long long>(height);
+    // The radix sort indexes with a signed 32-bit offset, so a larger plane cannot be sorted here;
+    // report it as unsupported so the caller restarts the step on the CPU reference.
+    if (requested > static_cast<long long>(INT_MAX)) return VF_CUDA_UNSUPPORTED;
+    if (out_mask_capacity < requested) return VF_CUDA_INVALID_ARGUMENT;
+
+    const int items = static_cast<int>(requested);
+    const size_t item_count = static_cast<size_t>(items);
+    int result = reserve_device(
+        &persistent->cnr_mask_image, &persistent->cnr_mask_image_capacity, item_count,
+        &persistent->allocation_count);
+    if (result != VF_CUDA_OK) return result;
+    result = reserve_device(
+        &persistent->cnr_mask_background, &persistent->cnr_mask_background_capacity, item_count,
+        &persistent->allocation_count);
+    if (result != VF_CUDA_OK) return result;
+    result = reserve_device(
+        &persistent->cnr_mask_residual, &persistent->cnr_mask_residual_capacity, item_count,
+        &persistent->allocation_count);
+    if (result != VF_CUDA_OK) return result;
+    result = reserve_device(
+        &persistent->cnr_mask_absdev, &persistent->cnr_mask_absdev_capacity, item_count,
+        &persistent->allocation_count);
+    if (result != VF_CUDA_OK) return result;
+    result = reserve_device(
+        &persistent->cnr_mask_mask, &persistent->cnr_mask_mask_capacity, item_count,
+        &persistent->allocation_count);
+    if (result != VF_CUDA_OK) return result;
+    result = reserve_median_scratch(persistent, items);
+    if (result != VF_CUDA_OK) return result;
+
+    reset_timing(persistent, true);
+    const size_t row_bytes = static_cast<size_t>(width) * sizeof(float);
+    cudaError_t error = cudaMemcpy2DAsync(
+        persistent->cnr_mask_image, row_bytes, image, static_cast<size_t>(image_stride),
+        row_bytes, static_cast<size_t>(height), cudaMemcpyHostToDevice, persistent->stream);
+    if (error == cudaSuccess) {
+        error = cudaMemcpy2DAsync(
+            persistent->cnr_mask_background, row_bytes, background,
+            static_cast<size_t>(background_stride), row_bytes, static_cast<size_t>(height),
+            cudaMemcpyHostToDevice, persistent->stream);
+    }
+    if (error != cudaSuccess) return cuda_result(error);
+    cudaEventRecord(persistent->timing_events[TIMING_AFTER_INPUT], persistent->stream);
+
+    constexpr int CNR_THREADS = 256;
+    const unsigned int blocks = static_cast<unsigned int>(
+        (static_cast<long long>(items) + CNR_THREADS - 1) / CNR_THREADS);
+    cnr_residual_kernel<<<blocks, CNR_THREADS, 0, persistent->stream>>>(
+        persistent->cnr_mask_image, persistent->cnr_mask_background,
+        persistent->cnr_mask_residual, items);
+    result = visionflow_cuda::kernel_launch_result();
+    if (result != VF_CUDA_OK) return result;
+
+    float residual_median = 0.0f;
+    result = run_device_median(
+        persistent, persistent->cnr_mask_residual, items, &residual_median, false);
+    if (result != VF_CUDA_OK) return result;
+
+    cnr_absdev_kernel<<<blocks, CNR_THREADS, 0, persistent->stream>>>(
+        persistent->cnr_mask_residual, persistent->cnr_mask_absdev, items, residual_median);
+    result = visionflow_cuda::kernel_launch_result();
+    if (result != VF_CUDA_OK) return result;
+
+    float mad = 0.0f;
+    result = run_device_median(persistent, persistent->cnr_mask_absdev, items, &mad, false);
+    if (result != VF_CUDA_OK) return result;
+
+    // The detector holds both medians as Python floats, so every remaining operation in
+    // _automatic_cnr_mask is a double computation: `mad_scale * mad`, the two Python max() calls and
+    // `residual_sigma_multiplier * robust_noise_sigma`. Reproducing that nesting in double keeps the
+    // threshold bit-identical; the mask then narrows it to float32 for the comparison, which is what
+    // NumPy does with a Python float operand.
+    const double robust_noise_sigma = python_max(mad_scale * static_cast<double>(mad), absolute_floor);
+    const double residual_threshold =
+        python_max(threshold_floor, sigma_multiplier * robust_noise_sigma);
+    const float threshold_f32 = static_cast<float>(residual_threshold);
+    cnr_mask_kernel<<<blocks, CNR_THREADS, 0, persistent->stream>>>(
+        persistent->cnr_mask_absdev, persistent->cnr_mask_mask, items, threshold_f32,
+        static_cast<unsigned char>(candidate_value));
+    result = visionflow_cuda::kernel_launch_result();
+    if (result != VF_CUDA_OK) return result;
+    // AFTER_KERNEL covers the whole device pipeline of this export, including the two median
+    // readbacks (the sort keys must reach the host to be decoded), so kernel_ms here is the device
+    // cost of the complete step rather than a single kernel launch.
+    cudaEventRecord(persistent->timing_events[TIMING_AFTER_KERNEL], persistent->stream);
+
+    const size_t mask_row_bytes = static_cast<size_t>(width);
+    error = cudaMemcpy2DAsync(
+        out_mask, mask_row_bytes, persistent->cnr_mask_mask, mask_row_bytes, mask_row_bytes,
+        static_cast<size_t>(height), cudaMemcpyDeviceToHost, persistent->stream);
+    if (error != cudaSuccess) return cuda_result(error);
+    cudaEventRecord(persistent->timing_events[TIMING_AFTER_OUTPUT], persistent->stream);
+    result = visionflow_cuda::stream_result(persistent->stream);
+    if (result != VF_CUDA_OK) return result;
+    finalize_timing(persistent);
+
+    *out_residual_median = residual_median;
+    *out_mad = mad;
+    *out_threshold = residual_threshold;
+    return VF_CUDA_OK;
 }
