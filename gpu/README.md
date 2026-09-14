@@ -109,6 +109,10 @@ ROI、coordinate batches、context reuse、4K benchmark 與 persistent-plan stre
   必須恢復 CUDA 且不得沿用上一張的 fallback 狀態。
 - `device_oom`：配置超過專用＋共用 GPU 記憶體的 ROI batch 取得真實 OOM，之後同一
   context 的小批次與 resident plan 必須立即成功並與 CPU 相同。
+- `sticky_context`：隔離子程序以 NVRTC 編譯故意越界寫入的 kernel，產生真實 CUDA 700
+  illegal address。runtime 收到 sticky 錯誤碼（214、220、226、700、702、709、710、714～719）
+  後標記 CUDA context 損毀：該次 Detector 整顆 CPU 重跑，之後同一程序不再呼叫 CUDA，
+  `gpu.mode: auto` 回報需重新啟動的原因，`gpu.mode: cuda` 明確失敗。
 - `--vram-pressure`：另一個程序佔住可用專用 VRAM。Windows 驅動預設的 CUDA sysmem
   fallback 會讓配置溢出到共用記憶體而非回傳 OOM，因此此項驗證結果等價與時間變化，
   不代表 OOM 失敗路徑。

@@ -226,12 +226,14 @@ class BaseDetector:
         previous_preprocess_cache = self._active_preprocess_cache
         self._active_device_roi = device_roi
         self._active_preprocess_cache = preprocess_cache
+        # A sticky CUDA failure makes the runtime unavailable mid-run; the attempt still restarts on CPU.
+        gpu_attempted = self.gpu_active
         try:
             try:
                 processed = self.preprocess(image)
                 defects = self.detect(processed)
             except Exception as exc:
-                if not self.gpu_active or not self._gpu_fallback_enabled:
+                if not gpu_attempted or not self._gpu_fallback_enabled:
                     raise
                 self.gpu_fallback_reason = str(exc)
                 self._active_device_roi = None

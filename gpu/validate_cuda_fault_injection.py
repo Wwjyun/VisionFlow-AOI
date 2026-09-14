@@ -5,6 +5,8 @@ Scenarios (no fake DLL):
 - kernel_launch_error: a 1-pixel-wide image taller than 65535 * BLOCK_Y rows makes the
   CUDA kernel grid invalid, so the launch itself fails inside the real DLL.
 - device_oom: a ROI batch whose device allocation exceeds dedicated + shared GPU memory.
+- sticky_context: child process corrupts its primary CUDA context with an NVRTC kernel that
+  writes to an invalid device address (CUDA 700); CUDA must stay disabled until restart.
 - vram_pressure (opt-in): a separate process holds the free dedicated VRAM while plans run.
 
 Each scenario checks CPU-equivalent results, whole-detector fallback metadata and that the
@@ -57,7 +59,7 @@ def parse_args() -> argparse.Namespace:
                         help="Also hold free dedicated VRAM from another process while plans run.")
     parser.add_argument("--repetitions", type=int, default=10)
     parser.add_argument("--json-output")
-    parser.add_argument("--child", choices=["init-failure", "vram-hog"], help=argparse.SUPPRESS)
+    parser.add_argument("--child", choices=["init-failure", "vram-hog", "sticky-context"], help=argparse.SUPPRESS)
     return parser.parse_args()
 
 
@@ -115,15 +117,7 @@ def _synthetic_bgr(height: int, width: int, seed: int) -> np.ndarray:
 
 
 def scenario_init_failure(dll: str) -> dict:
-    environment = dict(os.environ, CUDA_VISIBLE_DEVICES="-1")
-    completed = subprocess.run(
-        [sys.executable, str(Path(__file__).resolve()), "--child", "init-failure", "--dll", dll],
-        cwd=ROOT, env=environment, capture_output=True, text=True, timeout=600,
-    )
-    lines = [line for line in completed.stdout.splitlines() if line.startswith("{")]
-    if completed.returncode != 0 or not lines:
-        raise AssertionError(f"init-failure child failed ({completed.returncode}): {completed.stderr[-2000:]}")
-    payload = json.loads(lines[-1])
+    payload = _run_child("init-failure", dll, dict(os.environ, CUDA_VISIBLE_DEVICES="-1"))
     print(f"PASS init_failure: {payload}")
     return payload
 
@@ -280,6 +274,112 @@ def scenario_device_oom(dll: str) -> dict:
     return payload
 
 
+def _run_child(mode: str, dll: str, environment: dict | None = None) -> dict:
+    child_environment = dict(environment or os.environ, PYTHONIOENCODING="utf-8")
+    completed = subprocess.run(
+        [sys.executable, str(Path(__file__).resolve()), "--child", mode, "--dll", dll],
+        cwd=ROOT, env=child_environment, capture_output=True, text=True,
+        encoding="utf-8", errors="replace", timeout=900,
+    )
+    lines = [line for line in completed.stdout.splitlines() if line.startswith("{")]
+    if completed.returncode != 0 or not lines:
+        raise AssertionError(f"{mode} child failed ({completed.returncode}): {completed.stderr[-3000:]}")
+    return json.loads(lines[-1])
+
+
+def _inject_illegal_address() -> int:
+    """Corrupt this process's primary CUDA context with a real out-of-bounds kernel write."""
+    toolkit = Path(os.environ["CUDA_PATH"]) / "bin" / "x64"
+    os.add_dll_directory(str(toolkit))
+    nvrtc_path = next(path for path in toolkit.glob("nvrtc64_*.dll") if "builtins" not in path.name)
+    nvrtc = ctypes.CDLL(str(nvrtc_path))
+    driver = ctypes.WinDLL("nvcuda.dll")
+    program = ctypes.c_void_p()
+    source = b'extern "C" __global__ void corrupt(unsigned char* p) { p[123] = 1; }'
+    _check(nvrtc.nvrtcCreateProgram(ctypes.byref(program), source, b"corrupt.cu", 0, None, None) == 0,
+           "nvrtcCreateProgram failed")
+    options = (ctypes.c_char_p * 1)(b"-arch=sm_86")
+    _check(nvrtc.nvrtcCompileProgram(program, 1, options) == 0, "nvrtcCompileProgram failed")
+    size = ctypes.c_size_t()
+    nvrtc.nvrtcGetPTXSize(program, ctypes.byref(size))
+    image = ctypes.create_string_buffer(size.value)
+    nvrtc.nvrtcGetPTX(program, image)
+    device, context = ctypes.c_int(), ctypes.c_void_p()
+    module, function = ctypes.c_void_p(), ctypes.c_void_p()
+    for name, result in (
+        ("cuInit", driver.cuInit(0)),
+        ("cuDeviceGet", driver.cuDeviceGet(ctypes.byref(device), 0)),
+        ("cuDevicePrimaryCtxRetain", driver.cuDevicePrimaryCtxRetain(ctypes.byref(context), device)),
+        ("cuCtxSetCurrent", driver.cuCtxSetCurrent(context)),
+        ("cuModuleLoadData", driver.cuModuleLoadData(ctypes.byref(module), image)),
+        ("cuModuleGetFunction", driver.cuModuleGetFunction(ctypes.byref(function), module, b"corrupt")),
+    ):
+        _check(result == 0, f"{name} failed with {result}")
+    invalid_pointer = ctypes.c_void_p(0x10)
+    arguments = (ctypes.c_void_p * 1)(ctypes.addressof(invalid_pointer))
+    _check(driver.cuLaunchKernel(function, 1, 1, 1, 1, 1, 1, 0, None, arguments, None) == 0,
+           "cuLaunchKernel failed")
+    return int(driver.cuCtxSynchronize())
+
+
+def scenario_sticky_context(dll: str) -> dict:
+    payload = _run_child("sticky-context", dll)
+    print(f"PASS sticky_context: {json.dumps(payload, ensure_ascii=False)}")
+    return payload
+
+
+def child_sticky_context(dll: str) -> dict:
+    image = _synthetic_bgr(512, 640, seed=51)
+    manager = DetectorManager()
+    cpu = _without_execution(manager.create(DETECTOR_ID).run(image))
+    tile = {"mode": "grid", "width": 256, "height": 256, "overlap_x": 0, "overlap_y": 0}
+    runs = []
+    with tempfile.TemporaryDirectory(prefix="visionflow_fault_sticky_") as temporary:
+        folder = Path(temporary)
+        image_path = _write_image(folder / "input.png", image)
+        cpu_recipe = _write_recipe(folder / "cpu.yaml", _recipe({"mode": "cpu", "dll_path": dll}, tile, False))
+        auto_recipe = _write_recipe(folder / "auto.yaml", _recipe(
+            {"mode": "auto", "dll_path": dll, "fallback_to_cpu": True}, tile, True))
+        strict_recipe = _write_recipe(folder / "strict.yaml", _recipe({"mode": "cuda", "dll_path": dll}, tile, True))
+        cpu_result = _normalized_pipeline(AOIPipeline(cpu_recipe, folder / "cpu").run(image_path))
+        session = GpuExecutionSession.from_recipe_path(auto_recipe)
+        runtime = session.runtime
+        try:
+            def pipeline_run(label: str) -> dict:
+                calls_before = runtime.performance_stats()["call_count"]
+                result = AOIPipeline(auto_recipe, folder / label, gpu_session=session).run(image_path)
+                _check(_normalized_pipeline(result) == cpu_result, f"{label}: session pipeline differs from CPU")
+                status = result["execution"]["gpu"]["detectors"][DETECTOR_ID]
+                entry = {"run": label, "detector_active": status["active"],
+                         "fallback_reason": status["fallback_reason"],
+                         "cuda_calls": runtime.performance_stats()["call_count"] - calls_before}
+                runs.append(entry)
+                return entry
+
+            healthy = pipeline_run("healthy")
+            _check(healthy["detector_active"] and healthy["cuda_calls"] > 0, f"healthy run did not use CUDA: {healthy}")
+            sync_error = _inject_illegal_address()
+            _check(sync_error in {700, 719}, f"injection did not produce a sticky CUDA error: {sync_error}")
+            failed = pipeline_run("sticky_failure")
+            _check("error 17" in failed["fallback_reason"], f"sticky failure was not reported: {failed}")
+            _check(not runtime.available and runtime.device_lost_reason, "runtime still reports CUDA available")
+            after = pipeline_run("after_device_lost")
+            _check(after["cuda_calls"] == 0 and "重新啟動" in after["fallback_reason"],
+                   f"runtime retried CUDA after device loss: {after}")
+            detector = manager.create(DETECTOR_ID, use_gpu=True, gpu_runtime=runtime).run(image)
+            _check(_without_execution(detector) == cpu, "detector after device loss differs from CPU")
+        finally:
+            session.close()
+        strict_error = ""
+        try:
+            AOIPipeline(strict_recipe, folder / "strict").run(image_path)
+        except GpuRuntimeError as exc:
+            strict_error = str(exc)
+        _check("error 1700" in strict_error or "error 1719" in strict_error,
+               f"strict CUDA mode did not fail explicitly after device loss: {strict_error!r}")
+    return {"sync_error": sync_error, "pipeline_runs": runs, "strict_error": strict_error}
+
+
 def _cudart():
     return ctypes.CDLL(str(Path(os.environ["CUDA_PATH"]) / "bin" / "x64" / "cudart64_13.dll"))
 
@@ -366,6 +466,9 @@ def main() -> int:
     if args.child == "vram-hog":
         child_vram_hog()
         return 0
+    if args.child == "sticky-context":
+        print(json.dumps(child_sticky_context(args.dll), ensure_ascii=False))
+        return 0
     probe = GpuRuntime(args.dll, fallback_to_cpu=False)
     if not probe.available:
         raise SystemExit(f"CUDA DLL unavailable: {probe.unavailable_reason}")
@@ -377,6 +480,7 @@ def main() -> int:
         "init_failure": scenario_init_failure(args.dll),
         "kernel_launch_error": scenario_kernel_launch_error(args.dll),
         "device_oom": scenario_device_oom(args.dll),
+        "sticky_context": scenario_sticky_context(args.dll),
     }
     if args.vram_pressure:
         report["vram_pressure"] = scenario_vram_pressure(args.dll, max(1, args.repetitions))
@@ -384,7 +488,7 @@ def main() -> int:
         output = Path(args.json_output)
         output.parent.mkdir(parents=True, exist_ok=True)
         output.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
-    print("PASS CUDA fault injection: init failure, kernel launch error and device OOM recovered")
+    print("PASS CUDA fault injection: init failure, kernel launch error, device OOM and sticky context handled")
     return 0
 
 

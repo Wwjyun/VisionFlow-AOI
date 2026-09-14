@@ -133,6 +133,7 @@ class _NativePlanDll(_FusedDll):
         self.plan_execute_calls = 0
         self.plan_output_shapes = {}
         self.fail_next_plan_execute = False
+        self.plan_execute_failure_code = 2
         self.vf_plan_query = _Function(self._query)
         self.vf_plan_create = _Function(self._plan_create)
         self.vf_plan_execute = _Function(self._plan_execute)
@@ -165,7 +166,7 @@ class _NativePlanDll(_FusedDll):
         self.plan_execute_calls += 1
         if self.fail_next_plan_execute:
             self.fail_next_plan_execute = False
-            return 2
+            return self.plan_execute_failure_code
         handle = plan.value if hasattr(plan, "value") else int(plan)
         output_height = self.plan_output_shapes.get(handle, (int(height), 0))[0]
         ctypes.memset(dst, 0, output_height * int(dst_stride))
@@ -562,6 +563,60 @@ class GpuRuntimeMetricsTests(unittest.TestCase):
         self.assertEqual(dll.plan_execute_calls, 2)
         self.assertEqual(len(runtime._native_plans), 1)
 
+    def test_sticky_cuda_error_disables_runtime_until_restart(self):
+        runtime = GpuRuntime(enabled=False)
+        dll = _NativePlanDll()
+        runtime._dll = dll
+        runtime.device_count = 1
+        runtime._load_optional_context()
+        plan = PreprocessPlan((Gray(),), name="sticky_device_loss")
+        image = np.zeros((4, 5, 3), dtype=np.uint8)
+        dll.fail_next_plan_execute = True
+        dll.plan_execute_failure_code = 1700
+
+        with self.assertRaisesRegex(GpuRuntimeError, "error 1700"):
+            runtime.execute_plan(image, plan)
+
+        self.assertFalse(runtime.available)
+        self.assertFalse(runtime.supports_native_plan)
+        self.assertIn("重新啟動", runtime.unavailable_reason)
+        self.assertIn("error 1700", runtime.device_lost_reason)
+        status = runtime.status(requested=True)
+        self.assertFalse(status["active"])
+        self.assertEqual(status["fallback_reason"], runtime.device_lost_reason)
+        runtime.clear_recoverable_error()
+        self.assertFalse(runtime.available)
+        with self.assertRaisesRegex(GpuRuntimeError, "重新啟動"):
+            runtime.bgr_to_gray(image)
+        self.assertEqual(dll.plan_execute_calls, 1)
+
+    def test_non_sticky_cuda_errors_keep_runtime_available(self):
+        for code in (1001, 1002, 1999, 2):
+            runtime = GpuRuntime(enabled=False)
+            dll = _NativePlanDll()
+            runtime._dll = dll
+            runtime.device_count = 1
+            runtime._load_optional_context()
+            dll.fail_next_plan_execute = True
+            dll.plan_execute_failure_code = code
+            with self.assertRaises(GpuRuntimeError):
+                runtime.execute_plan(np.zeros((4, 5, 3), dtype=np.uint8), PreprocessPlan((Gray(),), name="x"))
+            self.assertTrue(runtime.available, code)
+            self.assertEqual(runtime.device_lost_reason, "")
+
+    def test_sticky_context_creation_failure_marks_device_lost(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            dll_path = Path(temporary) / "visionflow_cuda.dll"
+            dll_path.write_bytes(b"fake")
+            with patch(
+                "core.gpu_runtime.ctypes.CDLL",
+                return_value=_LoadScenarioDll(context_result=1700),
+            ):
+                runtime = GpuRuntime(dll_path, enabled=True)
+
+        self.assertFalse(runtime.available)
+        self.assertIn("context creation failed with error 1700", runtime.unavailable_reason)
+
     def test_context_reuse_matrix_covers_shape_channel_and_parameter_changes(self):
         runtime = GpuRuntime(enabled=False)
         dll = _NativePlanDll()
@@ -827,6 +882,29 @@ class DetectorNativeRoutingTests(unittest.TestCase):
         self.assertFalse(result["execution"]["gpu_active"])
         self.assertEqual(result["execution"]["preprocess_capability"]["route"], "fallback")
         self.assertIn("injected native plan failure", result["execution"]["fallback_reason"])
+
+    def test_sticky_native_failure_routes_later_detectors_to_cpu_without_cuda_calls(self):
+        runtime = GpuRuntime(enabled=False)
+        dll = _NativePlanDll()
+        runtime._dll = dll
+        runtime.device_count = 1
+        runtime._load_optional_context()
+        dll.fail_next_plan_execute = True
+        dll.plan_execute_failure_code = 1700
+        image = np.random.default_rng(700).integers(0, 256, (32, 40, 3), dtype=np.uint8)
+        reference = Detector401(params=self._params()).run(image)
+
+        first = Detector401(params=self._params(), use_gpu=True, gpu_runtime=runtime).run(image)
+        calls_after_failure = dll.plan_execute_calls
+        later_detector = Detector401(params=self._params(), use_gpu=True, gpu_runtime=runtime)
+        later = later_detector.run(image)
+
+        self.assertIn("error 1700", first["execution"]["fallback_reason"])
+        self.assertEqual(first["defects"], reference["defects"])
+        self.assertFalse(later["execution"]["gpu_active"])
+        self.assertIn("重新啟動", later["execution"]["fallback_reason"])
+        self.assertEqual(later["defects"], reference["defects"])
+        self.assertEqual(dll.plan_execute_calls, calls_after_failure)
 
     def test_native_plan_failure_restarts_on_cpu_from_resident_tile_view(self):
         source = np.random.default_rng(401).integers(0, 256, (72, 96, 3), dtype=np.uint8)

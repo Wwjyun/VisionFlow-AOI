@@ -101,7 +101,7 @@
 - [x] 將 CUDA stream、morphology ping-pong 與所有 plan scratch 納入同一 context。
 - [x] monitor/batch 跨多張影像重用同一個長生命週期 `GpuRuntime`/context。
 - [x] 測試尺寸增減、channel 切換、參數改變、CUDA error/OOM 後的重用與釋放。（validator 覆蓋 shape grow/shrink、1/3 channel、參數切換與 warm allocation plateau；2026-09-14 RTX 3090 真實 launch error 後 context allocation 不再增加、真實 OOM 後連續三次小批次／resident plan 與 CPU 相同且 allocation count 不變、失敗 batch 不留下 native handle）
-- [ ] 偵測 sticky CUDA context error（例如 illegal memory access）後，明確停用或重建共用 `GpuExecutionSession`，並以 GUI／監控狀態提示重新啟動；目前每次 run 仍會嘗試 CUDA 後整顆 Detector CPU fallback，結果正確但會重複失敗。需在 RTX 以隔離子程序注入驗證。
+- [x] 偵測 sticky CUDA context error（例如 illegal memory access）後，明確停用或重建共用 `GpuExecutionSession`，並以 GUI／監控狀態提示重新啟動；目前每次 run 仍會嘗試 CUDA 後整顆 Detector CPU fallback，結果正確但會重複失敗。需在 RTX 以隔離子程序注入驗證。（2026-09-14：同一程序內重建無法恢復 primary context，因此 runtime 標記 CUDA 損毀並停用至重新啟動；RTX 3090 以 NVRTC 越界 kernel 實測 CUDA 700 通過）
 - [ ] 評估 Windows 驅動預設 CUDA sysmem fallback：佔滿專用 VRAM 時配置溢出到共用記憶體而不回傳 OOM（2026-09-14 4K plan 結果等價、新 context 首次 51 ms），需以正式大圖／批次量測溢出後的端到端延遲，決定是否以 `recommended_roi_batch_size`／監控告警限制專用 VRAM 使用量。
 - [ ] 評估 `cudaMallocAsync`/memory pool；只有相容且實測有收益時採用。
 
@@ -413,6 +413,8 @@
 - [ ] 加速不得犧牲 GUI 回應、打包啟動、結果追溯、錯誤訊息或 CPU fallback。
 
 ## 完成紀錄
+
+- [x] 2026-09-14：處理 sticky CUDA context error。RTX 3090 實測（隔離子程序以 NVRTC 編譯故意寫入無效 device 位址的 kernel，`cuCtxSynchronize` 回傳 700）確認 sticky 錯誤後原 runtime 每次呼叫都回 1700，同一程序新建 runtime 也因 context 建立失敗而無法恢復，但舊版 `available` 仍為 True、每張圖都會重試並失敗。`GpuRuntime` 將所有 native 失敗集中到 `_native_error()`，遇到 cudaError 214、220、226、700、702、709、710、714～719（999 不視為 sticky）即設定 `device_lost_reason`，`available`／所有 optional capability 轉為 False，原因以繁中提示需重新啟動程式並保留原始錯誤；session 的每 run 可恢復錯誤清除不會解除此狀態。另修正 `BaseDetector.run()` 改以本次開始時是否嘗試 GPU 決定 CPU 重跑，避免 runtime 在同一次 run 中轉為不可用時把例外往外拋。`validate_cuda_fault_injection.py` 新增 `sticky_context`：共用 session 的健康 run 使用 7 次 CUDA 呼叫、注入後的 run 僅 1 次呼叫即整顆 Detector CPU 重跑、下一次 run 0 次 CUDA 呼叫，三次 Pipeline 結果皆與 CPU 模式相同，strict `gpu.mode: cuda` 明確回報損毀原因；子程序輸出改用 UTF-8。新增 fake DLL 測試覆蓋 sticky 標記、非 sticky 碼（1001／1002／1999）維持可用、context 建立 1700 與後續 Detector 零呼叫 CPU 路由。完整 345 tests、fault injection（init failure、kernel launch error、device OOM、sticky context）、compileall、CUDA preflight、CLI 合成 NG（預期 exit 2）與 `git diff --check` 通過；未修改 CUDA source／ABI／DLL。
 
 - [x] 2026-09-14：完成 CUDA Gaussian shared-memory tile／halo 實測並改採內部快速路徑。先依 5×5 morphology 模式實作單次 launch 的 block-local tile（reflect101 載入 halo、水平與垂直 pass 皆在 shared memory，radius≤32），27 組 512²／4K／2300×12000 ROI、1／3 通道、kernel 3～45 的輸出 SHA 與舊版完全相同，但 CUDA event 時間全面約慢 2 倍（4K 單通道 k45 1.145→2.179 ms、大 ROI 3 通道 k45 10.3→21.5 ms），因此移除不採用。改在原兩段式 kernel 對不需邊界反射的內部像素使用連續視窗、無 `reflect101` 分支的快速路徑，邊界像素維持原公式；同一程序交錯 A/B 各 10 輪：4K 單通道 k45 1.23→0.68 ms（9/10）、4K 3 通道 k45 3.16→1.74 ms（10/10）、4K 3 通道 k15 1.18→0.84 ms（8/10）、2300×12000 ROI 單通道 k45 3.59→2.06 ms、3 通道 k45 10.28→5.42 ms（皆 10/10），kernel 3～11 差異在雜訊範圍，所有輸出與 CPU OpenCV 0 差異。linear／DAG plan、stateless primitive 與 401-2 fused adapter 共用同一 kernels；stateless 4K k45 含傳輸 median 6.05 ms（CPU 12.23 ms）。以 CUDA 13.3、VS 18、`sm_86` 重編 DLL，native smoke、完整 validator（含 `--resize-area-pipeline`、benchmark、crossover、morphology profile、10／100／1000 stress）、fault injection、341 tests、compileall、CUDA preflight 與 `git diff --check` 均通過。512² tile 的 k45 kernel 僅約 0.09→0.08 ms，正式 Recipe 真圖收益另列待辦；ABI 未變。
 

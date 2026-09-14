@@ -27,6 +27,11 @@ class GpuRuntimeError(RuntimeError):
     pass
 
 
+CUDA_RUNTIME_ERROR_BASE = 1000
+# cudaError_t values that leave the process CUDA context unusable until the process exits.
+STICKY_CUDA_ERRORS = frozenset({214, 220, 226, 700, 702, 709, 710, 714, 715, 716, 717, 718, 719})
+
+
 @dataclass(frozen=True, slots=True)
 class GpuResidentImage:
     runtime: object
@@ -128,6 +133,7 @@ class GpuRuntime:
         self.device_name = ""
         self.compute_capability = ""
         self.unavailable_reason = ""
+        self.device_lost_reason = ""
         self.last_error = ""
         self.fused_unavailable_reason = ""
         self.native_plan_unavailable_reason = ""
@@ -141,7 +147,7 @@ class GpuRuntime:
 
     @property
     def available(self) -> bool:
-        return self._dll is not None and self.device_count > 0
+        return self._dll is not None and self.device_count > 0 and not self.device_lost_reason
 
     @property
     def backend(self) -> str:
@@ -330,9 +336,7 @@ class GpuRuntime:
                 lock_acquired - queued,
             )
         if result != 0:
-            raise GpuRuntimeError(
-                f"{function_name} failed with CUDA DLL error {result}: {self._error_message(result)}"
-            )
+            raise self._native_error(function_name, result)
         return output
 
     def upload_image(self, image: np.ndarray) -> GpuResidentImage:
@@ -358,9 +362,7 @@ class GpuRuntime:
             if result == 0 and self._capture_native_cumulative:
                 self._record_native_performance_unlocked()
         if result != 0 or generation.value == 0:
-            raise GpuRuntimeError(
-                f"vf_context_upload_u8 failed with CUDA DLL error {result}: {self._error_message(result)}"
-            )
+            raise self._native_error("vf_context_upload_u8", result)
         return GpuResidentImage(
             self, int(generation.value), int(source.shape[1]), int(source.shape[0]), channels
         )
@@ -375,9 +377,7 @@ class GpuRuntime:
                 ctypes.byref(free_bytes), ctypes.byref(total_bytes)
             ))
         if result != 0:
-            raise GpuRuntimeError(
-                f"vf_gpu_memory_info failed with CUDA DLL error {result}: {self._error_message(result)}"
-            )
+            raise self._native_error("vf_gpu_memory_info", result)
         return {"free_bytes": int(free_bytes.value), "total_bytes": int(total_bytes.value)}
 
     def recommended_roi_batch_size(
@@ -436,9 +436,7 @@ class GpuRuntime:
                 completed - lock_acquired, lock_acquired - queued,
             )
         if result != 0 or not handle.value:
-            raise GpuRuntimeError(
-                f"vf_roi_batch_create failed with CUDA DLL error {result}: {self._error_message(result)}"
-            )
+            raise self._native_error("vf_roi_batch_create", result)
         self._roi_batches[int(handle.value)] = handle
         return GpuRoiBatch(self, handle, image, len(encoded), expected_shape[0], expected_shape[1])
 
@@ -495,9 +493,7 @@ class GpuRuntime:
                 completed - lock_acquired, lock_acquired - queued,
             )
         if result != 0:
-            raise GpuRuntimeError(
-                f"vf_roi_batch_download_u8 failed with CUDA DLL error {result}: {self._error_message(result)}"
-            )
+            raise self._native_error("vf_roi_batch_download_u8", result)
         return output
 
     def _destroy_roi_batch(self, batch: GpuRoiBatch) -> None:
@@ -507,9 +503,7 @@ class GpuRuntime:
                 return
             result = int(self._dll.vf_roi_batch_destroy(handle))
         if result != 0:
-            raise GpuRuntimeError(
-                f"vf_roi_batch_destroy failed with CUDA DLL error {result}: {self._error_message(result)}"
-            )
+            raise self._native_error("vf_roi_batch_destroy", result)
 
     def native_plan_capability(self, plan, image: np.ndarray) -> tuple[bool, str]:
         if not self.supports_native_plan:
@@ -553,9 +547,7 @@ class GpuRuntime:
                     ctypes.byref(created),
                 ))
                 if result != 0 or not created.value:
-                    raise GpuRuntimeError(
-                        f"vf_plan_create failed with CUDA DLL error {result}: {self._error_message(result)}"
-                    )
+                    raise self._native_error("vf_plan_create", result)
                 return created
             handle = NativePlanManager(
                 self._native_plans,
@@ -597,9 +589,7 @@ class GpuRuntime:
                     kernel_launch_count=self._plan_descriptors.kernel_launch_count(plan, src_channels)
                 )
         if result != 0:
-            raise GpuRuntimeError(
-                f"{function_name} failed with CUDA DLL error {result}: {self._error_message(result)}"
-            )
+            raise self._native_error(function_name, result)
         return plan.validate_output(output, expected)
 
     def native_dag_plan_capability(self, plan, image: np.ndarray) -> tuple[bool, str]:
@@ -640,9 +630,7 @@ class GpuRuntime:
                     int(source.shape[0]), ctypes.byref(created)
                 ))
                 if result != 0 or not created.value:
-                    raise GpuRuntimeError(
-                        f"vf_dag_plan_create failed with CUDA DLL error {result}: {self._error_message(result)}"
-                    )
+                    raise self._native_error("vf_dag_plan_create", result)
                 return created
             handle = NativePlanManager(
                 self._native_dag_plans,
@@ -684,9 +672,7 @@ class GpuRuntime:
                 completed - lock_acquired, lock_acquired - queued,
             )
         if result != 0:
-            raise GpuRuntimeError(
-                f"{function_name} failed with CUDA DLL error {result}: {self._error_message(result)}"
-            )
+            raise self._native_error(function_name, result)
         return outputs
 
     def _validate_device_roi(self, device_roi: GpuDeviceRoi, source: np.ndarray) -> None:
@@ -768,6 +754,7 @@ class GpuRuntime:
             reason = (
                 f"CUDA persistent context creation failed with error {result}: {self._error_message(result)}"
             )
+            self._mark_device_lost_if_sticky(result, reason)
             self.fused_unavailable_reason = reason
             self.native_plan_unavailable_reason = reason
             self.native_dag_plan_unavailable_reason = reason
@@ -1117,9 +1104,7 @@ class GpuRuntime:
                 lock_acquired - queued,
             )
         if result != 0:
-            raise GpuRuntimeError(
-                f"{function_name} failed with CUDA DLL error {result}: {self._error_message(result)}"
-            )
+            raise self._native_error(function_name, result)
 
     def _record_performance(
         self,
@@ -1132,6 +1117,18 @@ class GpuRuntime:
         self._performance_recorder.record(
             function_name, host_to_device_bytes, device_to_host_bytes, wall_sec, lock_wait_sec
         )
+
+    def _native_error(self, function_name: str, error_code: int) -> GpuRuntimeError:
+        message = f"{function_name} failed with CUDA DLL error {error_code}: {self._error_message(error_code)}"
+        self._mark_device_lost_if_sticky(error_code, message)
+        return GpuRuntimeError(message)
+
+    def _mark_device_lost_if_sticky(self, error_code: int, message: str) -> None:
+        if int(error_code) - CUDA_RUNTIME_ERROR_BASE not in STICKY_CUDA_ERRORS or self.device_lost_reason:
+            return
+        # Retrying CUDA in this process only repeats the failure; later runs route to CPU.
+        self.device_lost_reason = f"CUDA context 已損毀，需重新啟動程式才能再使用 GPU：{message}"
+        self.unavailable_reason = self.device_lost_reason
 
     def _error_message(self, error_code: int) -> str:
         function = getattr(self._dll, "vf_gpu_error_message", None)
