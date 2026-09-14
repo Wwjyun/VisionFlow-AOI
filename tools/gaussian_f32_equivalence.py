@@ -37,6 +37,10 @@ EVIDENCE_JSON = EVIDENCE_DIR / "gaussian_f32_equivalence.json"
 # of these numbers; the margin covers contents and shapes this tool does not enumerate.
 CLAIMED_GRAY_MAX_ABS = 2.0e-4
 CLAIMED_GRAY_MEAN_ABS = 2.0e-5
+# Explicit (non-zero) sigma takes the pure exp/sum/normalize branch for every ksize, where OpenCV's
+# SIMD filter diverges a little more; measured separately and claimed separately.
+CLAIMED_SIGMA_MAX_ABS = 4.0e-4
+CLAIMED_SIGMA_MEAN_ABS = 5.0e-5
 # The error scales with the magnitude of the source. For wide-range inputs the claim is relative to
 # the dynamic range instead of an absolute float32 unit.
 CLAIMED_RELATIVE_TO_RANGE = 5.0e-7
@@ -45,6 +49,14 @@ VERIFIED_KERNELS = tuple(range(3, 128, 2))
 
 # Fixed representative kernel sizes used for the shape/content sweep.
 SWEEP_KERNELS = (3, 5, 9, 21, 51, 63, 101, 127)
+# Sigma values the sweep covers. Zero and negative both select OpenCV's automatic sigma rule.
+SWEEP_SIGMAS = (0.0, 0.5, 1.0, 1.25, 2.5, 5.0)
+SIGMA_SWEEP_KERNELS = (3, 5, 9, 21, 31, 51, 127)
+SIGMA_SWEEP_SHAPES = ((64, 80), (400, 600), (3, 1024))
+# Coefficients are checked for every kernel size against every sigma, including a negative sigma
+# (auto alias) and a sigma equal to the automatic value of that kernel size.
+KERNEL_COEFFICIENT_SIGMAS = (0.0, 0.5, 1.0, 1.25, 2.5, 5.0, -1.0)
+KERNEL_COEFFICIENT_SIZES = VERIFIED_KERNELS
 
 # OpenCV's fixed small-kernel table (SMALL_GAUSSIAN_SIZE == 9 in OpenCV 5.x), indexed by ksize / 2.
 SMALL_KERNELS = {
@@ -57,30 +69,56 @@ SMALL_KERNELS = {
 }
 
 
-def reference_kernel_f32(ksize: int) -> np.ndarray:
-    """Mirror of prepare_gaussian_f32_weights() in gpu/visionflow_cuda.cu."""
-    if ksize in SMALL_KERNELS:
+def automatic_sigma(ksize: int) -> float:
+    return ((ksize - 1) * 0.5 - 1) * 0.3 + 0.8
+
+
+def reference_kernel_f32(ksize: int, sigma: float = 0.0) -> np.ndarray:
+    """Mirror of prepare_gaussian_f32_weights() in gpu/visionflow_cuda.cu.
+
+    ``sigma > 0`` is used directly; zero or negative selects OpenCV's automatic rule, including the
+    fixed small-kernel table for odd ksize <= 9.
+    """
+    automatic = not sigma > 0.0
+    if automatic and ksize <= 9:
         return np.array(SMALL_KERNELS[ksize], dtype=np.float32)
-    sigma = ((ksize - 1) * 0.5 - 1) * 0.3 + 0.8
+    sigma_x = automatic_sigma(ksize) if automatic else float(sigma)
     offset = np.arange(ksize, dtype=np.float64) - (ksize - 1) * 0.5
-    raw = np.exp(-0.5 * offset * offset / (sigma * sigma))
+    raw = np.exp(-0.5 * offset * offset / (sigma_x * sigma_x))
     return (raw * (1.0 / float(np.sum(raw)))).astype(np.float32)
 
 
 def kernel_coefficients() -> dict:
-    """Check the generated coefficients against cv2.getGaussianKernel for every verified size."""
+    """Check the generated coefficients against cv2.getGaussianKernel for every verified size.
+
+    Every combination of kernel size and sigma in the sweep must be bit-identical; a non-zero sigma
+    must NOT fall back to the automatic table, and a non-positive sigma must select it.
+    """
     worst = 0.0
-    worst_size = 0
-    for ksize in VERIFIED_KERNELS:
-        reference = cv2.getGaussianKernel(ksize, 0, cv2.CV_32F).reshape(-1)
-        difference = float(np.max(np.abs(reference - reference_kernel_f32(ksize))))
-        if difference > worst:
-            worst, worst_size = difference, ksize
+    worst_case = None
+    checked = 0
+    for ksize in KERNEL_COEFFICIENT_SIZES:
+        for sigma in KERNEL_COEFFICIENT_SIGMAS:
+            reference = cv2.getGaussianKernel(ksize, sigma, cv2.CV_32F).reshape(-1)
+            difference = float(np.max(np.abs(reference - reference_kernel_f32(ksize, sigma))))
+            checked += 1
+            if difference > worst:
+                worst, worst_case = difference, (ksize, sigma)
+    # The failure mode the coefficient rule exists to prevent: a non-zero sigma must not silently
+    # produce the automatic-sigma kernel.
+    distinct = True
+    for ksize in KERNEL_COEFFICIENT_SIZES:
+        for sigma in (0.5, 1.0, 2.5):
+            if np.array_equal(
+                reference_kernel_f32(ksize, sigma), reference_kernel_f32(ksize, 0.0)
+            ):
+                distinct = False
     return {
-        "checked_sizes": len(VERIFIED_KERNELS),
+        "checked_combinations": checked,
         "worst_abs_difference": worst,
-        "worst_size": worst_size,
+        "worst_case": list(worst_case) if worst_case else None,
         "bit_exact": worst == 0.0,
+        "non_zero_sigma_differs_from_auto": distinct,
     }
 
 
@@ -187,11 +225,19 @@ def main() -> int:
     lines.append(f"device: {runtime.device_name} (sm {runtime.compute_capability})")
     lines.append(f"openCV: cv2 {cv2.__version__}, numpy {np.__version__}")
     lines.append("")
-    lines.append("[coefficients] prepare_gaussian_f32_weights() mirror vs cv2.getGaussianKernel(k, 0, CV_32F)")
+    lines.append("[coefficients] prepare_gaussian_f32_weights() mirror vs cv2.getGaussianKernel(k, sigma, CV_32F)")
     lines.append(
-        f"  odd sizes checked: {coefficients['checked_sizes']} (3..127)"
-        f"  worst |diff| = {coefficients['worst_abs_difference']:.3e} at ksize={coefficients['worst_size']}"
+        f"  combinations checked: {coefficients['checked_combinations']} "
+        f"(odd ksize 3..127 x sigma {KERNEL_COEFFICIENT_SIGMAS})"
+    )
+    lines.append(
+        f"  worst |diff| = {coefficients['worst_abs_difference']:.3e} at "
+        f"(ksize, sigma)={tuple(coefficients['worst_case']) if coefficients['worst_case'] else None}"
         f"  bit-exact = {coefficients['bit_exact']}"
+    )
+    lines.append(
+        "  every non-zero sigma produces a kernel different from the automatic-sigma kernel: "
+        f"{coefficients['non_zero_sigma_differs_from_auto']}"
     )
 
     # 1. Every verified kernel size on one representative operand.
@@ -213,6 +259,106 @@ def main() -> int:
             lines.append(
                 f"    ksize={row['kernel_size']:3d}  max={row['max_abs']:.3e}  mean={row['mean_abs']:.3e}"
             )
+
+    # 1b. Non-zero sigma: the export must use that sigma, not OpenCV's automatic rule. This is the
+    # regression the sigma=0-only sweep could not see.
+    sigma_rows = []
+    worst_sigma = 0.0
+    worst_sigma_mean = 0.0
+    worst_sigma_case = None
+    seed = 500
+    for shape in SIGMA_SWEEP_SHAPES:
+        for kind in CONTENTS:
+            seed += 1
+            operand = np.clip(scene(shape, kind, seed), 0.0, 255.0).astype(np.float32)
+            for ksize in SIGMA_SWEEP_KERNELS:
+                for sigma in SWEEP_SIGMAS:
+                    expected = cv2.GaussianBlur(operand, (ksize, ksize), sigma)
+                    actual = runtime.gaussian_blur_f32(operand, ksize, sigma)
+                    maximum, mean = measure(actual, expected)
+                    # Distance from the automatic-sigma result: a device that ignored sigma would
+                    # match cv2(sigma=0) here instead of cv2(sigma).
+                    auto_reference = cv2.GaussianBlur(operand, (ksize, ksize), 0.0)
+                    auto_gap = float(np.max(np.abs(actual.astype(np.float64) - auto_reference.astype(np.float64))))
+                    sigma_rows.append({
+                        "shape": list(shape), "content": kind, "kernel_size": ksize, "sigma": sigma,
+                        "max_abs": maximum, "mean_abs": mean, "gap_to_auto_sigma": auto_gap,
+                    })
+                    if maximum > worst_sigma:
+                        worst_sigma, worst_sigma_case = maximum, (shape, kind, ksize, sigma)
+                    worst_sigma_mean = max(worst_sigma_mean, mean)
+    record["sigma_sweep"] = {
+        "cases": len(sigma_rows),
+        "worst_max_abs": worst_sigma,
+        "worst_mean_abs": worst_sigma_mean,
+        "worst_case": [list(worst_sigma_case[0]), worst_sigma_case[1], worst_sigma_case[2],
+                       worst_sigma_case[3]] if worst_sigma_case else None,
+        "sigmas": list(SWEEP_SIGMAS),
+        "kernel_sizes": list(SIGMA_SWEEP_KERNELS),
+    }
+    lines.append("")
+    lines.append(
+        f"[sigma sweep] {len(sigma_rows)} cases "
+        f"({len(SIGMA_SWEEP_SHAPES)} shapes x {len(CONTENTS)} contents x "
+        f"{len(SIGMA_SWEEP_KERNELS)} kernel sizes x {len(SWEEP_SIGMAS)} sigma values)"
+    )
+    lines.append(
+        f"  sigma values {SWEEP_SIGMAS}, kernel sizes {SIGMA_SWEEP_KERNELS}"
+    )
+    lines.append(f"  worst max|device - cv2(sigma)|  = {worst_sigma:.3e}")
+    lines.append(f"  worst mean|device - cv2(sigma)| = {worst_sigma_mean:.3e}")
+    if worst_sigma_case:
+        lines.append(
+            f"  worst case: shape={worst_sigma_case[0]} content={worst_sigma_case[1]} "
+            f"ksize={worst_sigma_case[2]} sigma={worst_sigma_case[3]}"
+        )
+    non_auto_rows = [row for row in sigma_rows if row["sigma"] > 0.0]
+    for sigma in SWEEP_SIGMAS:
+        if sigma <= 0.0:
+            continue
+        rows = [row for row in non_auto_rows if row["sigma"] == sigma]
+        lines.append(
+            f"  sigma={sigma:<5} cases={len(rows):4d} worst max|diff| = "
+            f"{max(row['max_abs'] for row in rows):.3e}  "
+            f"max|device - cv2(auto sigma)| = {max(row['gap_to_auto_sigma'] for row in rows):.3e}"
+        )
+
+    # 1c. A non-positive sigma is OpenCV's automatic rule, so it must reproduce cv2(sigma=0).
+    auto_alias_rows = []
+    for ksize in (3, 9, 31, 51):
+        operand = np.clip(scene((400, 600), "uint8-random", 900 + ksize), 0.0, 255.0).astype(np.float32)
+        for sigma in (0.0, -1.0, -0.25):
+            expected = cv2.GaussianBlur(operand, (ksize, ksize), 0.0)
+            actual = runtime.gaussian_blur_f32(operand, ksize, sigma)
+            maximum, mean = measure(actual, expected)
+            auto_alias_rows.append({
+                "kernel_size": ksize, "sigma": sigma, "max_abs": maximum, "mean_abs": mean,
+            })
+    record["auto_sigma_alias"] = auto_alias_rows
+    lines.append("")
+    lines.append("[non-positive sigma == OpenCV automatic rule] vs cv2.GaussianBlur(ksize, 0.0)")
+    for row in auto_alias_rows:
+        lines.append(
+            f"    ksize={row['kernel_size']:3d} sigma={row['sigma']:>5} "
+            f"max={row['max_abs']:.3e} mean={row['mean_abs']:.3e}"
+        )
+
+    # 1d. A sigma with no OpenCV coefficient rule must be refused, never folded into the auto rule.
+    sigma_refusals = []
+    for sigma in (float("nan"), float("inf"), float("-inf")):
+        try:
+            runtime.gaussian_blur_f32(source, 31, sigma)
+            sigma_refusals.append({"sigma": repr(sigma), "refused": False, "error_code": None})
+        except GpuRuntimeError as error:
+            sigma_refusals.append({
+                "sigma": repr(sigma), "refused": True,
+                "error_code": int(getattr(error, "error_code", 0)),
+            })
+    record["sigma_refusals"] = sigma_refusals
+    lines.append("")
+    lines.append("[non-finite sigma] refused with VF_CUDA_INVALID_ARGUMENT (1)")
+    for row in sigma_refusals:
+        lines.append(f"    sigma={row['sigma']:>5} refused={row['refused']} error_code={row['error_code']}")
 
     # 2. Shape x content sweep at representative kernel sizes. Operands are clipped to [0, 255] so
     # the gray-domain claim below is measured on exactly the value range it names.
@@ -313,23 +459,27 @@ def main() -> int:
     lines.append("[kernel wider than the operand] reflect101 wraps repeatedly in both passes")
     lines.append(f"  {len(over_rows)} cases (5x5, 8x11, 20x20, 33x7 x ksize 51/63/127): worst max|diff| = {over_worst:.3e}")
 
-    # 4. ROI variant: equality with cv2.GaussianBlur on the same sub-array.
+    # 4. ROI variant: equality with cv2.GaussianBlur on the same sub-array, for auto and explicit
+    # sigma.
     roi_rows = []
     if runtime.supports_gaussian_blur_f32_roi:
         panel = scene((240, 320), "aoi-like", 21)
-        for (x, y, width, height, ksize) in (
-            (0, 0, 320, 240, 51),
-            (0, 0, 320, 240, 3),
-            (16, 24, 128, 96, 51),
-            (200, 100, 120, 140, 21),
-            (319, 239, 1, 1, 9),
-            (0, 0, 5, 5, 127),
+        for (x, y, width, height, ksize, sigma) in (
+            (0, 0, 320, 240, 51, 0.0),
+            (0, 0, 320, 240, 3, 0.0),
+            (16, 24, 128, 96, 51, 0.0),
+            (200, 100, 120, 140, 21, 0.0),
+            (319, 239, 1, 1, 9, 0.0),
+            (0, 0, 5, 5, 127, 0.0),
+            (16, 24, 128, 96, 51, 1.25),
+            (100, 60, 64, 64, 31, 2.5),
+            (0, 0, 320, 240, 9, 0.5),
         ):
-            expected = cv2.GaussianBlur(panel[y:y + height, x:x + width], (ksize, ksize), 0.0)
-            actual = runtime.gaussian_blur_f32_roi(panel, x, y, width, height, ksize)
+            expected = cv2.GaussianBlur(panel[y:y + height, x:x + width], (ksize, ksize), sigma)
+            actual = runtime.gaussian_blur_f32_roi(panel, x, y, width, height, ksize, sigma)
             maximum, mean = measure(actual, expected)
             roi_rows.append({
-                "rect": [x, y, width, height], "kernel_size": ksize,
+                "rect": [x, y, width, height], "kernel_size": ksize, "sigma": sigma,
                 "max_abs": maximum, "mean_abs": mean,
             })
     record["roi_variant"] = roi_rows
@@ -338,7 +488,7 @@ def main() -> int:
     lines.append("[ROI variant] vs cv2.GaussianBlur on the same sub-array (isolated rectangle)")
     for row in roi_rows:
         lines.append(
-            f"    rect={tuple(row['rect'])} ksize={row['kernel_size']:3d}"
+            f"    rect={tuple(row['rect'])} ksize={row['kernel_size']:3d} sigma={row['sigma']:<5}"
             f"  max={row['max_abs']:.3e}  mean={row['mean_abs']:.3e}"
         )
     lines.append(f"  worst max|diff| = {roi_worst:.3e}")
@@ -348,9 +498,19 @@ def main() -> int:
     first = runtime.gaussian_blur_f32(operand, 51)
     second = runtime.gaussian_blur_f32(operand, 51)
     deterministic = bool(np.array_equal(first, second))
-    record["deterministic"] = deterministic
+    sigma_deterministic = bool(
+        np.array_equal(
+            runtime.gaussian_blur_f32(operand, 51, 1.25),
+            runtime.gaussian_blur_f32(operand, 51, 1.25),
+        )
+    )
+    record["deterministic"] = deterministic and sigma_deterministic
+    record["deterministic_explicit_sigma"] = sigma_deterministic
     lines.append("")
-    lines.append(f"[determinism] two calls on identical bytes are bit-identical: {deterministic}")
+    lines.append(
+        f"[determinism] two calls on identical bytes are bit-identical: "
+        f"auto sigma={deterministic}, explicit sigma=1.25 {sigma_deterministic}"
+    )
 
     # 6. Unsupported kernel sizes are refused, never computed.
     refusals = []
@@ -377,24 +537,81 @@ def main() -> int:
             f"    ksize={row['kernel_size']:3d} refused={row['refused']} error_code={row['error_code']}"
         )
 
-    # 7. Claimed tolerance check.
+    # 7. The bridge must refuse a DLL that ignores sigma rather than returning the automatic-sigma
+    # background for it. The legacy behaviour is simulated by dropping the trailing argument.
+    native_blur = runtime._dll.vf_gaussian_blur_f32
+    legacy_rows: dict = {}
+    try:
+        runtime._dll.vf_gaussian_blur_f32 = lambda *values: native_blur(*values[:-1], 0.0)
+        legacy_rows["probe_detects_legacy"] = runtime._probe_gaussian_f32_sigma() is False
+        runtime._gaussian_f32_sigma_supported = False
+        try:
+            runtime.gaussian_blur_f32(source, 31, 1.0)
+            legacy_rows["refuses_explicit_sigma"] = False
+        except GpuRuntimeError as error:
+            legacy_rows["refuses_explicit_sigma"] = True
+            legacy_rows["refusal_message"] = str(error)
+        try:
+            runtime.gaussian_blur_f32(source, 31, 0.0)
+            legacy_rows["still_allows_automatic_sigma"] = True
+        except GpuRuntimeError:
+            legacy_rows["still_allows_automatic_sigma"] = False
+    finally:
+        runtime._dll.vf_gaussian_blur_f32 = native_blur
+        runtime._gaussian_f32_sigma_supported = runtime._probe_gaussian_f32_sigma()
+    legacy_rows["probe_accepts_current_dll"] = bool(runtime.supports_gaussian_f32_sigma)
+    record["sigma_support_guard"] = legacy_rows
+    lines.append("")
+    lines.append("[sigma support guard] a DLL whose export ignores sigma must be refused")
+    lines.append(f"  probe detects the simulated legacy export: {legacy_rows.get('probe_detects_legacy')}")
+    lines.append(f"  explicit sigma refused on such a DLL: {legacy_rows.get('refuses_explicit_sigma')}")
+    lines.append(
+        f"  automatic sigma still allowed on such a DLL: "
+        f"{legacy_rows.get('still_allows_automatic_sigma')}"
+    )
+    lines.append(f"  probe accepts this DLL: {legacy_rows['probe_accepts_current_dll']}")
+    if legacy_rows.get("refusal_message"):
+        lines.append(f"  refusal: {legacy_rows['refusal_message']}")
+
+    # 8. Claimed tolerance check. Ignoring sigma (the regression this sweep exists for) shows up as
+    # a huge max_abs on every sigma > 0 case, so the sigma bound below is the real gate.
+    sigma_refusals_ok = all(row["refused"] and row["error_code"] == 1 for row in sigma_refusals)
+    auto_alias_ok = all(row["max_abs"] <= CLAIMED_GRAY_MAX_ABS for row in auto_alias_rows)
+    guard_ok = (
+        legacy_rows.get("probe_detects_legacy")
+        and legacy_rows.get("refuses_explicit_sigma")
+        and legacy_rows.get("still_allows_automatic_sigma")
+        and legacy_rows.get("probe_accepts_current_dll")
+    )
     claim_ok = (
         coefficients["bit_exact"]
+        and coefficients["non_zero_sigma_differs_from_auto"]
         and worst_gray <= CLAIMED_GRAY_MAX_ABS
         and worst_gray_mean <= CLAIMED_GRAY_MEAN_ABS
         and worst_wide <= CLAIMED_RELATIVE_TO_RANGE
         and over_worst <= CLAIMED_GRAY_MAX_ABS
         and (not roi_rows or roi_worst <= CLAIMED_GRAY_MAX_ABS)
         and deterministic
+        and sigma_deterministic
         and expected_unsupported
+        and sigma_refusals_ok
+        and auto_alias_ok
+        and guard_ok
+        and worst_sigma <= CLAIMED_SIGMA_MAX_ABS
+        and worst_sigma_mean <= CLAIMED_SIGMA_MEAN_ABS
     )
     record["claim_ok"] = claim_ok
     lines.append("")
     lines.append("[claimed tolerance]")
     lines.append(
-        f"  float32 gray/residual in [0, 255], any odd ksize in [3, 127]:"
+        f"  float32 gray/residual in [0, 255], any odd ksize in [3, 127], sigma <= 0 (automatic):"
         f"  max|diff| <= {CLAIMED_GRAY_MAX_ABS:.1e} (measured {worst_gray:.3e}),"
         f"  mean|diff| <= {CLAIMED_GRAY_MEAN_ABS:.1e} (measured {worst_gray_mean:.3e})"
+    )
+    lines.append(
+        f"  float32 gray/residual in [0, 255], any odd ksize in [3, 127], sigma > 0 (explicit):"
+        f"  max|diff| <= {CLAIMED_SIGMA_MAX_ABS:.1e} (measured {worst_sigma:.3e}),"
+        f"  mean|diff| <= {CLAIMED_SIGMA_MEAN_ABS:.1e} (measured {worst_sigma_mean:.3e})"
     )
     lines.append(
         f"  wider dynamic range: |diff| <= {CLAIMED_RELATIVE_TO_RANGE:.1e} of the source range"

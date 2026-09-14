@@ -34,10 +34,28 @@ class _Runtime:
         return {"requested": requested, "active": requested}
 
 
+class _CountingRuntime(_Runtime):
+    """A runtime that reports the optional device exports it actually executed."""
+
+    def __init__(self, functions):
+        self._functions = {
+            name: {"calls": calls} for name, calls in dict(functions).items()
+        }
+
+    def performance_stats(self):
+        return {
+            "measurement_scope": "host_wrapper_and_optional_cuda_events",
+            "functions": {
+                name: {**entry, "host_to_device_bytes": 0, "device_to_host_bytes": 0}
+                for name, entry in self._functions.items()
+            },
+        }
+
+
 class DeviceHostSplitTests(unittest.TestCase):
-    def _split(self, detectors, resident=True, tiling=False):
+    def _split(self, detectors, resident=True, tiling=False, runtime=None):
         return InspectionResultAssembler._device_host_split(
-            gpu_runtime=_Runtime(),
+            gpu_runtime=runtime if runtime is not None else _Runtime(),
             detectors=detectors,
             resident_image=object() if resident else None,
             tiling_gpu_requested=tiling,
@@ -59,10 +77,48 @@ class DeviceHostSplitTests(unittest.TestCase):
         self.assertEqual(split["resident_upload"], "device")
         self.assertEqual(split["anchor_localization"], "device")
         self.assertEqual(split["preprocessing"], "device")
-        # No device implementation exists for these yet, so they must not be implied as device work.
+        # No device export for these steps ran in this run, so they must not be implied as device
+        # work just because the recipe requested CUDA.
         self.assertEqual(split["candidate_extraction"], "cpu")
         self.assertEqual(split["geometry_and_statistics"], "cpu")
         self.assertEqual(split["pass_ng_decision"], "cpu")
+        self.assertEqual(split["hybrid_steps"], {})
+
+    def test_executed_device_exports_mark_the_step_as_a_hybrid(self):
+        """A step is ``device`` only when its device export really ran.
+
+        ``Detector202_1`` computes its exact median/MAD on the device
+        (``vf_median_f32``) while connected components still runs in OpenCV, so the
+        candidate step is genuinely hybrid and must be reported as such, with the
+        observed export named so the claim is checkable.
+        """
+
+        runtime = _CountingRuntime({"vf_median_f32": 12, "vf_context_upload_u8": 1})
+        split = self._split([_Detector(routes={"cuda": 6})], resident=True, runtime=runtime)
+        self.assertEqual(split["candidate_extraction"], "device")
+        self.assertEqual(split["hybrid_steps"], {"candidate_extraction": ["vf_median_f32"]})
+        self.assertIn("vf_median_f32", split["note"])
+        # A step with no device export in this run stays host work.
+        self.assertEqual(split["geometry_and_statistics"], "cpu")
+        self.assertEqual(split["pass_ng_decision"], "cpu")
+
+    def test_unknown_or_zero_counts_never_imply_device_work(self):
+        for functions in ({}, {"vf_median_f32": 0}, {"vf_upload_unrelated_export": 5}):
+            with self.subTest(functions=functions):
+                runtime = _CountingRuntime(functions)
+                split = self._split([_Detector()], resident=True, runtime=runtime)
+                self.assertEqual(split["candidate_extraction"], "cpu")
+                self.assertEqual(split["geometry_and_statistics"], "cpu")
+                self.assertEqual(split["hybrid_steps"], {})
+
+    def test_a_runtime_without_metrics_does_not_break_result_assembly(self):
+        class _BrokenRuntime(_Runtime):
+            def performance_stats(self):
+                raise RuntimeError("injected metrics failure")
+
+        split = self._split([_Detector()], resident=True, runtime=_BrokenRuntime())
+        self.assertEqual(split["candidate_extraction"], "cpu")
+        self.assertEqual(split["geometry_and_statistics"], "cpu")
 
     def test_crossover_cpu_route_is_not_reported_as_device_preprocessing(self):
         detector = _Detector(gpu_active=True, routes={"cpu_crossover": 4}, crossover=True)

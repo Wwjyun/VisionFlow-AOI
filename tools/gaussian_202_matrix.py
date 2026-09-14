@@ -69,11 +69,12 @@ class _SubstitutionProxy:
 
     def GaussianBlur(self, src, ksize, sigma1=0.0, *args, **kwargs):  # noqa: N802 - cv2 name
         ksize = tuple(int(value) for value in ksize) if isinstance(ksize, (tuple, list)) else ksize
+        # sigma1 is forwarded as the double the detector's gaussian_sigma parameter carries; the
+        # native export applies OpenCV's own rule to it, so a non-zero sigma is never substituted.
         usable = (
             isinstance(ksize, tuple)
             and len(ksize) == 2
             and ksize[0] == ksize[1]
-            and float(sigma1) == 0.0
             and not args
             and not kwargs
             and np.asarray(src).dtype == np.float32
@@ -82,7 +83,7 @@ class _SubstitutionProxy:
             self.calls.append(("cpu", ksize if isinstance(ksize, tuple) else (ksize, ksize), float(sigma1)))
             return self._cv2.GaussianBlur(src, ksize, sigma1, *args, **kwargs)
         self.calls.append(("device", ksize, float(sigma1)))
-        return self._runtime.gaussian_blur_f32(src, int(ksize[0]))
+        return self._runtime.gaussian_blur_f32(src, int(ksize[0]), float(sigma1))
 
 
 @contextlib.contextmanager
@@ -252,6 +253,30 @@ def build_scenes() -> list[dict]:
         {"name": "sweep-grid-no-noise-kernel127", "shape": (300, 300), "seed": 39, "sweep": True,
          "deltas": (15, 30, 60, 120, 200, 250), "sizes": (5, 13, 21, 34, 60, 90),
          "params": {"background_kernel_size": 127}},
+        # --- explicit gaussian_sigma (an admin recipe parameter of the detector) --------------
+        # With sigma != 0 the device must apply that sigma, not OpenCV's automatic rule; before the
+        # sigma fix these scenes produced a different candidate mask.
+        {"name": "sigma1-no-noise", "shape": small, "seed": 40,
+         "defects": [(200, 100, 190, 190, 150)], "params": {"gaussian_sigma": 1.0}},
+        {"name": "sigma1-multi", "shape": small, "seed": 41,
+         "defects": [(60, 60, 20, 20, 120), (200, 90, 30, 30, 45), (330, 150, 40, 40, 30),
+                     (120, 300, 25, 60, 70)],
+         "params": {"gaussian_sigma": 1.0}},
+        {"name": "sigma2.5-kernel31", "shape": small, "seed": 42,
+         "defects": [(200, 100, 40, 40, 40)], "params": {"gaussian_sigma": 2.5}},
+        {"name": "sigma5-kernel31", "shape": small, "seed": 43,
+         "defects": [(200, 100, 60, 60, 60)], "params": {"gaussian_sigma": 5.0}},
+        {"name": "sigma1.25-kernel51", "shape": small, "seed": 44,
+         "defects": [(200, 100, 60, 60, 60)],
+         "params": {"background_kernel_size": 51, "gaussian_sigma": 1.25}},
+        {"name": "sigma0.5-noise2-sweep", "shape": (300, 300), "seed": 45, "noise": 2.0,
+         "sweep": True, "deltas": (15, 25, 45, 80, 150, 250), "sizes": (5, 8, 13, 21, 34, 48),
+         "params": {"background_kernel_size": 31, "gaussian_sigma": 0.5}},
+        {"name": "sigma2-kernel127-large", "shape": (1000, 1000), "seed": 46,
+         "defects": kernel31_cliff, "params": {"background_kernel_size": 127, "gaussian_sigma": 2.0}},
+        {"name": "sigma3-dark-background", "shape": small, "seed": 47, "base": 40,
+         "defects": [(200, 100, 120, 120, 150)],
+         "params": {"background_kernel_size": 51, "gaussian_sigma": 3.0}},
     ]
     return scenes
 
@@ -315,6 +340,7 @@ def run_case(scene: dict, runtime: GpuRuntime, module) -> dict:
         "mask_bit_identical": mask_equal,
         "residual_metadata_deltas": residual_deltas,
         "gaussian_calls": blur_calls,
+        "gaussian_sigma": float(params.get("gaussian_sigma", 0.0)),
         "device_median_calls": median_calls,
         "reference_backend": reference["execution"]["backend"],
         "device_backend": device["execution"]["backend"],
@@ -460,6 +486,15 @@ def main() -> int:
     lines.append(f"device: {runtime.device_name} (sm {runtime.compute_capability})")
     lines.append(f"scenes: {len(results)} unified/whole-pipeline runs per mode, both with use_gpu=True")
     lines.append(f"gaussian call sites substituted: device={device_calls}, left on cv2={cpu_calls}")
+    sigma_calls = sorted({
+        call[2] for result in results for call in result["gaussian_calls"] if call[0] == "device"
+    })
+    sigma_scenes = [result for result in results if result["gaussian_sigma"] != 0.0]
+    lines.append(f"GaussianBlur sigma values forwarded to the device: {sigma_calls}")
+    lines.append(
+        f"scenes with a non-zero gaussian_sigma recipe parameter: {len(sigma_scenes)} "
+        f"({[result['name'] for result in sigma_scenes]})"
+    )
     lines.append(
         "gpu exact-median calls per run: "
         f"min reference={min(result['device_median_calls']['reference'] for result in results)}, "
@@ -493,6 +528,7 @@ def main() -> int:
     for result in results:
         lines.append(
             f"  {result['name']:32s} shape={str(tuple(result['shape'])):12s} "
+            f"sigma={result['gaussian_sigma']:<5} "
             f"pass={result['device_pass']!s:5s} defects={result['device_defects']:3d} "
             f"mask_bit_equal={result['mask_bit_identical']!s:5s} "
             f"strict_identical={result['identical']!s:5s}"

@@ -128,6 +128,20 @@ class GpuCapabilities:
             self.gaussian_blur_f32 and self.has_exports(("vf_gaussian_blur_f32_roi",))
         )
 
+    @property
+    def gaussian_blur_f32_sigma(self) -> bool:
+        """Whether the float32 Gaussian honours an explicit sigma.
+
+        A DLL built before the sigma parameter existed still exports the same names but ignores the
+        trailing argument, which would silently return OpenCV's automatic-sigma background for a
+        non-zero sigma. The runtime probes that at load time, so this is False for such a DLL and a
+        non-zero sigma is refused instead of silently substituted.
+        """
+        return bool(
+            self.gaussian_blur_f32
+            and getattr(self.runtime, "_gaussian_f32_sigma_supported", False)
+        )
+
 
 @dataclass(slots=True)
 class GpuResourceRegistry:

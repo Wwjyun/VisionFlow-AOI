@@ -148,6 +148,8 @@ class GpuRuntime:
         self._performance_recorder = GpuPerformanceRecorder()
         self._performance = self._performance_recorder.values
         self._capture_native_cumulative = False
+        # Set by _load_optional_gaussian_blur_f32(); False means the loaded DLL ignores sigma.
+        self._gaussian_f32_sigma_supported = False
         # Strict CUDA mode must never route a CUDA-capable plan to CPU.
         self.crossover_policy = PlanCrossoverPolicy() if self.fallback_to_cpu else None
         if enabled:
@@ -202,6 +204,11 @@ class GpuRuntime:
     def supports_gaussian_blur_f32_roi(self) -> bool:
         return self._capabilities.gaussian_blur_f32_roi
 
+    @property
+    def supports_gaussian_f32_sigma(self) -> bool:
+        """Whether the float32 Gaussian export honours an explicit sigma (load-time probe)."""
+        return self._capabilities.gaussian_blur_f32_sigma
+
     def status(self, requested: bool = False) -> dict:
         active = bool(requested and self.available and not self.last_error)
         return {
@@ -224,6 +231,7 @@ class GpuRuntime:
                 "exact_median": self.supports_exact_median,
                 "gaussian_blur_f32": self.supports_gaussian_blur_f32,
                 "gaussian_blur_f32_roi": self.supports_gaussian_blur_f32_roi,
+                "gaussian_blur_f32_sigma": self.supports_gaussian_f32_sigma,
             },
             "queue": {
                 "depth": self.queue_depth,
@@ -577,14 +585,20 @@ class GpuRuntime:
             raise self._native_error("vf_median_f32", result)
         return np.float32(median_value.value)
 
-    def gaussian_blur_f32(self, image: np.ndarray, kernel_size: int) -> np.ndarray:
-        """Return ``cv2.GaussianBlur(float32_image, (k, k), 0.0)`` computed on the device.
+    def gaussian_blur_f32(
+        self, image: np.ndarray, kernel_size: int, sigma: float = 0.0
+    ) -> np.ndarray:
+        """Return ``cv2.GaussianBlur(float32_image, (k, k), sigma)`` computed on the device.
 
         The operand is a single-channel float32 host array; it is uploaded once (2D copy), blurred
         by the separable float32 operator with ``reflect101`` borders, and copied back. The result
         matches the OpenCV reference within the tolerance documented on the native export (a few
         float32 ulps: <= 2.0e-4 absolute for gray/residual values in [0, 255]), which was shown not
         to change the 202-CS-SN-1 final output on the widened scene matrix.
+
+        ``sigma`` follows cv2 exactly: a positive value is the standard deviation of both axes and
+        zero or a negative value selects OpenCV's automatic sigma rule. It is passed as a double,
+        so the caller's value is never narrowed here.
 
         ``kernel_size`` must be one of the odd sizes in [3, 127] that the native export verifies;
         an unsupported size raises ``GpuRuntimeError`` with ``error_code`` set to
@@ -595,6 +609,7 @@ class GpuRuntime:
             raise GpuRuntimeError(
                 "CUDA DLL has no float32 Gaussian export (vf_gaussian_blur_f32)"
             )
+        self._require_gaussian_f32_sigma(sigma)
         source = self._f32_image(image)
         output = np.empty_like(source)
         result = self._call_gaussian_f32(
@@ -605,6 +620,7 @@ class GpuRuntime:
                 output.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
                 int(output.strides[0]),
                 int(kernel_size),
+                ctypes.c_double(float(sigma)),
             ),
             int(source.nbytes),
             int(output.nbytes),
@@ -621,17 +637,20 @@ class GpuRuntime:
         width: int,
         height: int,
         kernel_size: int,
+        sigma: float = 0.0,
     ) -> np.ndarray:
         """Blur one rectangle of a float32 image on the device, as an isolated image.
 
-        Equal to ``cv2.GaussianBlur(image[y:y+height, x:x+width], (kernel_size, kernel_size), 0.0)``:
-        borders reflect inside the rectangle and pixels outside it are never read, so a caller can
-        blur a sub-window without uploading the whole plane. Only the rectangle crosses PCIe.
+        Equal to ``cv2.GaussianBlur(image[y:y+height, x:x+width], (kernel_size, kernel_size),
+        sigma)``: borders reflect inside the rectangle and pixels outside it are never read, so a
+        caller can blur a sub-window without uploading the whole plane. Only the rectangle crosses
+        PCIe.
         """
         if not self.supports_gaussian_blur_f32_roi:
             raise GpuRuntimeError(
                 "CUDA DLL has no float32 Gaussian ROI export (vf_gaussian_blur_f32_roi)"
             )
+        self._require_gaussian_f32_sigma(sigma)
         source = self._f32_image(image)
         x, y, width, height = int(x), int(y), int(width), int(height)
         if (
@@ -652,6 +671,7 @@ class GpuRuntime:
                 output.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
                 int(output.strides[0]),
                 int(kernel_size),
+                ctypes.c_double(float(sigma)),
             ),
             int(width) * int(height) * 4,
             int(output.nbytes),
@@ -659,6 +679,49 @@ class GpuRuntime:
         if result != 0:
             raise self._native_error("vf_gaussian_blur_f32_roi", result)
         return output
+
+    def _require_gaussian_f32_sigma(self, sigma) -> None:
+        """Refuse an explicit sigma when the loaded DLL cannot honour one.
+
+        vf_gaussian_blur_f32 gained its sigma parameter as an additive change to this ABI. A DLL
+        built before that parameter exists still exports the same name and simply ignores the extra
+        argument, so it would silently return OpenCV's automatic-sigma background for a non-zero
+        sigma. That is a wrong result rather than a missing one, so it is refused loudly; sigma <= 0
+        keeps working because the automatic rule is exactly what such a DLL computes.
+        """
+        if float(sigma) > 0.0 and not self.supports_gaussian_f32_sigma:
+            raise GpuRuntimeError(
+                "CUDA DLL vf_gaussian_blur_f32 does not honour an explicit sigma (the loaded DLL "
+                "predates the sigma parameter); rebuild gpu/visionflow_cuda.dll or pass sigma <= 0"
+            )
+
+    def _probe_gaussian_f32_sigma(self) -> bool:
+        """Detect whether the float32 Gaussian export applies an explicit sigma.
+
+        Two tiny device calls with different sigmas must produce different bytes; a DLL that ignores
+        the sigma argument returns the same automatic-sigma result twice. The probe does not record
+        performance counters, so a fresh runtime still reports zero calls.
+        """
+        probe = np.zeros((16, 16), dtype=np.float32)
+        probe[6:10, 6:10] = 255.0
+        automatic = np.empty_like(probe)
+        explicit = np.empty_like(probe)
+        try:
+            with self._lock:
+                for target, sigma in ((automatic, 0.0), (explicit, 1.0)):
+                    result = int(self._dll.vf_gaussian_blur_f32(
+                        self._context,
+                        probe.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+                        int(probe.shape[1]), int(probe.shape[0]), int(probe.strides[0]),
+                        target.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+                        int(target.strides[0]),
+                        9, ctypes.c_double(sigma),
+                    ))
+                    if result != 0:
+                        return False
+        except Exception:
+            return False
+        return not np.array_equal(automatic, explicit)
 
     def _call_gaussian_f32(self, function_name: str, arguments: tuple, input_bytes: int, output_bytes: int) -> int:
         """Run one float32 Gaussian export under the shared queue slot and context lock."""
@@ -1260,7 +1323,7 @@ class GpuRuntime:
                 ctypes.c_void_p,
                 ctypes.POINTER(ctypes.c_float), ctypes.c_int, ctypes.c_int, ctypes.c_int,
                 ctypes.POINTER(ctypes.c_float), ctypes.c_int,
-                ctypes.c_int,
+                ctypes.c_int, ctypes.c_double,
             ]
             blur.restype = ctypes.c_int
         roi = getattr(self._dll, "vf_gaussian_blur_f32_roi", None)
@@ -1270,9 +1333,11 @@ class GpuRuntime:
                 ctypes.POINTER(ctypes.c_float), ctypes.c_int, ctypes.c_int, ctypes.c_int,
                 ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
                 ctypes.POINTER(ctypes.c_float), ctypes.c_int,
-                ctypes.c_int,
+                ctypes.c_int, ctypes.c_double,
             ]
             roi.restype = ctypes.c_int
+        if blur is not None:
+            self._gaussian_f32_sigma_supported = self._probe_gaussian_f32_sigma()
 
     @staticmethod
     def _native_plan_descriptor(plan, image: np.ndarray) -> tuple[_VfPlanDescV1, object]:

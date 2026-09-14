@@ -119,6 +119,43 @@ class TileInspector:
 class InspectionResultAssembler:
     """Build the stable public result schema from completed pipeline phases."""
 
+    # Optional device exports that belong to each post-preprocessing pipeline step.  A step is
+    # reported as ``device`` only when the runtime really executed one of its exports during this
+    # run, so the split describes measured activity rather than the recipe request.
+    _DEVICE_STAGE_EXPORTS = {
+        "candidate_extraction": (
+            "vf_median_f32",
+            "vf_find_contours_u8",
+            "vf_find_contours_download",
+            "vf_connected_components_u8",
+        ),
+        "geometry_and_statistics": (
+            "vf_component_stats_u8",
+            "vf_ring_statistics_f32",
+        ),
+    }
+
+    @staticmethod
+    def _device_call_counts(gpu_runtime) -> dict:
+        """Return the per-export call counts of this run, or ``{}`` when unavailable."""
+        stats = getattr(gpu_runtime, "performance_stats", None)
+        if not callable(stats):
+            return {}
+        try:
+            snapshot = stats()
+        except Exception:  # a runtime that cannot report must not break result assembly
+            return {}
+        if not isinstance(snapshot, dict):
+            return {}
+        functions = snapshot.get("functions")
+        if not isinstance(functions, dict):
+            return {}
+        counts = {}
+        for name, entry in functions.items():
+            if isinstance(entry, dict):
+                counts[str(name)] = int(entry.get("calls", 0) or 0)
+        return counts
+
     @staticmethod
     def _detector_gpu_status(detector, gpu_runtime) -> dict:
         crossover_cpu = bool(getattr(detector, "cpu_crossover_only", False))
@@ -158,23 +195,47 @@ class InspectionResultAssembler:
             and not getattr(detector, "cpu_crossover_only", False)
             for detector in native_detectors
         )
+        call_counts = InspectionResultAssembler._device_call_counts(gpu_runtime)
+        step_sides = {}
+        step_exports = {}
+        for step, exports in InspectionResultAssembler._DEVICE_STAGE_EXPORTS.items():
+            executed = {
+                name: call_counts[name]
+                for name in exports
+                if call_counts.get(name, 0) > 0
+            }
+            step_exports[step] = executed
+            step_sides[step] = "device" if executed else "cpu"
+        # A detector whose candidate or geometry stage ran an optional device export is a hybrid:
+        # part of the step is on the device and part is still host work.  Say so explicitly, and
+        # record which exports were observed so the claim is checkable.
+        hybrid = {
+            step: sorted(executed)
+            for step, executed in step_exports.items()
+            if executed
+        }
+        note = (
+            "anchor_localization 僅在形狀界線內走 device（見 core/tiler.py "
+            "gpu_anchor_shapes_supported）；candidate_extraction、geometry_and_statistics 與 "
+            "pass_ng_decision 只在該次執行真的呼叫到對應 device export 時才回報 device，"
+            "因此「device」代表該步驟部分在 device、其餘仍在 host。"
+        )
+        if hybrid:
+            note += " 本次 device 端 export：" + "；".join(
+                f"{step}={','.join(names)}" for step, names in sorted(hybrid.items())
+            ) + "。"
         return {
             "image_decode": "cpu",
             "resident_upload": "device" if resident_image is not None else "cpu",
             "anchor_localization": "device" if resident_image is not None else "cpu",
             "tiling_roi": "device" if tiling_gpu_requested and resident_image is not None else "cpu",
             "preprocessing": "device" if plan_on_device else "cpu",
-            # These steps have no device implementation yet, so they are reported as host work
-            # rather than inferred from the preprocessing route.
-            "candidate_extraction": "cpu",
-            "geometry_and_statistics": "cpu",
+            "candidate_extraction": step_sides["candidate_extraction"],
+            "geometry_and_statistics": step_sides["geometry_and_statistics"],
             "pass_ng_decision": "cpu",
             "aggregation_and_reporting": "cpu",
-            "note": (
-                "anchor_localization 僅在形狀界線內走 device（見 core/tiler.py "
-                "gpu_anchor_shapes_supported）；candidate_extraction、geometry_and_statistics 與 "
-                "pass_ng_decision 目前仍無 device 實作，因此一律回報 cpu。"
-            ),
+            "hybrid_steps": hybrid,
+            "note": note,
         }
 
     @staticmethod

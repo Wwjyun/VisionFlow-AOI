@@ -359,26 +359,34 @@ VF_CUDA_API int vf_median_f32(
  *
  * Semantics. Single-channel float32, separable horizontal-then-vertical convolution with
  * reflect101 borders and float32 accumulation, using the same coefficients OpenCV's
- * cv2.getGaussianKernel(ksize, 0.0, CV_32F) produces (the 0.3*((ksize-1)*0.5-1)+0.8 sigma for
- * ksize > 9, OpenCV's fixed small-kernel table for ksize 3, 5, 7 and 9 - SMALL_GAUSSIAN_SIZE is 9
- * in OpenCV 5.x). Coefficients were checked bit-for-bit against cv2.getGaussianKernel for every
- * supported size, so the difference against cv2.GaussianBlur(src, (ksize, ksize), 0.0) comes only
- * from the summation order inside OpenCV's SIMD filter:
+ * cv2.getGaussianKernel(ksize, sigma, CV_32F) produces: `sigma > 0` is used directly for both
+ * axes (cv2.GaussianBlur defaults sigma2 to sigma1), while `sigma <= 0` selects OpenCV's automatic
+ * rule 0.3*((ksize-1)*0.5-1)+0.8, including its fixed small-kernel table for odd ksize <= 9
+ * (SMALL_GAUSSIAN_SIZE is 9 in OpenCV 5.x). `sigma` is a double so the caller's value is never
+ * narrowed on the way in; a NaN or infinite sigma has no OpenCV rule to reproduce and is refused
+ * with VF_CUDA_INVALID_ARGUMENT instead of being silently treated as the automatic sigma.
+ * Coefficients were checked bit-for-bit against cv2.getGaussianKernel for every supported size and
+ * for sigma 0.0/0.5/1.0/1.25/2.5/5.0, so the difference against
+ * cv2.GaussianBlur(src, (ksize, ksize), sigma) comes only from the summation order inside OpenCV's
+ * SIMD filter:
  *
  *   Verified tolerance (tools/gaussian_f32_equivalence.py,
  *   outputs_validation/cnr_profile/gaussian_f32_equivalence.txt):
- *     - input values in [0, 255] (the detector's gray/residual domain), any supported ksize:
- *       max |device - cv2| <= 2.0e-4 (measured 9.2e-5), mean <= 2.0e-5 (measured 1.1e-5).
+ *     - input values in [0, 255] (the detector's gray/residual domain), any supported ksize,
+ *       1008-case sigma sweep over {0.0, 0.5, 1.0, 1.25, 2.5, 5.0}:
+ *       max |device - cv2| <= 4.0e-4 (measured 9.2e-5 with sigma <= 0, 7.6e-5 with sigma > 0),
+ *       mean <= 5.0e-5 (measured 1.1e-5 with sigma <= 0, 3.1e-5 with sigma > 0).
  *     - the error scales with the magnitude of the source, not with the image size: it stayed
  *       below 5.0e-7 of the source range (measured 3.5e-7 on a +-1000 float32 source).
- *   The 202-CS-SN-1 result was then compared against the cv2.GaussianBlur reference on 39 scenes /
+ *   The 202-CS-SN-1 result was then compared against the cv2.GaussianBlur reference on 47 scenes /
  *   78 defects (tools/gaussian_202_matrix.py,
- *   outputs_validation/cnr_profile/gaussian_202_final_output_matrix.txt): PASS/NG, defect count,
+ *   outputs_validation/cnr_profile/gaussian_202_final_output_matrix.txt), including eight scenes
+ *   that set the detector's gaussian_sigma recipe parameter to 0.5..5.0: PASS/NG, defect count,
  *   every defect's bbox, area and confidence, the candidate mask and every other metadata field
- *   were identical in all 39 scenes. The only fields that moved were the residual-derived
- *   diagnostic floats reported inside the defect metadata - residual_median <= 1.5e-5,
- *   mad <= 7.6e-6, robust_noise_sigma <= 1.1e-5, residual_threshold <= 3.4e-5 absolute - which is
- *   the tolerance above appearing in the reported numbers, not in any detection decision.
+ *   were identical in all of them. The only fields that moved were the residual-derived diagnostic
+ *   floats reported inside the defect metadata - residual_median <= 1.5e-5, mad <= 7.6e-6,
+ *   robust_noise_sigma <= 1.1e-5, residual_threshold <= 3.4e-5 absolute - which is the tolerance
+ *   above appearing in the reported numbers, not in any detection decision.
  *
  * Supported kernel sizes. Exactly the odd sizes in [3, 127] - all 63 of them are covered by the
  * tolerance evidence above. Anything else (even, below 3, or above 127) is rejected: sizes below 3
@@ -397,7 +405,7 @@ VF_CUDA_API int vf_gaussian_blur_f32(
     void* context,
     const float* src, int width, int height, int src_stride,
     float* dst, int dst_stride,
-    int kernel_size);
+    int kernel_size, double sigma);
 
 /*
  * Optional rectangle variant of the float32 Gaussian: the same operator restricted to
@@ -405,17 +413,17 @@ VF_CUDA_API int vf_gaussian_blur_f32(
  *
  * The rectangle is treated as an isolated image: borders reflect inside it and pixels outside it
  * are never read, so the result equals cv2.GaussianBlur(src[y:y+height, x:x+width], (ksize, ksize),
- * 0.0) and the caller can blur a sub-window without uploading the whole plane. `src_stride` is the
- * byte stride of the full source, `dst_stride` the byte stride of the `width` x `height`
- * single-channel float32 result. Validation, tolerance and ksize rules are identical to
- * vf_gaussian_blur_f32.
+ * sigma) and the caller can blur a sub-window without uploading the whole plane. `src_stride` is
+ * the byte stride of the full source, `dst_stride` the byte stride of the `width` x `height`
+ * single-channel float32 result. Validation, sigma semantics, tolerance and ksize rules are
+ * identical to vf_gaussian_blur_f32.
  */
 VF_CUDA_API int vf_gaussian_blur_f32_roi(
     void* context,
     const float* src, int src_width, int src_height, int src_stride,
     int x, int y, int width, int height,
     float* dst, int dst_stride,
-    int kernel_size);
+    int kernel_size, double sigma);
 
 #ifdef __cplusplus
 }
