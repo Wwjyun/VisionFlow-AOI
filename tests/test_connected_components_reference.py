@@ -104,8 +104,8 @@ class ConnectedComponentsReferenceTests(unittest.TestCase):
 
         OpenCV labels 8-connectivity with the Bolelli 2x2 block scan, so
         provisional labels are created per block corner rather than per pixel and
-        the numbering differs even though the component count, the pixel sets and
-        the per-component stats all agree.
+        the numbering differs even though the component count and the pixel sets
+        agree.  The pixel sets are compared through the sorted bounding boxes.
         """
         for label, mask in cases():
             if not label.startswith("random_seed"):
@@ -115,12 +115,14 @@ class ConnectedComponentsReferenceTests(unittest.TestCase):
             )
             count, labels, stats, _ = connected_components_with_stats(mask, 8)
             self.assertEqual(count, count_ref, label)
-            self.assertEqual(stats[1:, 4].sum(), stats_ref[1:, 4].sum(), label)
-            # Same components, different numbering: the multiset of component
-            # bounding boxes must still agree.
             self.assertEqual(
                 sorted(map(tuple, stats[1:, :4])),
                 sorted(map(tuple, stats_ref[1:, :4])),
+                label,
+            )
+            self.assertEqual(
+                sorted(int(area) for area in stats[1:, 4]),
+                sorted(int(area) for area in stats_ref[1:, 4]),
                 label,
             )
             self.assertFalse(np.array_equal(labels, labels_ref), label)
