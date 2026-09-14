@@ -19,6 +19,7 @@ You implement focused code changes in the VisionFlow AOI repository (recipe-driv
 - A failed GPU step restarts the entire detector on CPU; never continue from partial GPU results. Preserve `gpu.mode` semantics: `cpu` never loads CUDA, `auto` may fall back, `cuda` fails explicitly.
 - Preserve ABI v1 and optional-export probing for old DLLs. Do not edit `gpu/include/*.h`, `.cu` files, or ctypes signatures unless explicitly asked.
 - Detectors declare cached immutable `PreprocessPlan` objects with shared typed operators; no detector-specific CUDA workflows.
+- GPU-mode boundary (see `AGENT.md`): CPU decodes the image, one H2D upload, then localization, preprocessing, candidate extraction, geometry/statistics, and PASS/NG stay on the GPU until results are downloaded for aggregation/reporting on CPU. Only replace a CPU step with a GPU one when equivalence tests prove identical results.
 - Keep behavior in the narrowest module (`core/`, `detectors/`, `gui/`, `tools/`); no mutable module globals for detector/recipe/image/GPU state.
 - New operator-facing GUI text is Traditional Chinese (PASS, NG, ERROR, CPU, CUDA, ROI, DLL stay English).
 - Match surrounding code style, naming, and comment density.

@@ -66,9 +66,12 @@ Put behavior in the narrowest appropriate module. Do not duplicate pipeline or f
 - `CpuPreprocessExecutor` defines OpenCV fallback semantics. `CudaPreprocessExecutor` selects a generic native plan, compatibility adapter, reusable primitives, or explicit fallback.
 - Add a shared operator when an algorithm is reusable. Detector-named native adapters are compatibility code, not the extension model.
 - Do not silently substitute a faster operation with different semantics, such as nearest-neighbor for OpenCV `INTER_AREA`.
-- Prefer one upload, multiple device operators, and one necessary download. Reuse context buffers across operators, tiles, and images where lifetime permits.
+- GPU-mode pipeline boundary: image file reading and decoding (PNG/BMP/JPEG) stay on CPU, and the decoded image is uploaded to the device exactly once. After that upload, every inspection step before aggregation must run on the GPU without further pixel H2D: Template Anchor Grid localization, tile/ROI generation, preprocessing, candidate extraction (contours or connected components), geometry/shape filtering, statistics such as CNR, and PASS/NG defect decisions. Download only final defect results plus pixels explicitly needed for overlay, NG tiles, debug images, or GUI display.
+- Aggregation, report generation (overlay rendering, CSV/JSON, PNG encoding), YAML, logging, GUI control, and disk I/O stay on CPU.
+- Every GPU-mode step keeps its CPU implementation as the correctness reference and the whole-detector fallback. A GPU implementation replaces a CPU step only after tests prove identical PASS/NG, defect count, bbox, area, confidence, metadata, and OpenCV contour/label ordering (or a documented, tested tolerance).
+- Steps that do not yet have a verified GPU implementation remain CPU work tracked in the `Todo.md` full-GPU section. Report the actual device/host split from runtime metadata; never describe the flow as fully GPU before it is.
+- Reuse context buffers across operators, tiles, and images where lifetime permits.
 - Preserve context-owned resident image/device ROI lifetime and generation checks. Batch and monitor share one `GpuExecutionSession`; do not create one runtime per image or per worker.
-- Keep small contour/geometry work, YAML, aggregation, GUI control, CSV/JSON, PNG encoding, and disk I/O on CPU unless profiling proves otherwise.
 - Tile-level CPU parallelism is opt-in. Use thread-local detector instances, preserve input ordering, and keep GPU detector or resident-image execution on the single serialized GPU path.
 - Recipe caching must invalidate on file metadata changes and return independent deep copies; never expose a mutable cached recipe.
 - Debug intermediate images are opt-in runtime payloads. Strip them from JSON and public tile results, and never enable them in production defaults.
@@ -109,7 +112,7 @@ Put behavior in the narrowest appropriate module. Do not duplicate pipeline or f
 
 ## Future detector development contract
 
-- Every new traditional CV detector must express reusable image preprocessing as a cached immutable `PreprocessPlan`; detector code keeps only detector-specific geometry, filtering, PASS/NG decisions, defect metadata, and deterministic ordering.
+- Every new traditional CV detector must express reusable image preprocessing as a cached immutable `PreprocessPlan`; detector code keeps only detector-specific parameters, decision rules, defect metadata, and deterministic ordering. Candidate extraction, geometry filtering, and statistics must be designed so the GPU-mode boundary above can keep them on the device through shared, backend-neutral operators rather than detector-specific CUDA workflows.
 - Cache keys must cover the input shape/dtype and every detector parameter that changes preprocessing semantics. Use the bounded shared plan cache rather than mutable module globals or rebuilding plans for every tile.
 - `CpuPreprocessExecutor` is the correctness reference. Optional CUDA execution must use shared typed operators, capability reporting, and full-detector CPU restart on unsupported semantics or failure.
 - Do not add detector-specific CUDA workflows or exports for new detectors. When a reusable operation is missing, add a backend-neutral typed operator and its CPU reference first; temporary compatibility adapters require an explicit migration item in `Todo.md`.

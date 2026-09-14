@@ -191,10 +191,11 @@
 目標：整圖一次 H2D 後，前處理、候選抽取、幾何／統計判定都留在 GPU，只下載最終缺陷清單（或 NG／overlay 必要像素）。目前 GPU mode 只涵蓋前處理 plan；resident ROI 後已無像素 H2D，但每個 ROI 仍下載 binary mask（401／203／503／505／506）或 Gray（202-CS-SN-1）給 CPU 做後續步驟。任何移轉都必須維持 PASS/NG、缺陷 bbox／area／confidence／metadata 與排序和 CPU 基準一致，並保留整顆 Detector CPU fallback。
 
 - [ ] 202-CS-SN-1 自動 CNR 主體 GPU 化：新增共用 typed operator 與 CUDA 實作，涵蓋 float 大核 Gaussian 背景（含 sigma 自動規則）、residual、MAD（與 NumPy median 完全相同的中位數）、`max(8, 3×sigma)` 門檻 mask、形態學、8-connectivity connected components（標籤順序與 `cv2.connectedComponentsWithStats` 的 stats 完全一致）、局部背景 ring CNR 統計，只下載候選統計。2026-09-14 產線配置（16384×13000、6 個 2000×12000 ROI）CPU Detector 約 4.9 s、端到端 5.85 s，GPU 目前只做 Gray 使端到端 6.06 s（略慢），收益最大。
-- [ ] 讀圖解碼 GPU 化評估：16384×13000 大圖 CPU 解碼約 0.8 s（占 GPU 模式端到端約 55%）；評估 JPEG 用 nvJPEG、BMP 直接上傳原始像素、PNG deflate 的 GPU 可行性，保留 Windows 中文路徑、EXIF 旋轉、像素上限與壞檔錯誤語意，並量測解碼後直接成為 resident image 的端到端收益。
-- [ ] Contour 類 Detector（401 系列、203-AS-SN-1、503／505／506）候選抽取 GPU 化評估：`findContours` 為順序追蹤、無與 OpenCV 等價的 GPU 實作，先前評估 connected components 在 pixel area、孔洞 contour 數與排序語意不等價；需決定是實作 OpenCV 等價的 GPU contour／幾何，或以 GPU 候選統計預篩再只下載候選小區域給 CPU，並以 PASS/NG、bbox、area、contour 順序等價測試把關。
-- [ ] Template Anchor Grid 定位 GPU 化評估（產線配置約 0.06～0.07 s，優先度低），需與 OpenCV `matchTemplate` 分數、定位座標完全一致。
-- [ ] 上述方向決定後更新 `AGENT.md` 的 CPU/GPU 契約（目前規定 contour／幾何、YAML、彙總、報表與磁碟 I/O 留在 CPU，除非 profiling 證明值得移轉），並同步 README 與 GPU 文件。
+- [x] 讀圖解碼維持 CPU。（2026-09-14 使用者決定：PNG／BMP 等讀檔解碼留在 CPU，解碼後整圖一次上傳；16384×13000 大圖 CPU 解碼約 0.8 s 不列入 GPU 化範圍）
+- [ ] Contour 類 Detector（401 系列、203-AS-SN-1、503／505／506）候選抽取、幾何篩選與 PASS/NG 移到 GPU：`findContours` 為順序追蹤、無與 OpenCV 等價的現成 GPU 實作，先前評估 connected components 在 pixel area、孔洞 contour 數與排序語意不等價；需設計與 OpenCV contour／幾何完全等價的共用 GPU operator，以 PASS/NG、bbox、area、contour 順序等價測試把關，完成前維持 CPU 並如實回報。
+- [ ] Template Anchor Grid 定位 GPU 化（產線配置約 0.06～0.07 s；依新契約定位須在上傳後於 GPU 完成），需與 OpenCV `matchTemplate` 分數、定位座標完全一致。
+- [x] 更新 `AGENT.md` 的 CPU/GPU 契約。（2026-09-14 依使用者指示改為 GPU mode 目標邊界：CPU 讀檔解碼後一次上傳，Template Anchor Grid 定位、tile／ROI、前處理、候選抽取、幾何／統計與 PASS/NG 皆在 GPU，只下載最終結果與報表必要像素；彙總、報表、YAML、GUI 與磁碟 I/O 在 CPU。CPU 實作仍為正確性基準與整顆 Detector fallback，未有等價 GPU 實作的步驟依本節待辦處理；`.claude/agents/aoi-coder.md` 同步摘要）
+- [ ] 各步驟實際移到 GPU 後，同步更新 README 與 `gpu/README.md` 的使用者說明（README 目前如實描述 contour／幾何在 CPU）。
 
 ### 202-CS-SN-1／203-AS-SN-1／503-CS-SN-1／506-CS-SN-1 RTX 驗收（2026-09-14 補列）
 
