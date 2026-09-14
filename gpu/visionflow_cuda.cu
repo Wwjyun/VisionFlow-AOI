@@ -1279,6 +1279,65 @@ __device__ __forceinline__ void match_offer_candidate(
     }
 }
 
+// One thread per output row within a column band. The template is staged in shared memory, because
+// it is the small, constant, every-candidate operand; the ROI stays in global memory and each row
+// the thread reads is reused across all template rows it participates in, so the cost per output
+// is one read of a template_width strip plus one multiply-add chain. Consecutive threads handle
+// consecutive output rows, so both the ROI loads and the template loads coalesce (the warp shares
+// one template row and reads a contiguous ROI patch).
+__global__ void match_score_shared_template_kernel(
+    const uint8_t* roi, int roi_width,
+    int output_width, int output_height,
+    int template_width, int template_height, int template_pixels,
+    int column_band,
+    double template_mean, double template_variance,
+    const uint8_t* templ, unsigned long long* best_keys) {
+    extern __shared__ unsigned char shared_bytes[];
+    uint8_t* shared_template = shared_bytes;
+
+    for (int index = threadIdx.y * blockDim.x + threadIdx.x;
+         index < template_width * template_height; index += blockDim.x * blockDim.y) {
+        shared_template[index] = templ[index];
+    }
+    __syncthreads();
+
+    const int output_row = blockIdx.y * blockDim.y + threadIdx.y;
+    const int column = blockIdx.x * column_band + threadIdx.x;
+    if (column >= output_width || output_row >= output_height) return;
+
+    long long window_sum = 0;
+    long long window_square = 0;
+    long long weighted = 0;
+    for (int template_row = 0; template_row < template_height; ++template_row) {
+        const uint8_t* image_line =
+            roi + static_cast<size_t>(output_row + template_row) * roi_width + column;
+        const uint8_t* template_line =
+            shared_template + static_cast<size_t>(template_row) * template_width;
+        long long term = 0;
+        for (int offset = 0; offset < template_width; ++offset) {
+            const int value = image_line[offset];
+            window_sum += value;
+            window_square += static_cast<long long>(value) * value;
+            term += static_cast<long long>(value) * template_line[offset];
+        }
+        weighted += term;
+    }
+    const double mean = static_cast<double>(window_sum) / template_pixels;
+    double window_variance = static_cast<double>(window_square) / template_pixels - mean * mean;
+    if (window_variance < 0.0) window_variance = 0.0;
+    const double denominator = std::sqrt(window_variance * template_variance) * template_pixels;
+    double score = -1.0;
+    if (denominator > 0.0) {
+        score = (static_cast<double>(weighted) - template_mean * window_sum) / denominator;
+    }
+    if (score > 1.0) score = 1.0;
+    if (score < -1.0) score = -1.0;
+    // Several output rows of the same column are in flight at once, so publish through the same
+    // packed-key compare-and-swap the tiled kernel uses; the ordering is identical, so the winner
+    // does not depend on which block ran first.
+    match_offer_candidate(score, column, output_row, best_keys);
+}
+
 // Tiled score kernel. Each block stages the ROI patch covering its output tile into shared memory
 // once, so the window sum, its square and the template-weighted sum are all accumulated from
 // shared memory instead of re-reading the ROI for every candidate. The template stays in global
@@ -2858,7 +2917,12 @@ VF_CUDA_API int vf_match_template_gray_u8(
         }
         break;
     }
-    if (shared_bytes > MATCH_SHARED_LIMIT_BYTES) {
+    // When the ROI tile had to shrink below the tile we would like, the template-in-shared layout
+    // is the better trade: the template is the small operand and the ROI streams through L2.
+    const bool use_shared_template =
+        (tile_cols < MATCH_TILE_COLS || tile_rows < MATCH_TILE_ROWS) &&
+        template_bytes <= MATCH_SHARED_LIMIT_BYTES;
+    if (shared_bytes > MATCH_SHARED_LIMIT_BYTES && !use_shared_template) {
         // Beyond this the template height alone exceeds the block budget, so the caller restarts
         // localization on the CPU reference instead of receiving a wrong anchor.
         return VF_CUDA_UNSUPPORTED;
@@ -2868,24 +2932,50 @@ VF_CUDA_API int vf_match_template_gray_u8(
             static_cast<int>(MATCH_SHARED_LIMIT_BYTES)) != cudaSuccess) {
         return cuda_result(cudaGetLastError());
     }
+    if (use_shared_template) {
+        if (cudaFuncSetAttribute(
+                match_score_shared_template_kernel,
+                cudaFuncAttributeMaxDynamicSharedMemorySize,
+                static_cast<int>(template_bytes)) != cudaSuccess) {
+            return cuda_result(cudaGetLastError());
+        }
+        const dim3 shared_grid(
+            static_cast<unsigned int>((output_width + MATCH_BLOCK_X - 1) / MATCH_BLOCK_X),
+            static_cast<unsigned int>((output_height + MATCH_BLOCK_Y - 1) / MATCH_BLOCK_Y));
+        const dim3 shared_block(MATCH_BLOCK_X, MATCH_BLOCK_Y);
+        error = cudaMemsetAsync(
+            best_keys, 0, sizeof(unsigned long long) * match_candidate_slots(output_width),
+            persistent->stream);
+        if (error != cudaSuccess) return cuda_result(error);
+        match_score_shared_template_kernel<<<
+            shared_grid, shared_block, template_bytes, persistent->stream>>>(
+            persistent->u8[MATCH_ROI_BUFFER], search_width,
+            output_width, output_height, template_width, template_height,
+            template_width * template_height, MATCH_BLOCK_X,
+            template_mean, template_variance,
+            persistent->u8[MATCH_TEMPLATE_BUFFER], best_keys);
+        result = visionflow_cuda::kernel_launch_result();
+        if (result != VF_CUDA_OK) return result;
+    } else {
     const int tiles_x = (output_width + tile_cols - 1) / tile_cols;
     const int tiles_y = (output_height + tile_rows - 1) / tile_rows;
     const dim3 score_grid(static_cast<unsigned int>(tiles_x) * static_cast<unsigned int>(tiles_y));
     const dim3 score_block(MATCH_BLOCK_X, MATCH_BLOCK_Y);
-    // The per-column key slots are the compare-and-swap targets, so they must start empty.
-    error = cudaMemsetAsync(
-        best_keys, 0, sizeof(unsigned long long) * match_candidate_slots(output_width),
-        persistent->stream);
-    if (error != cudaSuccess) return cuda_result(error);
-    match_score_kernel<<<score_grid, score_block, shared_bytes, persistent->stream>>>(
-        persistent->u8[MATCH_ROI_BUFFER], search_width,
-        output_width, output_height, template_width, template_height,
-        template_width * template_height, tile_cols, tile_rows,
-        template_mean, template_variance,
-        persistent->u8[MATCH_TEMPLATE_BUFFER],
-        best_keys);
-    result = visionflow_cuda::kernel_launch_result();
-    if (result != VF_CUDA_OK) return result;
+        // The per-column key slots are the compare-and-swap targets, so they must start empty.
+        error = cudaMemsetAsync(
+            best_keys, 0, sizeof(unsigned long long) * match_candidate_slots(output_width),
+            persistent->stream);
+        if (error != cudaSuccess) return cuda_result(error);
+        match_score_kernel<<<score_grid, score_block, shared_bytes, persistent->stream>>>(
+            persistent->u8[MATCH_ROI_BUFFER], search_width,
+            output_width, output_height, template_width, template_height,
+            template_width * template_height, tile_cols, tile_rows,
+            template_mean, template_variance,
+            persistent->u8[MATCH_TEMPLATE_BUFFER],
+            best_keys);
+        result = visionflow_cuda::kernel_launch_result();
+        if (result != VF_CUDA_OK) return result;
+    }
 
     // Reduce the per-column keys to one global best with the same packed ordering, then unpack it
     // on the device so the host receives coordinates and the quantized score.

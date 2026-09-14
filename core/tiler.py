@@ -482,6 +482,13 @@ class GridAnchorConfig:
         )
 
 
+# Device-anchor bounds taken from the RTX 3090 measurements recorded in Todo.md: above this
+# template side, or below this search area, the CPU reference is faster than the CUDA kernel, so
+# the device path is skipped for those shapes.
+MATCH_TILE_TEMPLATE_LIMIT = 128
+MATCH_TILE_SEARCH_PIXELS_LIMIT = 256 * 256
+
+
 class Tiler:
     def __init__(
         self,
@@ -493,7 +500,7 @@ class Tiler:
         gpu_runtime=None,
         resident_image=None,
         crop_workers: int | str = "auto",
-        gpu_anchor_enabled: bool = False,
+        gpu_anchor_enabled: bool = True,
     ):
         if width <= 0 or height <= 0:
             raise ValueError("Tile width and height must be positive.")
@@ -510,8 +517,9 @@ class Tiler:
         self.image_loader = ImageLoader()
         self.gpu_runtime = gpu_runtime
         self.resident_image = resident_image
-        # Off until the CUDA localization kernel is both equivalent and faster than the CPU
-        # reference; see _find_grid_anchor_on_device for the measured evidence.
+        # The device localization path runs by default because it measured 1.6-3.9x faster than the
+        # CPU reference on the RTX 3090 within the shape bound checked by
+        # gpu_anchor_shapes_supported; anything outside that bound keeps the CPU reference.
         self.gpu_anchor_enabled = bool(gpu_anchor_enabled)
         self.crop_workers = crop_workers
         self.last_profile_ms = {"template_match_ms": 0.0, "roi_generation_ms": 0.0}
@@ -719,6 +727,8 @@ class Tiler:
         resident = self.resident_image
         if runtime is None or resident is None or not getattr(runtime, "supports_template_match", False):
             return None
+        if not self.gpu_anchor_shapes_supported(search_rect, template_gray.shape):
+            return None
         try:
             match = runtime.match_template_gray(resident, tuple(search_rect), template_gray)
         except Exception:
@@ -734,6 +744,23 @@ class Tiler:
             "score": float(match["score"]),
             "backend": "cuda_dll",
         }
+
+    @staticmethod
+    def gpu_anchor_shapes_supported(search_rect, template_shape) -> bool:
+        """Whether the device anchor path measured faster than the CPU reference for this shape.
+
+        RTX 3090 evidence (Todo.md): 1.6-3.9x faster while the template is at most
+        MATCH_TILE_TEMPLATE_LIMIT px per side, but slower for tiny searches because the CUDA call
+        overhead then dominates the CPU work. Outside the bound the CPU reference stays in charge.
+        """
+        template_height, template_width = (int(value) for value in template_shape[:2])
+        search_width = int(search_rect[2])
+        search_height = int(search_rect[3])
+        if template_height <= 0 or template_width <= 0:
+            return False
+        if max(template_height, template_width) > MATCH_TILE_TEMPLATE_LIMIT:
+            return False
+        return search_width * search_height >= MATCH_TILE_SEARCH_PIXELS_LIMIT
 
     @staticmethod
     def _positions(total: int, size: int, step: int) -> list[int]:
