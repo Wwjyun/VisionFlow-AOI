@@ -357,13 +357,25 @@ float32 累加、OpenCV 的 kernel 係數）與 `vf_gaussian_blur_f32_roi`，並
 （1）**label 0 的 stats 描述的是背景像素**（例如 50×40 影像中 16×10 白色矩形 → `[0,0,50,40,1840]`）；
 （2）**某標籤若無像素，stats 為 sentinel `[-1, INT_MAX, 0, 0, 0]`、centroid 為 NaN**（全前景時 label 0 即如此）。
 
-**已知限制（尚未解決）**：**隨機遮罩**上 component 數量與像素集合正確，但**標籤編號順序不同**
+**已知限制（尚未解決，已縮小範圍）**：**隨機遮罩**上 component 數量與像素集合正確，但**標籤編號順序不同**
 （例：96 個 component 數量相同，但 cv2 把 `(19,0)` 編為 5、參考實作編為 4）。
 目前推測是 provisional label 的指派／合併後重編號規則尚未完全一致；此缺口已由專門的測試
 （`test_random_masks_agree_on_component_count_but_not_yet_on_label_order`）釘住，
 **不影響既有產線**（202 仍使用 OpenCV），但**在修正前不得以本參考實作作為 GPU 化的黃金標準**。
-下一步：對照 OpenCV `connectedComponents_subset`／`icvLabelBlobs` 的 provisional 指派與
-`icvSortAndCompressLabels`（或等價的 labels 重編號）逐行修正，再擴大隨機遮罩矩陣。
+已排除的假設（實證，非推測）：
+- **不是「首像素的 raster 掃描順序」**：以此規則檢查隨機遮罩，96 個 component 中有 **63 個不符**
+  （例：cv2 label 4 的首像素是 (16,1)，但掃描順序上它應為 8；cv2 label 5 的首像素 (19,0) 應為 4）。
+  第二個隨機遮罩（69 個 component）有 49 個不符。結構化案例（實心矩形、合併的 L 形等）在此規則下 0 個不符，
+  所以此規則只在「無合併」的情境成立。
+- **不是「union-find root 升冪」**：先前已試過，同樣不符。
+- 因此編號取決於 OpenCV provisional label 的**建立與合併後重編號**細節
+  （`icvLabelBlobs` 的 `lbl` 配置與 `icvSortAndCompressLabels` 的重排），需逐行對照原始碼才能確定。
+
+後續處理建議（以此為界，不要再盲目試規則）：
+1. 直接對照 OpenCV `connectedComponents_subset` 的兩段式實作逐行移植，特別是合併時標籤的處理順序。
+2. 或以「小型合成遮罩逐一枚舉」的方式反推：對每個會產生合併的 3×3／4×4 圖樣比較 cv2 標籤，建立規則表後再推廣。
+3. 在修正並通過全部隨機遮罩矩陣之前，**不得**以本參考實作作為 connected components GPU 化的黃金標準；
+   202 目前仍使用 OpenCV，產線不受影響。
 
 **可平行推進、不依賴上述卡點的項目：**
 1. 202-CS-SN-1 其餘步驟（**不含 median，已於本輪完成**）：Gaussian 背景、遮罩、connected components
@@ -629,6 +641,8 @@ float32 累加、OpenCV 的 kernel 係數）與 `vf_gaussian_blur_f32_roi`，並
 - [ ] 加速不得犧牲 GUI 回應、打包啟動、結果追溯、錯誤訊息或 CPU fallback。
 
 ## 完成紀錄
+
+- [x] 2026-09-15：為 202 的 connected components 建立黃金參考並把「標籤編號不符」縮小到可驗證的範圍。新增 `tools/connected_components_reference.py`（union-find 實作，含 OpenCV 的 label-0 語意）與 `tests/test_connected_components_reference.py`（5 tests，全套 394 → 399 tests OK）。結構化遮罩（全零、全滿、單像素、實心矩形、兩矩形、對角線、對角相鄰、環形孔洞、貼邊、morphology 雜訊遮罩；4 與 8 連通）的 label map、標籤順序、stats、centroids **全部與 `cv2.connectedComponentsWithStats` 相同**，並補上兩個容易漏掉的 OpenCV 語意：（1）**label 0 的 stats 描述背景像素**（50×40 影像中 16×10 白色矩形 → `[0,0,50,40,1840]`）；（2）**無像素的標籤 stats 為 sentinel `[-1, INT_MAX, 0, 0, 0]`、centroid 為 NaN**（全前景時 label 0 即如此）。**隨機遮罩**上 component 數量與像素集合永遠正確，但標籤編號順序不同；本輪以實證排除「首像素 raster 掃描順序」假設（96 個 component 中 63 個不符、第二個遮罩 69 個中 49 個不符，而結構化案例 0 個不符，故該規則只在無合併時成立），先前的「union-find root 升冪」亦已排除，因此編號取決於 OpenCV provisional label 的建立與合併後重編號細節。此缺口已由 `test_random_masks_agree_on_component_count_but_not_yet_on_label_order` 釘住並在 Todo 記錄後續兩條明確路徑；**修正前不得以此參考實作作為 connected components GPU 化的黃金標準**，202 仍使用 OpenCV，產線不受影響。未修改 runtime、CUDA source／ABI／DLL。
 
 - [x] 2026-09-14：實作並量測 Template Anchor Grid 的 GPU 定位（第一版，未達驗收門檻，預設關閉）。新增 optional ABI v1 export `vf_match_template_gray_u8`：讀取 context 已 resident 的原圖，在 device 上以 `bgr_gray_roi_kernel` 取 search ROI 的 gray（新 kernel 必要，因為 resident sub-rectangle 不是緊密排列，原 `bgr_gray_kernel` 會用錯 stride 讀到錯誤像素）、以兩個垂直 prefix 取得 window sum 與 window square sum，再逐候選計算 TM_CCOEFF_NORMED 並以 packed key 的 atomicCAS 取全域最佳；key 順序為「分數大者勝、同分取最上列再取最左行」，與 `cv2.minMaxLoc` 在本機的平手行為一致，且只下載 match 矩形與分數（無像素 H2D）。`core/tiler.py` 的 `_find_grid_anchor` 可改走 GPU、失敗或不支援時回 CPU 參考路徑，並在 tile metadata 回報 `grid_anchor_backend`。RTX 3090 實測（`tools/benchmark_anchor_grid_gpu.py`）：定位座標在 7 個合成場景中只有 3 個與 OpenCV 相同（512×512／4000×4000 等一致且分數差 ≤ 4e-7），其餘 4 個座標不同、分數差 0.43～0.96；速度在每個尺度都慢於 CPU（512×512 5.4→48.5 ms、1024×1024 29.0→105.6 ms、2000×12000 611→19630 ms、4000×4000 389→1106 ms）。因此未接入產線：`Tiler.gpu_anchor_enabled` 預設 False，既有 Recipe、GUI、CLI 與 CPU 結果完全不變。新增 `tests/test_tiler_anchor_backend.py`（4 tests）驗證 GPU 路徑接通、`VF_CUDA_UNSUPPORTED` 與缺少 export／無 resident image 時回 CPU 參考；全套 363 tests OK。此項仍為未完成待辦：需以 shared-memory tiling 重寫 kernel 並通過座標／分數等價矩陣後才可預設啟用。未修改 ABI v1 既有匯出語意。
 
