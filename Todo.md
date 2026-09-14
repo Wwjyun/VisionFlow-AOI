@@ -129,7 +129,7 @@
 - [x] 900-CS-AP-1 DAG 接上 CUDA/native executor，共用 device gray 並只下載必要 masks。
 - [x] 401/401-1/401-2 的 `findContours` 與少量幾何分析暫留 CPU，只下載 binary mask。
 - [x] 401-2 contour mask 改為局部 bbox mask，避免每個 contour 配置整張 ROI mask。
-- [ ] 評估 401-2 white-pixel reduction 移至 GPU，只下載統計值與必要 mask。（已拆出 `white_ratio_analysis` profiler；CPU bbox-local counting 改用 OpenCV countNonZero/bitwise_and，512² synthetic median 0.0343→0.0151 ms；GPU 搬移待 RTX/production 佔比證明）
+- [ ] 評估 401-2 white-pixel reduction 移至 GPU，只下載統計值與必要 mask。（2026-09-14 依使用者指示暫緩：401-CS-AP-2 可能不再使用、目前僅保留，除非恢復使用否則不投入 GPU 化；已拆出 `white_ratio_analysis` profiler；CPU bbox-local counting 改用 OpenCV countNonZero/bitwise_and，512² synthetic median 0.0343→0.0151 ms；GPU 搬移待 RTX/production 佔比證明）
 - [x] 評估 connected components；bbox 雖可一致，但 pixel area、孔洞 contour 數與既有排序語意不等價，且固定 seed 4K CPU benchmark 無收益，因此不取代 contours。
 - [ ] 全部 detector 遷移並通過 RTX 3090 驗收後，才評估移除 detector-specific compatibility adapter。
 
