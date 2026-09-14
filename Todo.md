@@ -87,7 +87,8 @@
 - [x] Adaptive Mean 使用 replicate-border 64-bit integral image，視窗查詢為 O(1)。
 - [x] Integral image 使用 row scan、transpose、第二次 row scan，並檢查 allocation overflow。
 - [x] 驗證工具已加入 Gaussian、Adaptive Mean、401-2 fused 與 4K benchmark 案例。
-- [ ] Gaussian 加入 shared-memory tile/halo，實測 kernel 45 收益與限制。
+- [x] Gaussian 加入 shared-memory tile/halo，實測 kernel 45 收益與限制。（2026-09-14 RTX 3090：block-local tile/halo 融合兩段 pass 輸出完全相同但全面約慢 2 倍，未採用；改採保留 reflect101 邊界的內部像素無分支快速路徑，k45 在 4K／2300×12000 ROI 交錯 A/B 10/10 勝出、kernel 時間降約 40～47%，小 kernel 在雜訊範圍）
+- [ ] 正式 Recipe 真圖量測 Gaussian 快速路徑對 Detector／端到端的實際占比與收益；512² tile 的 k45 kernel 僅約 0.09→0.08 ms，收益主要在大 ROI。
 - [x] CUDA event 分別量測 Adaptive Mean integral/kernel、Gaussian passes 與 threshold kernel；待 RTX runner 回收實測數值。
 
 ### Persistent context 與 buffers
@@ -170,7 +171,7 @@
 - C（可分離形態學）：上方已有 5×5 open、iterations=10 的基準、等價與實機收益待辦。
 - D（pinned memory＋stream 重疊）：上方已有評估待辦；須以多張圖片的批次／監控流程量測 H2D、kernel、必要 D2H 的實際重疊、host RAM／VRAM 峰值與端到端吞吐，單張圖片的序列時間不能直接當成可重疊收益。
 - [ ] E（向量化／`__restrict__`／`__ldg`）：以 profiler 選出受記憶體存取限制的 kernel，再分別試向量化載入／儲存及適用的編譯器讀取提示；確認對齊、stride、1／3 channel、ROI 邊界與 OpenCV 輸出語意，逐項測 kernel、Detector 和端到端收益。`__restrict__`／`__ldg` 不預設有效，沒有可重現收益即不採用。
-- F（Gaussian shared memory）：P2 已有 tile／halo 與 kernel 45 的待辦，需先證明 Gaussian 在正式 Recipe 的耗時占比。
+- F（Gaussian shared memory）：2026-09-14 已在 RTX 3090 實測 shared-memory tile／halo 較慢而不採用，改以內部快速路徑取得 k45 kernel 約 40～47% 收益（見 P2）；正式 Recipe 真圖占比仍待量測。
 - G（`INTER_AREA` 完整等價）：2026-09-14 已完成 CUDA Resize(area) 與 OpenCV 逐像素等價及合成 Recipe 端到端驗收（見 P1）；真實樣本仍依 RTX 驗收區。
 - I（RTX 實機驗收）：上方效能 gate、下方 RTX 3090 的 production PASS／NG、GUI、打包與壓測待辦仍未完成；H（metrics／等價驗證）貫穿 A～G，不另估一份收益。
 
@@ -412,6 +413,8 @@
 - [ ] 加速不得犧牲 GUI 回應、打包啟動、結果追溯、錯誤訊息或 CPU fallback。
 
 ## 完成紀錄
+
+- [x] 2026-09-14：完成 CUDA Gaussian shared-memory tile／halo 實測並改採內部快速路徑。先依 5×5 morphology 模式實作單次 launch 的 block-local tile（reflect101 載入 halo、水平與垂直 pass 皆在 shared memory，radius≤32），27 組 512²／4K／2300×12000 ROI、1／3 通道、kernel 3～45 的輸出 SHA 與舊版完全相同，但 CUDA event 時間全面約慢 2 倍（4K 單通道 k45 1.145→2.179 ms、大 ROI 3 通道 k45 10.3→21.5 ms），因此移除不採用。改在原兩段式 kernel 對不需邊界反射的內部像素使用連續視窗、無 `reflect101` 分支的快速路徑，邊界像素維持原公式；同一程序交錯 A/B 各 10 輪：4K 單通道 k45 1.23→0.68 ms（9/10）、4K 3 通道 k45 3.16→1.74 ms（10/10）、4K 3 通道 k15 1.18→0.84 ms（8/10）、2300×12000 ROI 單通道 k45 3.59→2.06 ms、3 通道 k45 10.28→5.42 ms（皆 10/10），kernel 3～11 差異在雜訊範圍，所有輸出與 CPU OpenCV 0 差異。linear／DAG plan、stateless primitive 與 401-2 fused adapter 共用同一 kernels；stateless 4K k45 含傳輸 median 6.05 ms（CPU 12.23 ms）。以 CUDA 13.3、VS 18、`sm_86` 重編 DLL，native smoke、完整 validator（含 `--resize-area-pipeline`、benchmark、crossover、morphology profile、10／100／1000 stress）、fault injection、341 tests、compileall、CUDA preflight 與 `git diff --check` 均通過。512² tile 的 k45 kernel 僅約 0.09→0.08 ms，正式 Recipe 真圖收益另列待辦；ABI 未變。
 
 - [x] 2026-09-14：CUDA `Resize(area)` 改為與 OpenCV `INTER_AREA` 逐像素一致。先以 Python 重建 OpenCV 5.0 CV_8UC1 行為並在 393 組隨機、二值、常數及大縮放比案例與 `cv2.resize` 完全相同；CUDA 依同一規則實作：相同尺寸 copy、2×2 `(sum+2)>>2`、其他整數倍 `sum × (float)(1/area)`、非整數倍在 plan create 以 host double 建立與 `computeResizeAreaTab` 相同的來源索引／float 權重表並上傳一次（execute 仍無配置、維持一次 H2D／D2H），kernel 依 `ResizeArea_Invoker` 的 float 累加順序計算並 half-even 捨入。stateless `vf_resize_gray_u8` 的縮小路徑共用相同實作，放大路徑不變。`cuda_project.json` 新增 `fmad: false`，build script 對 DLL 與 smoke 傳入 `--fmad=false`：同矩陣以預設 `--fmad=true` 重編時 324 組輸出、7,856 個像素不一致，關閉後 483 組、7,197 萬像素 0 差異。`validate_cuda_dll.py` 的 area 比對改為 0 容差並擴充為 179 組尺寸（copy／2×2／整數倍／單軸不變／1 像素邊界／4K／13000×2300 等，含非連續來源），新增 `--resize-area-pipeline` 以正式 `PRODUCT_A_CIRCLE_401_1_AOI_01.yaml` 在 `process_scale` 1.0／0.5／0.37／0.25 對合成 PASS／NG 圖跑完整 CPU/GPU Pipeline，8 組全部相同且 GPU 無 fallback。RTX 3090 含傳輸 median：4K 0.5 倍 GPU 1.85／CPU 0.91 ms、4K 0.37 倍 1.92／3.00 ms、16384×13000 0.37 倍 34.65／51.56 ms。以 CUDA 13.3、VS 18、`sm_86` 重編 DLL，native smoke、fault injection、完整 validator（benchmark、crossover、morphology profile、10／100／1000 stress）、340 tests、compileall、CUDA preflight 與 `git diff --check` 均通過；ABI v1 與 exports 未變，真實樣本驗收仍待提供。
 

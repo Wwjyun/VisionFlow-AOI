@@ -131,6 +131,24 @@ class CudaSourceContractTests(unittest.TestCase):
         self.assertIn("green_to_gray = 19235", gray)
         self.assertIn("red_to_gray = 9798", gray)
 
+    def test_gaussian_interior_fast_path_keeps_reflect101_borders(self):
+        root = Path(__file__).resolve().parents[1]
+        source = (root / "gpu" / "visionflow_cuda.cu").read_text(encoding="utf-8")
+        horizontal = source.split("__global__ void gaussian_horizontal_kernel(", 1)[1].split(
+            "__global__ void gaussian_vertical_kernel(", 1
+        )[0]
+        vertical = source.split("__global__ void gaussian_vertical_kernel(", 1)[1].split(
+            "__global__ void threshold_kernel(", 1
+        )[0]
+        launcher = source.split("void launch_gaussian(", 1)[1].split("__global__ void gather_roi_batch_kernel(", 1)[0]
+
+        self.assertIn("x >= radius && x + radius < width", horizontal)
+        self.assertIn("reflect101(x + kx, width)", horizontal)
+        self.assertIn("y >= radius && y + radius < height", vertical)
+        self.assertIn("reflect101(y + ky, height)", vertical)
+        self.assertNotIn("__shared__", horizontal + vertical + launcher)
+        self.assertEqual(source.count("launch_gaussian("), 4)
+
     def test_native_dag_uploads_root_once_and_downloads_requested_outputs(self):
         root = Path(__file__).resolve().parents[1]
         source = (root / "gpu" / "visionflow_cuda.cu").read_text(encoding="utf-8")
