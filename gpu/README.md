@@ -62,9 +62,22 @@ plan，tile metadata 以 `cpu_crossover` 路線與 `preprocess_routes` 標示。
   CPU 34.5～36.3 ms（**5.6～11.8×**）；202 端到端 PASS/NG、缺陷數、bbox、area、
   confidence、metadata **完全相同**，305.5 → 188.2 ms（**1.62×**）。median 未接線前
   約佔該 Detector 75% 時間，是該 Detector GPU 化的首要目標，現已完成。
-- **`vf_gaussian_blur_f32`（float32 Gaussian）**：進行中，等價量測與界線尚未定案前不接入
-  產線。它是把 202 的 `residual` 留在 device 上的前置條件（目前 `residual` 仍需下載後
-  才能在 host 計算 median 之外的後續步驟）。
+- `vf_gaussian_blur_f32` / `vf_gaussian_blur_f32_roi`（float32 Gaussian，供 202-CS-SN-1 的
+  CNR 背景）：**已接入** `detectors/detector_202_1.py` 的 `_background_blur`，需同時具備
+  `supports_gaussian_blur_f32` 與 `supports_gaussian_f32_sigma`；缺 export、舊版 DLL 或任何
+  device 錯誤都整段回 `cv2.GaussianBlur`。sigma 語意與 OpenCV 相同（`sigma>0` 直接使用、
+  `sigma<=0` 走自動規則、NaN／±inf 拒絕），係數對 `cv2.getGaussianKernel` 在 441 組
+  (ksize, sigma) **位元相同**；1008 個 sigma 掃描案例 worst `max|diff|` 7.629e-05
+  （claimed 4.0e-04）、`mean|diff|` 3.052e-05（claimed 5.0e-05）。
+  **語意差異（必須揭露）**：device 的加法順序與 OpenCV 不同，因此 `residual` 尾位漂移，
+  `mad`／`residual_median`／`residual_threshold`／`robust_noise_sigma` 四個診斷值會有
+  約 1e-5 的差異（202 矩陣最大 3.4e-05），其餘 40 個 metadata 欄位完全相同。
+  **判定不受影響**：47 個場景的 PASS/NG、缺陷數、結構欄位皆相同，且**候選遮罩 47/47 位元相同**。
+  報表會以 `metadata.background_backend`（`opencv_cpu`／`cuda_f32`）與
+  `metadata.background_precision_note` 明確標示該次執行用的是哪一條路徑。
+  **效能**：單獨呼叫沒有收益（4000×2000 ksize=51 為 13.5 vs 13.8 ms，H2D＋D2H 佔 96%），
+  但 **kernel 本體只有 0.606 ms**；接線後 202 的 `automatic_cnr_mask` 836.6 → 438.8 ms，
+  產線形狀端到端 1337 → 1019 ms（**1.31×**）。真正的大幅收益需把 residual 留在 device。
 - **connected components 與 ring CNR 統計**：**尚未 GPU 化**。`tools/connected_components_reference.py`
   已可與 `cv2.connectedComponentsWithStats` 在結構化遮罩上完全一致（含 label 0 描述背景像素、
   無像素標籤的 sentinel／NaN centroid 語意），但**隨機遮罩的標籤編號順序仍不同**；

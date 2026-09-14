@@ -748,6 +748,7 @@ detectors:
 - 在 `gpu.mode: auto` 且啟用 CPU fallback 時，若該 Recipe 與該影像尺寸上每個支援 CUDA 的 Detector plan 都在本機實測 CPU 較快，之後相同 Recipe 與尺寸的圖片會整張略過 resident 上傳（完全不發生像素 H2D），直接執行已量測的 CPU 路徑；結果 JSON 以 `execution.gpu.resident_image.skipped_by_crossover` 回報。strict `gpu.mode: cuda` 永不走此路徑。
 - 舊版 DLL 缺少新 exports 時仍保留既有路徑或 CPU fallback。
 - Template Anchor Grid 定位在形狀界線內由 GPU 執行：template 每邊不超過 128 px 且搜尋面積達 256×256 時，走 resident image 上的 CUDA 定位（RTX 3090 實測比 CPU 快 1.6～3.9 倍，座標與 `matchTemplate` 相符、分數差 ≤ 4.2e-7）；界外或不支援時一律回 CPU 參考實作。
+- 202-CS-SN-1 的 CNR 背景 Gaussian 與 median／MAD 在 CUDA 路徑下由 GPU 執行。**median 與 `np.median` 逐位元相同**；**Gaussian 為數學等價、非逐位元相同**（device 加法順序不同），因此 `mad`、`residual_median`、`residual_threshold`、`robust_noise_sigma` 這四個診斷值會有約 1e-5 的尾位差異，其餘 metadata 與 PASS/NG、缺陷數、bbox、area、confidence 全部相同，候選遮罩亦逐位元相同（47 個場景 47/47）。每次執行的缺陷 metadata 會以 `background_backend`（`opencv_cpu`／`cuda_f32`）與 `background_precision_note` 明確標示該次用的是哪條路徑；需要逐位元可重現時請用 `gpu.mode: cpu`。
 - GPU mode 統一為 `auto`、`cpu`、`cuda`：`auto` 依設定嘗試並可回退，`cpu` 不載入 CUDA，`cuda` 禁止隱性 CPU fallback；執行結果與 GUI 顯示的是實際 backend。
 
 目前 CUDA 原始碼包含 separable Gaussian、constant weights、64-bit integral Adaptive Mean Threshold、persistent context 與 grow-only buffers。這些功能仍需在目標 RTX 3090（`sm_86`）完成正式編譯、五份配方等價、效能、VRAM 與壓力驗收後，才能視為 production-ready 或預設啟用。

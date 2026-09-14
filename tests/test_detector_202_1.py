@@ -615,6 +615,36 @@ class Detector2021BackgroundRoutingTests(unittest.TestCase):
         )._automatic_cnr_mask(gray)
         self.assertEqual(runtime.gaussian_calls, [])
 
+    def test_reported_metadata_names_the_background_backend(self):
+        """The report must say which background produced the diagnostics.
+
+        The device filter drifts the four residual-derived diagnostics in their last
+        bits, so a reader of the CSV/JSON has to be able to tell the two paths apart
+        without re-running the detector.
+        """
+
+        gray = self._gray()
+        params = {"center_mask_enabled": False, "edge_mask_enabled": False}
+
+        cpu_detector = Detector202_1(params=params)
+        self.assertEqual(
+            cpu_detector._automatic_cnr_mask(gray)["background_backend"], "opencv_cpu"
+        )
+        cpu_defect = cpu_detector.run(np.dstack([gray] * 3))["defects"][0]
+        self.assertEqual(cpu_defect["metadata"]["background_backend"], "opencv_cpu")
+
+        device_detector = Detector202_1(
+            params=params, use_gpu=True, gpu_runtime=_GaussianRuntime()
+        )
+        self.assertEqual(
+            device_detector._automatic_cnr_mask(gray)["background_backend"], "cuda_f32"
+        )
+        device_defect = device_detector.run(np.dstack([gray] * 3))["defects"][0]
+        self.assertEqual(device_defect["metadata"]["background_backend"], "cuda_f32")
+        self.assertIn(
+            "尾位", device_defect["metadata"]["background_precision_note"]
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

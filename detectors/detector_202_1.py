@@ -271,14 +271,17 @@ class Detector202_1(Detector202):
         image_float: np.ndarray,
         kernel: int,
         sigma: float,
-    ) -> np.ndarray:
+    ) -> tuple[np.ndarray, str]:
         """Gaussian background, on the device when the runtime can honour ``sigma``.
+
+        Returns the background together with the backend that produced it, so the reports can say
+        which one was used instead of leaving the reader to infer it.
 
         Uses the optional CUDA float32 Gaussian export.  The device filter is *not* bit-identical
         to ``cv2.GaussianBlur`` - the summation order differs - so the caller must treat the result
         as mathematically equivalent rather than byte-equal: the measured deviation is <= 4e-4 on a
         [0, 255] float32 operand and the candidate mask it produces is bit-identical across the
-        whole 202 final-output matrix, while the residual-derived diagnostics (``mad``,
+        whole 202 final-output matrix, while the four residual-derived diagnostics (``mad``,
         ``residual_median``, ``residual_threshold``, ``robust_noise_sigma``) drift in their last
         bits.
 
@@ -295,17 +298,17 @@ class Detector202_1(Detector202):
             and self.use_gpu
         ):
             try:
-                return runtime.gaussian_blur_f32(image_float, kernel, sigma)
+                return runtime.gaussian_blur_f32(image_float, kernel, sigma), "cuda_f32"
             except Exception:
                 pass
-        return cv2.GaussianBlur(image_float, (kernel, kernel), sigma)
+        return cv2.GaussianBlur(image_float, (kernel, kernel), sigma), "opencv_cpu"
 
     def _automatic_cnr_mask(self, gray: np.ndarray) -> dict:
         image_float = gray.astype(np.float32)
         height, width = gray.shape[:2]
         background_kernel = self._background_kernel(height, width)
         gaussian_sigma = float(self.params.get("gaussian_sigma", 0.0))
-        background = self._background_blur(
+        background, background_backend = self._background_blur(
             image_float, background_kernel, gaussian_sigma
         )
         residual = image_float - background
@@ -373,6 +376,7 @@ class Detector202_1(Detector202):
             "candidate_mask": candidate_mask,
             "inclusion_mask": inclusion_mask.astype(bool),
             "background_kernel": background_kernel,
+            "background_backend": background_backend,
             "gaussian_sigma": gaussian_sigma,
             "residual_median": residual_median,
             "mad": mad,
@@ -540,6 +544,14 @@ class Detector202_1(Detector202):
                 "mad": float(analysis["mad"]),
                 "residual_threshold": float(analysis["residual_threshold"]),
                 "background_kernel": int(analysis["background_kernel"]),
+                "background_backend": str(analysis["background_backend"]),
+                "background_precision_note": (
+                    "background_backend=opencv_cpu 時背景與 OpenCV 逐位相同；"
+                    "background_backend=cuda_f32 時 device 的加法順序與 OpenCV 不同，"
+                    "候選遮罩與 PASS/NG 判定已實測完全相同，但 mad／residual_median／"
+                    "residual_threshold／robust_noise_sigma 這四個殘差衍生診斷值會有"
+                    "尾位（約 1e-5）差異。"
+                ),
                 "background_kernel_config": {
                     "configured_size": int(
                         self.params.get("background_kernel_size", 0)
