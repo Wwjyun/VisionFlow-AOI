@@ -12,6 +12,12 @@
 - The working tree usually contains untracked user artifacts (`*.pptx`, `*.inspect.ndjson`, `charts/`, `cuda_course/`, `interview_prep/`, `runtime-architecture.*`, `架構圖*/`, `.codex_ppt_build/`). Never stage, move, or delete them.
 - Quick summary check of unittest output: pipe through `Select-String -Pattern '^(Ran|OK|FAILED|ERROR:|FAIL:)'`; validators print many PASS lines.
 
+## DeepSeek Harness (DSH)
+
+DSH loads `AGENTS.md`/`CLAUDE.md` (and their `.local.md` overlays) but does not expand `@path` imports or discover other file names, so the DSH contract is reached through this pointer:
+
+- Read `HERMES.md` — DSH environment mechanics, the skill catalog imported into `$DSH_HOME\skills`, and the subagent delegation rules (`aoi-coder`).
+
 ## Project skills
 
 Project skills live in `.claude/skills/` and are Claude Code copies of the Git-tracked Codex sources in `codex-skills/`. When a skill changes, update both copies (Codex-specific `agents/openai.yaml` files are not copied).
