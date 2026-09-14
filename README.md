@@ -747,7 +747,7 @@ detectors:
 - Grid／Template Anchor Grid 啟用原生 GPU Detector 且 DLL 支援 resident ROI 時，圖片先在 CPU 讀檔並解碼為 BGR，再整張上傳 GPU 一次。Tile 以 device ROI 座標交給 CUDA plan，CPU 原圖僅保留不複製的 ROI view 供形狀檢查、GPU 失敗後的 CPU fallback 與 NG tile 輸出；混用 CPU Detector 時才按需建立獨立 CPU tile 副本。GPU plan 不會為非連續 CPU view 額外建立連續副本。部分 Detector 仍需下載 binary mask 在 CPU 執行 contours／幾何判定；CPU-only、舊 DLL 與非 grid 模式維持原有路徑。
 - 在 `gpu.mode: auto` 且啟用 CPU fallback 時，若該 Recipe 與該影像尺寸上每個支援 CUDA 的 Detector plan 都在本機實測 CPU 較快，之後相同 Recipe 與尺寸的圖片會整張略過 resident 上傳（完全不發生像素 H2D），直接執行已量測的 CPU 路徑；結果 JSON 以 `execution.gpu.resident_image.skipped_by_crossover` 回報。strict `gpu.mode: cuda` 永不走此路徑。
 - 舊版 DLL 缺少新 exports 時仍保留既有路徑或 CPU fallback。
-- Template Anchor Grid 定位目前仍由 CPU 參考實作負責。DLL 已提供可選的 CUDA 定位 export，但 RTX 3090 量測顯示它比 CPU 慢 3～32 倍，且部分合成場景的座標與 OpenCV `matchTemplate` 不一致，因此預設停用（以 `Tiler(gpu_anchor_enabled=True)` 才會啟用）；等價與效能驗收完成前不會改變產線行為。
+- Template Anchor Grid 定位目前仍由 CPU 參考實作負責。DLL 已提供可選的 CUDA 定位 export，在 RTX 3090 上與 OpenCV `matchTemplate` 的定位座標已 9/9 相同、分數差 ≤ 4.2e-7，但仍比 CPU 慢 3～33 倍，因此預設停用（以 `Tiler(gpu_anchor_enabled=True)` 才會啟用）；效能驗收完成前不會改變產線行為。
 - GPU mode 統一為 `auto`、`cpu`、`cuda`：`auto` 依設定嘗試並可回退，`cpu` 不載入 CUDA，`cuda` 禁止隱性 CPU fallback；執行結果與 GUI 顯示的是實際 backend。
 
 目前 CUDA 原始碼包含 separable Gaussian、constant weights、64-bit integral Adaptive Mean Threshold、persistent context 與 grow-only buffers。這些功能仍需在目標 RTX 3090（`sm_86`）完成正式編譯、五份配方等價、效能、VRAM 與壓力驗收後，才能視為 production-ready 或預設啟用。
