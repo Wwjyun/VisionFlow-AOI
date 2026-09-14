@@ -227,7 +227,26 @@
   預期可平行化但成本未知，須先以現有 102 案例 gate 把關。
 - 因為慢 95 倍，**不得啟用**；`candidate_extraction` 仍回報 cpu。
 
-**卡點 2：median 精確中位數尚未有可用的 CUDA 實作。**
+**卡點 2（已解決）：median 精確中位數已完成並接入 202-CS-SN-1。**
+- 實作：`vf_median_f32`（optional ABI v1 export）。float32 → 單調 uint32 key → `cub::DeviceRadixSort` 排序 →
+  只回讀中間 1～2 個 key（奇數 4 bytes／偶數 8 bytes）＋ NaN 旗標 → host 端 float32 取平均；
+  device 端完全沒有浮點運算。專用 grow-only context buffers，不與 `u8[]`／`u64[]` 共用。
+  建置需 `/Zc:preprocessor`，已寫入受版控的 `gpu/cuda_project.json`（`nvcc.msvc_flags`）並由
+  `build_cuda_dll.ps1` 組進 `-Xcompiler`，一般重建即可重現。
+- 等價（`tools/median_equivalence_gpu.py`，主 session 自行重跑）：**34/34 identical（`==` 成立）**，
+  其中 32/34 連 bit pattern 相同；尺寸涵蓋 1／2／3／11／1000／400001／2000001／8000001，
+  另含全同值、全零、全負、CNR 型殘差（σ≈6＋離群）、極端 float32 範圍、subnormal、±0.0、inf、
+  遞增／遞減、重複值；NaN 6/6 與 numpy 同為 NaN；operand 未被改動、連續兩次呼叫一致。
+- 效能（4,000,000 float32）：**GPU 2.92～6.53 ms vs np.median 34.5～36.3 ms（5.6～11.8 倍）**；
+  CUDA event 顯示成本幾乎全在 16 MB pageable H2D（h2d 2.68 ms），kernel（key transform＋radix sort）僅約 0.45 ms。
+- 相依：`dumpbin /dependents` 與舊 build 逐項相同，**未新增任何 runtime 依賴**（cudart 仍靜態）。
+- 接線（`detectors/detector_202_1.py`）：`_automatic_cnr_mask` 的 `residual_median` 與 `mad` 改走
+  `_exact_median()`，在 `gpu.mode` 允許、DLL 有 export 且偵測器啟用 GPU 時使用 device 結果；
+  缺少 export／舊 DLL／device 例外時整個呼叫回 `np.median`（不混用部分 device 結果）。
+- 端到端驗證（2000×4000 ROI，主 session 自行重跑）：**PASS／缺陷數／bbox／area／confidence／metadata
+  全部相同**，detector **305.5 → 188.2 ms（1.62 倍）**。
+
+**原始卡點描述（保留供追溯）：**
 - 已完成：`np.median`（float32）語意確認；縮減式演算法在 NumPy 逐位正確；量測確認 median＋MAD 佔
   CNR detector 約 75%（68.7 ms＋159.7 ms vs 全 detector 305.2 ms）。
 - 失敗並已回退：直方圖縮減版 CUDA 實作（device 端錯誤，誤差 1.7e-1～2.1e-1，且比 CPU 慢）。
@@ -236,7 +255,8 @@
 - 此卡點**不阻擋** CNR 其他步驟（Gaussian 背景、遮罩、幾何、ring CNR 統計）以 CPU 參考先建立黃金標準並驗證。
 
 **可平行推進、不依賴上述卡點的項目：**
-1. 202-CS-SN-1 其餘步驟的黃金參考與等價測試（connected components 標籤順序、component 幾何、ring CNR 統計）。
+1. 202-CS-SN-1 其餘步驟（**不含 median，已於本輪完成**）：Gaussian 背景、遮罩、connected components
+   標籤順序、component 幾何、ring CNR 統計的黃金參考與等價測試。
 2. 401 系列的幾何路徑等價測試（已量測：幾何僅約 9 µs/輪廓，稀疏時佔 11%，現階段不值得 GPU 化，但需等價測試把關既有行為）。
 3. README 與 `gpu/README.md` 的如實描述更新（`README.md` 已描述 anchor 界線；`gpu/README.md` 尚待補）。
 
