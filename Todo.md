@@ -304,7 +304,7 @@
 - [x] Adaptive Mean 覆蓋 block 3/11/35、正負與小數 C、invert 及邊界輸入。
 - [x] 401-2 fused 與 CPU plan 結果在容差內；相同尺寸連續執行 allocation count 不增加。
 - [x] 通用 native plan 完成後，逐 operator 與完整 plan 對 CPU executor 建立等價矩陣。
-- [ ] 記錄 4K primitives、preprocessing plan、純檢測與端到端 CPU/GPU speedup。
+- [x] 記錄 4K primitives、preprocessing plan、純檢測與端到端 CPU/GPU speedup。（2026-09-14 以合成 4K 與五份正式 Recipe 完成，見完成紀錄；401-2 與 900 暫緩使用，其數據僅供參考）
 - [x] 連續執行三次完整驗證，沒有 CUDA error、崩潰或 VRAM 持續成長。
 
 ### Production recipes、GUI、打包與壓測
@@ -312,8 +312,8 @@
 - [ ] `PRODUCT_A_AOI_01.yaml` PASS/NG 樣本一致。
 - [ ] `PRODUCT_A_CIRCLE_401_1_AOI_01.yaml` PASS/NG 樣本一致。
 - [ ] `PRODUCT_A_NEGATIVE_401_AOI_01.yaml` PASS/NG 樣本一致。
-- [ ] `PRODUCT_A_WHITE_RATIO_401_2_AOI_01.yaml` PASS/NG 樣本一致。
-- [ ] `PRODUCT_A_FRAME_900_AOI_01.yaml` PASS/NG 樣本一致。
+- [ ] `PRODUCT_A_WHITE_RATIO_401_2_AOI_01.yaml` PASS/NG 樣本一致。（2026-09-14 依使用者指示暫緩：401-CS-AP-2 可能不再使用、僅保留）
+- [ ] `PRODUCT_A_FRAME_900_AOI_01.yaml` PASS/NG 樣本一致。（2026-09-14 依使用者指示暫緩：900-CS-AP-1 暫時不用、僅保留）
 - [ ] 比較 tiles、PASS/NG、defect count、bbox、area、confidence、metadata 與 fallback log。
 - [ ] GUI 的 recipe 儲存/載入、viewer backend、status、overlay、輸出與 fallback 正確。
 - [ ] 打包版在有 NVIDIA GPU 與無 NVIDIA GPU 電腦均完成驗證。（目前無 GPU 電腦已完成 CPU-compatible package build 與 bundled recipe/MainWindow smoke；有 GPU 電腦待驗收）
@@ -415,6 +415,8 @@
 - [ ] 加速不得犧牲 GUI 回應、打包啟動、結果追溯、錯誤訊息或 CPU fallback。
 
 ## 完成紀錄
+
+- [x] 2026-09-14：記錄 RTX 3090 4K CPU/GPU speedup（合成 3840×2160，含傳輸，warm median）。Primitive（`validate_cuda_dll.py` benchmark 20 次）：BGR→Gray CPU 2.14／GPU 6.99 ms（0.31×）、Gaussian k45 12.23／6.05 ms（2.02×）、Adaptive Mean b35 14.43／10.68 ms（1.35×）、401-2 fused 21.69／6.75 ms（3.21×）。五份正式 Recipe 以各自 tile 設定、strict `gpu.mode: cuda` 與 CPU 各 1 次 cold＋8 次 warm、共用 session，正規化結果全部相同且 GPU active：`PRODUCT_A_AOI_01`（45 tiles）preprocess 75.3→24.4 ms（3.09×）、Detector 99.4→42.2 ms（2.36×）、端到端 347.6→281.2 ms（1.24×）；`PRODUCT_A_CIRCLE_401_1` preprocess 1.93×、Detector 1.76×（98.7→56.2 ms）、端到端 1.15×（345.5→300.1 ms）；`PRODUCT_A_NEGATIVE_401` preprocess 1.45×、Detector 1.28×（78.7→61.5 ms）、端到端 1.07×（326.5→304.8 ms）；`PRODUCT_A_WHITE_RATIO_401_2` preprocess 0.62×、Detector 0.82×、端到端 0.92×；`PRODUCT_A_FRAME_900`（單一整圖 tile）Detector 與端到端約 1.0×（5.3 s 由 CPU contour 主導）。900 在 Pipeline preprocess 階段量到 CPU 17.6／CUDA 183.4 ms，但隔離量測其 DAG plan 為 CPU 16.4、CUDA host 9.1、CUDA resident 5.3 ms，差異來源依使用者指示暫不追查（401-CS-AP-2 與 900-CS-AP-1 目前暫緩使用）。未修改 runtime、CUDA source／ABI／DLL。
 
 - [x] 2026-09-14：在 RTX 3090 驗證 tile 平行不會進入 GPU 路徑。設定 `AOI_TILE_WORKERS=8`，以正式 401-AS-SN-1 參數、2048×2048 合成圖（grid 512²＋overlap 64，每張 25 tiles）並監看 `BaseDetector.run` 的執行緒與同時執行數、`_inspect_tiles_parallel` 呼叫：CPU Recipe 走平行路徑（2 張圖 2 次、同時最多 8 個 Detector、16 個執行緒），`gpu.mode: auto` 與 strict `cuda` 的 resident ROI Recipe 皆 0 次平行呼叫、同時最多 1 個、單一執行緒，兩張圖結果（NG 32／42 defects）與 CPU 相同。另以 `BatchInspectionProcessor(max_workers=4)` 處理 8 張圖共用 throughput session，auto／cuda 皆 0 次 tile 平行、同時最多 1 個 Detector，8 張 NG、296 defects 一致，`nvidia-smi` 顯示 batch 前後 VRAM 1,552→1,508 與 1,508→1,507 MiB，無累積。未修改 runtime、CUDA source／ABI／DLL。
 
