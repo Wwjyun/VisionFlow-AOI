@@ -194,6 +194,14 @@ class GpuRuntime:
     def supports_exact_median(self) -> bool:
         return self._capabilities.exact_median
 
+    @property
+    def supports_gaussian_blur_f32(self) -> bool:
+        return self._capabilities.gaussian_blur_f32
+
+    @property
+    def supports_gaussian_blur_f32_roi(self) -> bool:
+        return self._capabilities.gaussian_blur_f32_roi
+
     def status(self, requested: bool = False) -> dict:
         active = bool(requested and self.available and not self.last_error)
         return {
@@ -214,6 +222,8 @@ class GpuRuntime:
                 "template_match": self.supports_template_match,
                 "find_contours": self.supports_find_contours,
                 "exact_median": self.supports_exact_median,
+                "gaussian_blur_f32": self.supports_gaussian_blur_f32,
+                "gaussian_blur_f32_roi": self.supports_gaussian_blur_f32_roi,
             },
             "queue": {
                 "depth": self.queue_depth,
@@ -566,6 +576,118 @@ class GpuRuntime:
         if result != 0:
             raise self._native_error("vf_median_f32", result)
         return np.float32(median_value.value)
+
+    def gaussian_blur_f32(self, image: np.ndarray, kernel_size: int) -> np.ndarray:
+        """Return ``cv2.GaussianBlur(float32_image, (k, k), 0.0)`` computed on the device.
+
+        The operand is a single-channel float32 host array; it is uploaded once (2D copy), blurred
+        by the separable float32 operator with ``reflect101`` borders, and copied back. The result
+        matches the OpenCV reference within the tolerance documented on the native export (a few
+        float32 ulps: <= 2.0e-4 absolute for gray/residual values in [0, 255]), which was shown not
+        to change the 202-CS-SN-1 final output on the widened scene matrix.
+
+        ``kernel_size`` must be one of the odd sizes in [3, 127] that the native export verifies;
+        an unsupported size raises ``GpuRuntimeError`` with ``error_code`` set to
+        ``CUDA_ERROR_UNSUPPORTED`` so the caller can restart the step on the CPU reference. The
+        input dtype must already be float32 so the caller, not this bridge, decides any narrowing.
+        """
+        if not self.supports_gaussian_blur_f32:
+            raise GpuRuntimeError(
+                "CUDA DLL has no float32 Gaussian export (vf_gaussian_blur_f32)"
+            )
+        source = self._f32_image(image)
+        output = np.empty_like(source)
+        result = self._call_gaussian_f32(
+            "vf_gaussian_blur_f32",
+            (
+                source.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+                int(source.shape[1]), int(source.shape[0]), int(source.strides[0]),
+                output.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+                int(output.strides[0]),
+                int(kernel_size),
+            ),
+            int(source.nbytes),
+            int(output.nbytes),
+        )
+        if result != 0:
+            raise self._native_error("vf_gaussian_blur_f32", result)
+        return output
+
+    def gaussian_blur_f32_roi(
+        self,
+        image: np.ndarray,
+        x: int,
+        y: int,
+        width: int,
+        height: int,
+        kernel_size: int,
+    ) -> np.ndarray:
+        """Blur one rectangle of a float32 image on the device, as an isolated image.
+
+        Equal to ``cv2.GaussianBlur(image[y:y+height, x:x+width], (kernel_size, kernel_size), 0.0)``:
+        borders reflect inside the rectangle and pixels outside it are never read, so a caller can
+        blur a sub-window without uploading the whole plane. Only the rectangle crosses PCIe.
+        """
+        if not self.supports_gaussian_blur_f32_roi:
+            raise GpuRuntimeError(
+                "CUDA DLL has no float32 Gaussian ROI export (vf_gaussian_blur_f32_roi)"
+            )
+        source = self._f32_image(image)
+        x, y, width, height = int(x), int(y), int(width), int(height)
+        if (
+            x < 0 or y < 0 or width <= 0 or height <= 0
+            or x + width > source.shape[1] or y + height > source.shape[0]
+        ):
+            raise GpuRuntimeError(
+                f"Float32 Gaussian ROI is out of bounds: "
+                f"x={x}, y={y}, width={width}, height={height}, image={source.shape}"
+            )
+        output = np.empty((height, width), dtype=np.float32)
+        result = self._call_gaussian_f32(
+            "vf_gaussian_blur_f32_roi",
+            (
+                source.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+                int(source.shape[1]), int(source.shape[0]), int(source.strides[0]),
+                x, y, width, height,
+                output.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+                int(output.strides[0]),
+                int(kernel_size),
+            ),
+            int(width) * int(height) * 4,
+            int(output.nbytes),
+        )
+        if result != 0:
+            raise self._native_error("vf_gaussian_blur_f32_roi", result)
+        return output
+
+    def _call_gaussian_f32(self, function_name: str, arguments: tuple, input_bytes: int, output_bytes: int) -> int:
+        """Run one float32 Gaussian export under the shared queue slot and context lock."""
+        function = getattr(self._dll, function_name)
+        queued = time.perf_counter()
+        with self._queue_slots, self._lock:
+            lock_acquired = time.perf_counter()
+            result = int(function(self._context, *arguments))
+            completed = time.perf_counter()
+            self._record_performance(
+                function_name, int(input_bytes), int(output_bytes),
+                completed - lock_acquired, lock_acquired - queued,
+            )
+        return result
+
+    @staticmethod
+    def _f32_image(image: np.ndarray) -> np.ndarray:
+        """Validate and normalize a single-channel float32 host operand."""
+        array = np.asarray(image)
+        if array.dtype != np.float32:
+            raise GpuRuntimeError(
+                f"vf_gaussian_blur_f32 requires float32 input, got {array.dtype}; "
+                "convert explicitly so the narrowing is the caller's decision"
+            )
+        if array.ndim != 2 or array.size == 0:
+            raise GpuRuntimeError(
+                f"vf_gaussian_blur_f32 requires a non-empty 2-D single-channel image, got {array.shape}"
+            )
+        return np.ascontiguousarray(array)
 
     def match_template_debug_key(self) -> int:
         """Return the raw packed winning key of the last localization call (diagnostics only)."""
@@ -983,6 +1105,7 @@ class GpuRuntime:
         self._load_optional_template_match()
         self._load_optional_find_contours()
         self._load_optional_exact_median()
+        self._load_optional_gaussian_blur_f32()
 
     def _load_optional_native_plan(self) -> None:
         query = getattr(self._dll, "vf_plan_query", None)
@@ -1129,6 +1252,27 @@ class GpuRuntime:
             ctypes.POINTER(ctypes.c_float),
         ]
         median.restype = ctypes.c_int
+
+    def _load_optional_gaussian_blur_f32(self) -> None:
+        blur = getattr(self._dll, "vf_gaussian_blur_f32", None)
+        if blur is not None:
+            blur.argtypes = [
+                ctypes.c_void_p,
+                ctypes.POINTER(ctypes.c_float), ctypes.c_int, ctypes.c_int, ctypes.c_int,
+                ctypes.POINTER(ctypes.c_float), ctypes.c_int,
+                ctypes.c_int,
+            ]
+            blur.restype = ctypes.c_int
+        roi = getattr(self._dll, "vf_gaussian_blur_f32_roi", None)
+        if roi is not None:
+            roi.argtypes = [
+                ctypes.c_void_p,
+                ctypes.POINTER(ctypes.c_float), ctypes.c_int, ctypes.c_int, ctypes.c_int,
+                ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+                ctypes.POINTER(ctypes.c_float), ctypes.c_int,
+                ctypes.c_int,
+            ]
+            roi.restype = ctypes.c_int
 
     @staticmethod
     def _native_plan_descriptor(plan, image: np.ndarray) -> tuple[_VfPlanDescV1, object]:

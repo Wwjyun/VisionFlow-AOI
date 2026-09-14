@@ -46,6 +46,14 @@ constexpr unsigned int GAUSSIAN_FIXED_SCALE = 1U << GAUSSIAN_FIXED_SHIFT;
 constexpr unsigned int GAUSSIAN_FINAL_ROUND =
     1U << (GAUSSIAN_FIXED_SHIFT * 2 - 1);
 __constant__ uint16_t gaussian_weights[MAX_GAUSSIAN_KERNEL];
+// float32 coefficients for the optional vf_gaussian_blur_f32 export. Separate symbol from the
+// uint16 fixed-point table above because that one serves the u8 export's rounding contract.
+__constant__ float gaussian_f32_weights[MAX_GAUSSIAN_KERNEL];
+// Odd kernel sizes the float32 export has been verified against cv2.GaussianBlur. The verified
+// range is every odd size in [3, MAX_GAUSSIAN_KERNEL]; anything else is reported as
+// VF_CUDA_UNSUPPORTED instead of being computed unvalidated. Evidence:
+// outputs_validation/cnr_profile/gaussian_f32_equivalence.txt (tools/gaussian_f32_equivalence.py).
+constexpr int GAUSSIAN_F32_MIN_KERNEL = 3;
 
 // Template Anchor Grid scratch planes owned by the persistent context. Declared here because the
 // context struct sizes its plane arrays from them.
@@ -115,6 +123,16 @@ struct PersistentContext {
     size_t median_sort_scratch_capacity = 0;
     int* median_nan_flag = nullptr;
     size_t median_nan_flag_capacity = 0;
+    // float32 Gaussian scratch for the optional vf_gaussian_blur_f32 export: the uploaded source
+    // rectangle, the horizontal intermediate and the packed result that is copied back. Grow-only
+    // and deliberately separate from u8[]/u64[], which are plan scratch that reserve_device only
+    // grows, so sharing them would mix a plan's buffer contents with this operator's input.
+    float* gaussian_f32_input = nullptr;
+    size_t gaussian_f32_input_capacity = 0;
+    float* gaussian_f32_intermediate = nullptr;
+    size_t gaussian_f32_intermediate_capacity = 0;
+    float* gaussian_f32_output = nullptr;
+    size_t gaussian_f32_output_capacity = 0;
     unsigned long long allocation_count = 0;
     cudaStream_t stream = nullptr;
     cudaError_t initialization_error = cudaSuccess;
@@ -160,6 +178,9 @@ struct PersistentContext {
         visionflow_cuda::free_device(median_sorted_keys);
         visionflow_cuda::free_device(median_sort_scratch);
         visionflow_cuda::free_device(median_nan_flag);
+        visionflow_cuda::free_device(gaussian_f32_input);
+        visionflow_cuda::free_device(gaussian_f32_intermediate);
+        visionflow_cuda::free_device(gaussian_f32_output);
         visionflow_cuda::free_device(resident_u8);
         for (cudaEvent_t event : timing_events) {
             if (event != nullptr) cudaEventDestroy(event);
@@ -393,6 +414,67 @@ int prepare_gaussian_weights(
             stream);
     if (error != cudaSuccess) return visionflow_cuda::runtime_error(error);
     *radius_out = radius;
+    return VF_CUDA_OK;
+}
+
+// Exact cv::getGaussianKernel(ksize, 0.0, CV_32F) coefficients for the float32 export.
+//
+// OpenCV derives sigma as 0.3*((ksize-1)*0.5-1)+0.8 only for ksize > 9; ksize 1, 3, 5, 7 and 9
+// come from its fixed small-kernel table (SMALL_GAUSSIAN_SIZE is 9 in OpenCV 5.x, and the table is
+// selected whenever sigma <= 0). Every other size is exp/sum/normalize in float64 followed by a
+// single cast to float32. Both branches were compared bit-for-bit against
+// cv2.getGaussianKernel(ksize, 0, cv2.CV_32F) for every odd ksize in [3, 127] by
+// tools/gaussian_f32_equivalence.py, so the coefficients - and therefore the kernel sums - are
+// identical to OpenCV's; only the accumulation order of the convolution differs.
+bool gaussian_f32_kernel_supported(int kernel) {
+    return kernel >= GAUSSIAN_F32_MIN_KERNEL && kernel <= MAX_GAUSSIAN_KERNEL && kernel % 2 == 1;
+}
+
+int prepare_gaussian_f32_weights(int kernel, int* radius_out, cudaStream_t stream = nullptr) {
+    if (radius_out == nullptr) return VF_CUDA_INVALID_ARGUMENT;
+    if (!gaussian_f32_kernel_supported(kernel)) return VF_CUDA_UNSUPPORTED;
+    // Rows are indexed by ksize / 2: 1, 3, 5, 7 and 9. The values are the exact float32 constants
+    // OpenCV stores in small_gaussian_tab, already summing to 1.
+    static const float small_kernels[5][9] = {
+        {1.0f},
+        {0.25f, 0.5f, 0.25f},
+        {0.0625f, 0.25f, 0.375f, 0.25f, 0.0625f},
+        {0.03125f, 0.109375f, 0.21875f, 0.28125f, 0.21875f, 0.109375f, 0.03125f},
+        {0.015625f, 0.05078125f, 0.1171875f, 0.19921875f, 0.234375f,
+         0.19921875f, 0.1171875f, 0.05078125f, 0.015625f},
+    };
+    std::vector<float> values(static_cast<size_t>(kernel));
+    if (kernel <= 9) {
+        const float* fixed = small_kernels[kernel / 2];
+        for (int i = 0; i < kernel; ++i) values[static_cast<size_t>(i)] = fixed[i];
+    } else {
+        const double sigma = 0.3 * ((kernel - 1) * 0.5 - 1) + 0.8;
+        const double scale = -0.5 / (sigma * sigma);
+        std::vector<double> raw(static_cast<size_t>(kernel));
+        double total = 0.0;
+        for (int i = 0; i < kernel; ++i) {
+            const double offset = static_cast<double>(i) - (kernel - 1) * 0.5;
+            raw[static_cast<size_t>(i)] = std::exp(scale * offset * offset);
+            total += raw[static_cast<size_t>(i)];
+        }
+        const double inverse = 1.0 / total;
+        for (int i = 0; i < kernel; ++i) {
+            values[static_cast<size_t>(i)] =
+                static_cast<float>(raw[static_cast<size_t>(i)] * inverse);
+        }
+    }
+    const size_t weight_bytes = static_cast<size_t>(kernel) * sizeof(float);
+    cudaError_t error = stream == nullptr
+        ? cudaMemcpyToSymbol(gaussian_f32_weights, values.data(), weight_bytes)
+        : cudaMemcpyToSymbolAsync(
+            gaussian_f32_weights,
+            values.data(),
+            weight_bytes,
+            0,
+            cudaMemcpyHostToDevice,
+            stream);
+    if (error != cudaSuccess) return visionflow_cuda::runtime_error(error);
+    *radius_out = kernel / 2;
     return VF_CUDA_OK;
 }
 
@@ -1174,6 +1256,71 @@ void launch_gaussian(
         src, intermediate, width, height, channels, radius);
     gaussian_vertical_kernel<<<grid2d(width, height), dim3(BLOCK_X, BLOCK_Y), 0, stream>>>(
         intermediate, dst, width, height, channels, radius);
+}
+
+// float32 separable Gaussian for the optional vf_gaussian_blur_f32 export. Single channel only:
+// the caller passes the detector's float32 gray/residual plane. Taps are read from the constant
+// coefficient table prepared by prepare_gaussian_f32_weights(), and both passes accumulate in
+// float32 with reflect101 borders, which is what cv2.GaussianBlur(single_channel_float32, ksize,
+// 0.0) does internally. The build disables FMA contraction (/fmad=false), so the result is a pure
+// function of the tap order documented here and of the input bytes.
+//
+// Horizontal pass: taps are accumulated left to right, the order OpenCV's row filter uses.
+__global__ void gaussian_f32_horizontal_kernel(
+    const float* src, float* dst, int width, int height, int radius) {
+    const int x = blockIdx.x * blockDim.x + threadIdx.x;
+    const int y = blockIdx.y * blockDim.y + threadIdx.y;
+    if (x >= width || y >= height) return;
+    const float* row = src + static_cast<size_t>(y) * width;
+    float sum = 0.0f;
+    if (x >= radius && x + radius < width) {
+        const float* window = row + (x - radius);
+        for (int k = 0; k <= 2 * radius; ++k) {
+            sum += window[k] * gaussian_f32_weights[k];
+        }
+    } else {
+        for (int kx = -radius; kx <= radius; ++kx) {
+            sum += row[reflect101(x + kx, width)] * gaussian_f32_weights[kx + radius];
+        }
+    }
+    dst[static_cast<size_t>(y) * width + x] = sum;
+}
+
+// Vertical pass: symmetric taps are added as a pair before the multiply, the order OpenCV's
+// symmetric column filter uses. Measured against cv2.GaussianBlur this is closer than a plain
+// left-to-right sum for every kernel size in the verified range (see the equivalence tool).
+__global__ void gaussian_f32_vertical_kernel(
+    const float* src, float* dst, int width, int height, int radius) {
+    const int x = blockIdx.x * blockDim.x + threadIdx.x;
+    const int y = blockIdx.y * blockDim.y + threadIdx.y;
+    if (x >= width || y >= height) return;
+    const std::ptrdiff_t step = static_cast<std::ptrdiff_t>(width);
+    float sum = 0.0f;
+    if (y >= radius && y + radius < height) {
+        const float* centre = src + static_cast<size_t>(y) * width + x;
+        sum = centre[0] * gaussian_f32_weights[radius];
+        for (int k = 1; k <= radius; ++k) {
+            const std::ptrdiff_t offset = static_cast<std::ptrdiff_t>(k) * step;
+            sum += (centre[-offset] + centre[offset]) * gaussian_f32_weights[radius + k];
+        }
+    } else {
+        sum = src[static_cast<size_t>(y) * width + x] * gaussian_f32_weights[radius];
+        for (int k = 1; k <= radius; ++k) {
+            const float top = src[static_cast<size_t>(reflect101(y - k, height)) * width + x];
+            const float bottom = src[static_cast<size_t>(reflect101(y + k, height)) * width + x];
+            sum += (top + bottom) * gaussian_f32_weights[radius + k];
+        }
+    }
+    dst[static_cast<size_t>(y) * width + x] = sum;
+}
+
+void launch_gaussian_f32(
+    const float* src, float* intermediate, float* dst, int width, int height,
+    int radius, cudaStream_t stream) {
+    gaussian_f32_horizontal_kernel<<<grid2d(width, height), dim3(BLOCK_X, BLOCK_Y), 0, stream>>>(
+        src, intermediate, width, height, radius);
+    gaussian_f32_vertical_kernel<<<grid2d(width, height), dim3(BLOCK_X, BLOCK_Y), 0, stream>>>(
+        intermediate, dst, width, height, radius);
 }
 
 __global__ void gather_roi_batch_kernel(
@@ -3874,4 +4021,119 @@ VF_CUDA_API int vf_median_f32(
     // divide by two. Reproduce both operations exactly, including their overflow and rounding.
     *out_median = (low + high) / 2.0f;
     return VF_CUDA_OK;
+}
+
+// Shared body of vf_gaussian_blur_f32 and vf_gaussian_blur_f32_roi. The requested rectangle of the
+// host float32 source is uploaded with a 2D copy (only the rectangle - the ROI export never
+// touches pixels outside it, which is what makes it equal to cv2.GaussianBlur on the same
+// sub-array), blurred on the device with the context's grow-only scratch, and copied back.
+static int gaussian_blur_f32_device(
+    PersistentContext* persistent,
+    const float* src, int src_stride, int offset_x, int offset_y,
+    int width, int height, float* dst, int dst_stride, int kernel_size) {
+    const size_t row_values = static_cast<size_t>(width);
+    const size_t pixel_count = row_values * static_cast<size_t>(height);
+    if (pixel_count == 0 || pixel_count > SIZE_MAX / sizeof(float)) return VF_CUDA_INVALID_ARGUMENT;
+    const size_t row_bytes = row_values * sizeof(float);
+    int result = reserve_device(
+        &persistent->gaussian_f32_input, &persistent->gaussian_f32_input_capacity, pixel_count,
+        &persistent->allocation_count);
+    if (result != VF_CUDA_OK) return result;
+    result = reserve_device(
+        &persistent->gaussian_f32_intermediate, &persistent->gaussian_f32_intermediate_capacity,
+        pixel_count, &persistent->allocation_count);
+    if (result != VF_CUDA_OK) return result;
+    result = reserve_device(
+        &persistent->gaussian_f32_output, &persistent->gaussian_f32_output_capacity, pixel_count,
+        &persistent->allocation_count);
+    if (result != VF_CUDA_OK) return result;
+
+    reset_timing(persistent, true);
+    cudaError_t error = cudaMemcpy2DAsync(
+        persistent->gaussian_f32_input, row_bytes,
+        reinterpret_cast<const char*>(src) + static_cast<size_t>(offset_y) * src_stride +
+            static_cast<size_t>(offset_x) * sizeof(float),
+        static_cast<size_t>(src_stride), row_bytes, static_cast<size_t>(height),
+        cudaMemcpyHostToDevice, persistent->stream);
+    if (error != cudaSuccess) return cuda_result(error);
+    cudaEventRecord(persistent->timing_events[TIMING_AFTER_INPUT], persistent->stream);
+
+    int radius = 0;
+    result = prepare_gaussian_f32_weights(kernel_size, &radius, persistent->stream);
+    if (result != VF_CUDA_OK) return result;
+    launch_gaussian_f32(
+        persistent->gaussian_f32_input, persistent->gaussian_f32_intermediate,
+        persistent->gaussian_f32_output, width, height, radius, persistent->stream);
+    result = visionflow_cuda::kernel_launch_result();
+    if (result != VF_CUDA_OK) return result;
+    cudaEventRecord(persistent->timing_events[TIMING_AFTER_KERNEL], persistent->stream);
+
+    error = cudaMemcpy2DAsync(
+        dst, static_cast<size_t>(dst_stride), persistent->gaussian_f32_output, row_bytes,
+        row_bytes, static_cast<size_t>(height), cudaMemcpyDeviceToHost, persistent->stream);
+    if (error != cudaSuccess) return cuda_result(error);
+    cudaEventRecord(persistent->timing_events[TIMING_AFTER_OUTPUT], persistent->stream);
+    result = visionflow_cuda::stream_result(persistent->stream);
+    if (result != VF_CUDA_OK) return result;
+    finalize_timing(persistent);
+    return VF_CUDA_OK;
+}
+
+// Kernel sizes below 3 are a malformed request; odd sizes outside the verified range are reported
+// as unsupported rather than computed unvalidated.
+static int gaussian_f32_kernel_request(int kernel_size) {
+    if (kernel_size < GAUSSIAN_F32_MIN_KERNEL) return VF_CUDA_INVALID_ARGUMENT;
+    return gaussian_f32_kernel_supported(kernel_size) ? VF_CUDA_OK : VF_CUDA_UNSUPPORTED;
+}
+
+// Separable float32 Gaussian with reflect101 borders, reproducing
+// cv2.GaussianBlur(single_channel_float32, (ksize, ksize), 0.0) within the tolerance documented in
+// include/visionflow_cuda.h. Strides are byte counts, as everywhere else in this ABI.
+VF_CUDA_API int vf_gaussian_blur_f32(
+    void* context,
+    const float* src, int width, int height, int src_stride,
+    float* dst, int dst_stride,
+    int kernel_size) {
+    PersistentContext* persistent = static_cast<PersistentContext*>(context);
+    if (persistent == nullptr || src == nullptr || dst == nullptr || width <= 0 || height <= 0 ||
+        width > INT_MAX / static_cast<int>(sizeof(float))) {
+        return VF_CUDA_INVALID_ARGUMENT;
+    }
+    const int minimum_stride = width * static_cast<int>(sizeof(float));
+    if (src_stride < minimum_stride || dst_stride < minimum_stride) {
+        return VF_CUDA_INVALID_ARGUMENT;
+    }
+    const int kernel_status = gaussian_f32_kernel_request(kernel_size);
+    if (kernel_status != VF_CUDA_OK) return kernel_status;
+    return gaussian_blur_f32_device(
+        persistent, src, src_stride, 0, 0, width, height, dst, dst_stride, kernel_size);
+}
+
+// Same operator restricted to one rectangle of a wider host float32 source. The rectangle is
+// treated as an isolated image - borders reflect inside it, pixels outside it are never read - so
+// the result equals cv2.GaussianBlur(src[y:y+height, x:x+width], (ksize, ksize), 0.0) and only the
+// rectangle crosses PCIe.
+VF_CUDA_API int vf_gaussian_blur_f32_roi(
+    void* context,
+    const float* src, int src_width, int src_height, int src_stride,
+    int x, int y, int width, int height,
+    float* dst, int dst_stride,
+    int kernel_size) {
+    PersistentContext* persistent = static_cast<PersistentContext*>(context);
+    if (persistent == nullptr || src == nullptr || dst == nullptr ||
+        src_width <= 0 || src_height <= 0 || width <= 0 || height <= 0 ||
+        x < 0 || y < 0 || width > src_width || height > src_height ||
+        x > src_width - width || y > src_height - height ||
+        src_width > INT_MAX / static_cast<int>(sizeof(float)) ||
+        width > INT_MAX / static_cast<int>(sizeof(float))) {
+        return VF_CUDA_INVALID_ARGUMENT;
+    }
+    if (src_stride < src_width * static_cast<int>(sizeof(float)) ||
+        dst_stride < width * static_cast<int>(sizeof(float))) {
+        return VF_CUDA_INVALID_ARGUMENT;
+    }
+    const int kernel_status = gaussian_f32_kernel_request(kernel_size);
+    if (kernel_status != VF_CUDA_OK) return kernel_status;
+    return gaussian_blur_f32_device(
+        persistent, src, src_stride, x, y, width, height, dst, dst_stride, kernel_size);
 }

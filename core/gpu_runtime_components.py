@@ -116,6 +116,18 @@ class GpuCapabilities:
         """Optional bit-exact float32 median over host values (never reads the resident image)."""
         return self.has_exports(("vf_median_f32",))
 
+    @property
+    def gaussian_blur_f32(self) -> bool:
+        """Optional float32 Gaussian (cv2.GaussianBlur equivalence) over host float32 values."""
+        return self.has_exports(("vf_gaussian_blur_f32",))
+
+    @property
+    def gaussian_blur_f32_roi(self) -> bool:
+        """Optional rectangle variant of the float32 Gaussian; the ROI export is additive."""
+        return bool(
+            self.gaussian_blur_f32 and self.has_exports(("vf_gaussian_blur_f32_roi",))
+        )
+
 
 @dataclass(slots=True)
 class GpuResourceRegistry:

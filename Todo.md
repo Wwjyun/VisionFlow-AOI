@@ -401,6 +401,36 @@ float32 累加、OpenCV 的 kernel 係數）與 `vf_gaussian_blur_f32_roi`，並
    **沒有任何 CNR 門檻**（每個候選都成為 defect），CNR 只影響 metadata 與排序，
    所以 GPU 化不需要「判定邊界」等價，只需要排序鍵等價。量測工具：
    `tools/cnr_ring_precision.py`。**仍待完成**：Gaussian 背景、候選遮罩、connected components。
+   **Gaussian 背景（`vf_gaussian_blur_f32`）：已實作、等價已量測，但有一個阻擋性缺陷未修，故未接線。**
+   - 等價（`tools/gaussian_f32_equivalence.py`，主 session 獨立重跑與子代理證據**位元組相同**，
+     sha256 `AC741D…`）：kernel 係數 63 個尺寸**位元完全相同**（sigma=0 的自動規則）；
+     float32 gray／residual 值域 [0,255]、任意奇數 ksize 3～127 的 claimed tolerance 為
+     `max|diff| ≤ 2.0e-04`、`mean|diff| ≤ 2.0e-05`（實測 worst 9.155e-05／1.052e-05），
+     寬值域為 `5.0e-07` 相對值域（實測 3.477e-07）；決定性；奇數 3～127 以外明確拒絕。
+   - **阻擋性缺陷：`vf_gaussian_blur_f32` 完全忽略 sigma 參數**，永遠回傳 sigma=0 的結果。
+     64×64 float32、4×4 的 100.0 方塊實測：`ksize=5 sigma=1.0` 時 device 與
+     `cv2.GaussianBlur(...,1.0)` 相差 1.918、與 `...,0.0` 相差 0.0；`ksize=9 sigma=1.0`
+     相差 31.52、`ksize=31 sigma=1.0` 相差 78.14；而 `ksize=31 sigma=5.0` 與 sigma=0
+     相差 1.907e-06（因 OpenCV 自動 sigma 在此剛好等於 5.0）。子代理的等價工具只掃
+     `sigma=0.0`，因此看不到此缺陷。
+     **為何阻擋**：`detector_202_1.py` 把 `gaussian_sigma` 暴露為可設定的管理內參（預設 0.0）
+     並傳給 `cv2.GaussianBlur` 作為 CNR 背景；非零 sigma 時 device 會**靜默替換語意**，
+     違反 AGENT.md。獨立量測（`tools/gaussian_mask_margin.py`）在 `gaussian_sigma=1.0` 的
+     400×600 場景：背景 max|diff| **42.82** 且**候選遮罩不再位元相同**；其餘 10 個場景
+     （含兩個產線尺寸）背景 max|diff| 僅 ~6.1e-05、遮罩位元相同。已把缺陷與重現方式交回子代理
+     修正（要求：支援 sigma 的 OpenCV 精確係數規則，或明確拒絕非零 sigma，不得靜默替換；
+     並把等價工具擴充為非零 sigma 掃描）。
+   - 效能（`tools/gaussian_f32_equivalence.py` 的 timing 段，4000×2000 float32 ksize=51）：
+     `cv2.GaussianBlur` 13.994 ms vs device 端到端 14.637 ms（**0.96×，單獨呼叫沒有收益**），
+     但 CUDA event 顯示 **kernel 本體只要 0.607 ms**，其餘 5.013 ms H2D＋7.575 ms D2H。
+     因此真正的收益只有在**把 residual 留在 device**、用它一次完成 median／絕對值／門檻／遮罩時
+     才會出現（預期把 94 ms 的 `threshold_and_mask` 與 59 ms 的 Gaussian+residual 一起省下）。
+   - **202 最終輸出矩陣（`tools/gaussian_202_matrix.py`，39 場景）**：PASS/NG **39/39 相同**、
+     缺陷數 **39/39 相同**、結構欄位（pass/count/type/bbox/area/confidence）**39/39 相同**、
+     **候選遮罩 39/39 位元相同**；但當場景有候選時 `metadata.mad` 67/78、
+     `metadata.residual_threshold` 67/78、`metadata.robust_noise_sigma` 67/78、
+     `metadata.residual_median` 22/78 不同（約 1e-5 相對值）。**判定本身不變，變的是中位數／MAD
+     這類值**——這是後續接線時必須揭露的語意差異，不可宣稱完全等價。
 2. 401 系列的幾何路徑等價測試（已量測：幾何僅約 9 µs/輪廓，稀疏時佔 11%，現階段不值得 GPU 化，但需等價測試把關既有行為）。
 3. ~~README 與 `gpu/README.md` 的如實描述更新~~ **已完成**：`gpu/README.md` 的輪廓速度記載
    （先前誤記為「密集案例比 cv2 快」）與 median 狀態（先前誤記為「尚未有可啟用的實作」）已
@@ -664,6 +694,8 @@ float32 累加、OpenCV 的 kernel 係數）與 `vf_gaussian_blur_f32_roi`，並
 - [ ] 加速不得犧牲 GUI 回應、打包啟動、結果追溯、錯誤訊息或 CPU fallback。
 
 ## 完成紀錄
+
+- [x] 2026-09-15：獨立複驗 `vf_gaussian_blur_f32`（202 CNR 的 float32 Gaussian 背景）並**否決接線**，同時量到它真正的收益位置。子代理已把 export、bridge 與等價工具落地；主 session 對其建置的 DLL 自行重跑等價工具，結果與子代理證據**位元組完全相同**（sha256 `AC741DA24AE0246E31B0FDDE23CEF3E3284D553B8FE6FFC110D6BD2BDBAE41B4`）：kernel 係數在 **63 個尺寸位元相同**（sigma=0 自動規則）、float32 值域 [0,255] 的 worst `max|diff|` 9.155e-05（claimed 2.0e-04）、`mean|diff|` 1.052e-05（claimed 2.0e-05）、決定性、奇數 3～127 以外明確拒絕；`gpu/preflight_cuda_build.py` exit 0、`tests.test_cuda_source_contract` 13 OK、全套 405 tests OK。**新增缺陷並否決接線**：`vf_gaussian_blur_f32` **完全忽略 sigma 參數**（永遠回傳 sigma=0 的結果）——64×64 float32 的 4×4 方塊實測 `ksize=5/9/31 sigma=1.0` 與 host 相差 1.918／31.52／78.14，而與 host 的 sigma=0 相差 0.0。因 `detector_202_1.py` 把 `gaussian_sigma` 暴露為可設定內參，非零 sigma 時會**靜默替換語意**，違反 AGENT.md，故**未接線**（bridge 已存在但沒有任何 detector 取用，產線行為不變），已把缺陷與重現方式交回子代理修正。新增 `tools/gaussian_mask_margin.py` 獨立量測「GPU Gaussian 會不會改變候選遮罩」：11 個場景中 10 個位元相同（含兩個產線尺寸，背景 max|diff| 僅 ~6.1e-05、mask flip margin 1.5e-05～1.3e-03），唯一不同的正是 `gaussian_sigma=1.0`（背景差 42.82、遮罩不同）。**收益位置也已量清**：4000×2000 ksize=51 單獨呼叫為 13.994 ms（cv2）vs 14.637 ms（device，0.96×）**沒有收益**，但 CUDA event 顯示 **kernel 本體只有 0.607 ms**，5.013 ms H2D＋7.575 ms D2H 佔其餘——所以價值在「把 residual 留在 device」一次完成 median／絕對值／門檻／遮罩，可同時省下 94 ms 的 `threshold_and_mask` 與 59 ms 的 Gaussian+residual。另以 `tools/gaussian_202_matrix.py` 取得 39 場景最終輸出矩陣：**PASS/NG 39/39、缺陷數 39/39、結構欄位 39/39、候選遮罩 39/39 位元相同**，但 `metadata.mad`／`residual_threshold`／`robust_noise_sigma` 67/78、`residual_median` 22/78 差約 1e-5 相對值——**判定不變、值會變**，此語意差異必須在接線時揭露。證據：`outputs_validation/cnr_profile/gaussian_f32_equivalence.{txt,json}`、`gaussian_f32_timing.{txt,json}`、`gaussian_202_final_output_matrix.{txt,json}`、`gaussian_mask_margin.json`。未修改產線程式與既有 ABI v1 匯出語意。
 
 - [x] 2026-09-15：在**產線 ROI 尺寸**上實測已接線的 GPU median，並把 202 遮罩階段的成本完整歸因，決定下一個 GPU 目標。新增 `tools/benchmark_median_202.py`（真 Detector、真 Gaussian 背景、真遮罩鏈）：2000×4000 CPU 295.3 → 164.1 ms（**1.80×**）、2000×12000 CPU 907.9 → 504.9 ms（**1.80×**），兩者的缺陷清單（bbox、area、confidence、cnr、contrast、background_area）**逐欄完全相同**；先前的 1.62× 是合成 ROI 量到的，此為產線形狀的複驗。新增 `tools/profile_202_mask_stage.py`（以 wrapper 計數 runtime 呼叫以證明走的是 device 路徑，非推測）：2000×12000 遮罩階段 CPU 833.4 → GPU median 380.7 ms，逐項為 gray 25.1／23.5、Gaussian+residual 57.0／59.0、**median(residual) 211.2／15.6（13.6×）**、**median(MAD) 309.8／70.6（4.4×）**、threshold+mask 95.7／94.0、morphology+inclusion 39.4／32.9、connected components 27.7／25.4、ring CNR 67.5／59.7；runtime median 呼叫數 CPU 0 次、GPU **12 次（2,880 萬×2 值）**，證明兩次 median 都真的在 device 上。**下一個目標由量測決定**：remaining 瓶頸是 `threshold_and_mask`（94 ms）與 Gaussian+residual（59 ms）的**反覆全圖 elementwise 運算**，兩者合計 153 ms；把 residual 留在 device 上一次完成 median、絕對值、門檻與遮罩，預期可再省下約 150 ms（1.80× → 約 2.8×），`vf_gaussian_blur_f32` 是此前置條件。另把 connected components 的編號缺口收斂到單一原因（見 Todo「全流程 GPU 化」）：已由 OpenCV 原始碼確認最終編號為 `flattenL` 依 provisional 標籤索引升冪配號、`set_union` 保留較小標籤，據此改寫參考實作後 **4 連通全部隨機遮罩通過**；8 連通仍不符的原因是 OpenCV 走 Bolelli 的 2×2 區塊掃描（`LabelingBolelli`），剩餘工作已收斂為單一路徑。證據：`outputs_validation/cnr_profile/median_202_production_shapes.json`、`outputs_validation/cnr_profile/mask_stage_split.json`。未修改任何產線程式、CUDA source／ABI 或 DLL（量測使用既有 DLL）。
 
