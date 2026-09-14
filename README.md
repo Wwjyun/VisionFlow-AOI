@@ -745,6 +745,7 @@ detectors:
 - Persistent context 現在持有 non-blocking CUDA stream、grow-only scratch 與 morphology ping-pong buffers；plan 內的中間結果不回傳 CPU。
 - Batch、monitor 與 GUI 單張連續檢測會透過 `GpuExecutionSession` 共用相容的 `GpuRuntime`/CUDA context；GUI 在 Recipe 路徑、mtime 或大小改變時重建 session，關閉視窗時釋放。每次執行仍重新上傳目前原圖，不跨圖片沿用 resident image generation。
 - Grid／Template Anchor Grid 啟用原生 GPU Detector 且 DLL 支援 resident ROI 時，圖片先在 CPU 讀檔並解碼為 BGR，再整張上傳 GPU 一次。Tile 以 device ROI 座標交給 CUDA plan，CPU 原圖僅保留不複製的 ROI view 供形狀檢查、GPU 失敗後的 CPU fallback 與 NG tile 輸出；混用 CPU Detector 時才按需建立獨立 CPU tile 副本。GPU plan 不會為非連續 CPU view 額外建立連續副本。部分 Detector 仍需下載 binary mask 在 CPU 執行 contours／幾何判定；CPU-only、舊 DLL 與非 grid 模式維持原有路徑。
+- 在 `gpu.mode: auto` 且啟用 CPU fallback 時，若該 Recipe 與該影像尺寸上每個支援 CUDA 的 Detector plan 都在本機實測 CPU 較快，之後相同 Recipe 與尺寸的圖片會整張略過 resident 上傳（完全不發生像素 H2D），直接執行已量測的 CPU 路徑；結果 JSON 以 `execution.gpu.resident_image.skipped_by_crossover` 回報。strict `gpu.mode: cuda` 永不走此路徑。
 - 舊版 DLL 缺少新 exports 時仍保留既有路徑或 CPU fallback。
 - GPU mode 統一為 `auto`、`cpu`、`cuda`：`auto` 依設定嘗試並可回退，`cpu` 不載入 CUDA，`cuda` 禁止隱性 CPU fallback；執行結果與 GUI 顯示的是實際 backend。
 

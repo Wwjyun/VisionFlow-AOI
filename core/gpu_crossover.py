@@ -40,6 +40,7 @@ class PlanCrossoverPolicy:
         self.max_entries = max(1, int(max_entries))
         self.clock = clock
         self._entries: OrderedDict[tuple, _CrossoverSamples] = OrderedDict()
+        self._resident_upload_unneeded: OrderedDict[tuple, None] = OrderedDict()
         self._lock = threading.Lock()
 
     @staticmethod
@@ -51,6 +52,48 @@ class PlanCrossoverPolicy:
         with self._lock:
             entry = self._entries.get(key)
             return entry.decision if entry is not None else ""
+
+    @staticmethod
+    def _resident_key(key: tuple) -> tuple:
+        return (key[0], key[1], key[2], True)
+
+    def prefer_cpu_key(self, key: tuple) -> tuple[bool, tuple]:
+        """Decide one plan call from its recorded key, returning the decision key to report.
+
+        A host-input CUDA call pays extra H2D on top of the resident ROI cost, so a CPU decision
+        measured against the resident path also holds when the resident image was skipped. The
+        reverse is not true: without an upload, only the resident measurement proves anything.
+        """
+
+        def field_of(candidate: tuple) -> str:
+            entry = self._entries.get(candidate)
+            return entry.decision if entry is not None else ""
+
+        with self._lock:
+            field = field_of(key)
+            resident_key = self._resident_key(key)
+            if field == "cpu":
+                return True, key
+            if resident_key != key:
+                resident_field = field_of(resident_key)
+                if resident_field == "cpu":
+                    return True, resident_key
+                if field == "cuda":
+                    return False, key
+                if resident_field == "cuda":
+                    return False, resident_key
+            return False, key
+
+    def mark_resident_upload_unneeded(self, key: tuple) -> None:
+        with self._lock:
+            self._resident_upload_unneeded[key] = None
+            self._resident_upload_unneeded.move_to_end(key)
+            while len(self._resident_upload_unneeded) > self.max_entries:
+                self._resident_upload_unneeded.popitem(last=False)
+
+    def resident_upload_unneeded(self, key: tuple) -> bool:
+        with self._lock:
+            return key in self._resident_upload_unneeded
 
     def wants_cpu_sample(self, key: tuple) -> bool:
         with self._lock:

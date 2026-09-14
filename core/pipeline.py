@@ -107,11 +107,17 @@ class AOIPipeline(LogMixin):
                 and self.detector_manager.uses_native_cuda_runtime(detector_id)
                 for detector_id, config in detector_configs.items()
             )
+            crossover_policy = getattr(gpu_runtime, "crossover_policy", None)
+            resident_skip_key = (provenance.get("effective_recipe_sha256", ""), tuple(image.shape))
+            resident_skipped_by_crossover = bool(
+                crossover_policy is not None and crossover_policy.resident_upload_unneeded(resident_skip_key)
+            )
             if (
                 detector_gpu_requested
                 and gpu_runtime.available
                 and gpu_runtime.supports_resident_roi
                 and str(tile_config.get("mode", "grid")).lower() == "grid"
+                and not resident_skipped_by_crossover
             ):
                 try:
                     resident_upload_memory = self._check_resident_upload_memory(gpu_runtime, image)
@@ -173,6 +179,18 @@ class AOIPipeline(LogMixin):
                     tiles, detectors, profiler, total_work
                 )
 
+        if crossover_policy is not None and resident_image is not None:
+            native_gpu_detectors = [
+                detector for detector in detectors
+                if detector.use_gpu and self.detector_manager.uses_native_cuda_runtime(detector.detector_id)
+            ]
+            if native_gpu_detectors and all(
+                detector.cpu_crossover_covers(crossover_policy) for detector in native_gpu_detectors
+            ):
+                # Every plan chosen here still resolves to CPU for exactly the plans and input shapes
+                # it ran, so later images with the same recipe/shape skip the whole-image H2D upload.
+                # A different tile or image shape has its own calibration key and keeps uploading.
+                crossover_policy.mark_resident_upload_unneeded(resident_skip_key)
         detector_fallbacks = {
             detector.detector_id: detector.gpu_fallback_reason
             for detector in detectors
@@ -206,6 +224,7 @@ class AOIPipeline(LogMixin):
             display_requested=self.recipe_manager.gpu_feature_requested(gpu_config, "display"),
             resident_image=resident_image,
             resident_upload_memory=resident_upload_memory,
+            resident_skipped_by_crossover=resident_skipped_by_crossover and detector_gpu_requested,
             profiler=profiler,
         )
 

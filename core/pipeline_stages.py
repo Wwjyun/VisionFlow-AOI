@@ -153,6 +153,7 @@ class InspectionResultAssembler:
         resident_image,
         profiler,
         resident_upload_memory: dict | None = None,
+        resident_skipped_by_crossover: bool = False,
     ) -> dict:
         return {
             "image_name": Path(image_path).name,
@@ -178,6 +179,7 @@ class InspectionResultAssembler:
                             if resident_image is not None else []
                         ),
                         "device_memory_before_upload": dict(resident_upload_memory or {}),
+                        "skipped_by_crossover": bool(resident_skipped_by_crossover),
                     },
                     "tiling": gpu_runtime.status(tiling_gpu_requested),
                     "display_requested": bool(display_requested),
