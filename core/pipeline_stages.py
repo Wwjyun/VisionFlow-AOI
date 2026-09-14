@@ -120,6 +120,22 @@ class InspectionResultAssembler:
     """Build the stable public result schema from completed pipeline phases."""
 
     @staticmethod
+    def _detector_gpu_status(detector, gpu_runtime) -> dict:
+        crossover_cpu = bool(getattr(detector, "cpu_crossover_only", False))
+        active = bool(detector.gpu_active and not crossover_cpu)
+        return {
+            "requested": getattr(detector, "gpu_requested", detector.use_gpu),
+            "active": active,
+            "backend": getattr(detector, "actual_backend", "cuda_dll" if active else "cpu"),
+            "device_name": (
+                (getattr(detector, "device_name", "") or gpu_runtime.device_name) if active else ""
+            ),
+            "fallback_reason": detector.gpu_fallback_reason,
+            "reason": "本機實測所有前處理 plan 以 CPU 較快，未使用 CUDA" if crossover_cpu else "",
+            "preprocess_routes": dict(getattr(detector, "preprocess_route_counts", {}) or {}),
+        }
+
+    @staticmethod
     def build(
         *,
         image_path: Path,
@@ -166,21 +182,9 @@ class InspectionResultAssembler:
                     "tiling": gpu_runtime.status(tiling_gpu_requested),
                     "display_requested": bool(display_requested),
                     "detectors": {
-                        detector.detector_id: {
-                            "requested": getattr(detector, "gpu_requested", detector.use_gpu),
-                            "active": detector.gpu_active,
-                            "backend": getattr(
-                                detector,
-                                "actual_backend",
-                                "cuda_dll" if detector.gpu_active else "cpu",
-                            ),
-                            "device_name": (
-                                (getattr(detector, "device_name", "") or gpu_runtime.device_name)
-                                if detector.gpu_active
-                                else ""
-                            ),
-                            "fallback_reason": detector.gpu_fallback_reason,
-                        }
+                        detector.detector_id: InspectionResultAssembler._detector_gpu_status(
+                            detector, gpu_runtime
+                        )
                         for detector in detectors
                     },
                     "metrics": gpu_runtime.performance_stats(),

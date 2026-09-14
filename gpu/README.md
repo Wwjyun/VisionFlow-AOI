@@ -29,6 +29,11 @@ copy、2×2 `(sum+2)>>2`、其他整數倍 float 平均，以及非整數倍的 
 `nvcc.fmad: false` 讓 build script 傳入 `--fmad=false`，避免 GPU 將乘加融合成 FMA 而破壞
 float 累加的逐像素一致性，不可移除。
 
+`gpu.mode: auto`（允許 CPU fallback）時，`PlanCrossoverPolicy` 會對每個前處理 plan 與輸入
+尺寸實測數次 CUDA 與 CPU 後凍結較快的後端；小 tile 或便宜 operator 可能改走逐像素相同的 CPU
+plan，tile metadata 以 `cpu_crossover` 路線與 `preprocess_routes` 標示。`gpu.mode: cuda`
+不啟用此路由。
+
 ## 檔案
 
 ```text

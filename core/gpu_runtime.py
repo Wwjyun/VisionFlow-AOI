@@ -13,6 +13,7 @@ from core.gpu_abi import (
     VfDagPlanDescV1 as _VfDagPlanDescV1, VfPlanDescV1 as _VfPlanDescV1,
     VfPlanOperatorV1 as _VfPlanOperatorV1, VfRoiV1 as _VfRoiV1,
 )
+from core.gpu_crossover import PlanCrossoverPolicy
 from core.gpu_metrics import GpuPerformanceRecorder
 from core.gpu_plan_descriptors import GpuPlanDescriptorBuilder
 from core.gpu_runtime_components import (
@@ -141,6 +142,8 @@ class GpuRuntime:
         self._performance_recorder = GpuPerformanceRecorder()
         self._performance = self._performance_recorder.values
         self._capture_native_cumulative = False
+        # Strict CUDA mode must never route a CUDA-capable plan to CPU.
+        self.crossover_policy = PlanCrossoverPolicy() if self.fallback_to_cpu else None
         if enabled:
             self._load()
             self._performance["load_sec"] = time.perf_counter() - load_started

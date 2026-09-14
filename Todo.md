@@ -111,7 +111,7 @@
 - [x] 量測 detector 401 多 iterations 的 morphology 占比：既有 close iterations 1/2/4/8 benchmark 加上 RTX 3090 合成 16384×13000／70 ROI／5×5 open iterations=10 基準，舊 kernel 的 morphology warm median 165.0 ms、占 GPU preprocessing 約 65%；正式真圖占比仍依 P4 驗收。
 - [x] 評估矩形 kernel 的 horizontal/vertical separable min/max filter：5×5 改用同一 kernel 內的 shared-memory 水平／垂直 min/max，其他尺寸保留原 kernel；RTX 3090 合成圖交錯 A/B 10 組皆勝出，逐像素及完整 Tile 結果一致。正式真圖、其他 Recipe 與長時間驗收仍依 P4 待辦。
 - [x] 多 iterations 使用 device ping-pong buffers，中間不得回傳 CPU。
-- [ ] 小 kernel/少 iterations 建立 CPU/GPU crossover 規則。（validator 已輸出各 iterations 含傳輸 CPU/GPU median/P95/speedup；production threshold 待 RTX 數據）
+- [x] 小 kernel/少 iterations 建立 CPU/GPU crossover 規則。（2026-09-14：RTX 3090 數據顯示單一像素門檻不成立，改為 detector-neutral `PlanCrossoverPolicy` 依本機實測每個 plan／輸入尺寸凍結較快後端，見 P5 與完成紀錄）
 
 ## P3：Detector 遷移與 CPU/GPU 邊界
 
@@ -193,7 +193,8 @@
 - [x] 移除不必要的 detector `image.copy()` 與完整尺寸 temporary masks；必要的 non-contiguous CUDA/QImage 邊界 copy 保留。
 - [x] 相同 tile 的 CPU detectors 共用一次 gray；GPU detectors 共用 resident source，避免各自重傳原圖。
 - [ ] RTX profiler 證明有收益後，再加入跨 detector 的 device-gray／完整 preprocessing result cache。
-- [ ] 對小圖、小 ROI、少 tiles 建立 CPU/GPU crossover benchmark；低於門檻自動選 CPU。（64²～1024² native 401-style matrix 與穩定 1.0x/1.5x threshold 報告已完成；production policy 待 RTX 數據）
+- [x] 對小圖、小 ROI、少 tiles 建立 CPU/GPU crossover benchmark；低於門檻自動選 CPU。（2026-09-14：`gpu.mode: auto` 允許 fallback 時啟用實測路由，`gpu.mode: cuda` 不啟用；RTX 3090 小 tile、正式 512² 與 16384×13000 六個 2000×12000 ROI 皆 CPU／strict CUDA／auto 結果一致）
+- [ ] Crossover 目前只比較單一前處理 plan，不含整圖 resident 上傳（16384×13000 約 0.08～0.1 s）；評估當所有 GPU Detector 的 plan 都選 CPU 或收益小於上傳成本時，整張圖略過 resident 上傳，並以正式真圖驗證。
 - [x] Overlay、NG tiles、CSV/JSON 與純檢測計時分離；目前各 reporter 與 `detectors_total` 已獨立計時，是否背景化由實測決定。
 - [x] Pattern matching 目前維持 CPU；只有 RTX profiler 證明為主要熱點後才另案 GPU 化，並要求模板常駐與 CPU 等價路徑。
 - [x] PNG 編碼、YAML、彙總、logging 與 GUI 控制邏輯維持 CPU，除非量測證明需要改變。
@@ -414,6 +415,8 @@
 - [ ] 加速不得犧牲 GUI 回應、打包啟動、結果追溯、錯誤訊息或 CPU fallback。
 
 ## 完成紀錄
+
+- [x] 2026-09-14：建立 CPU/GPU crossover 規則並啟用 detector-neutral 實測路由。RTX 3090 plan 級矩陣（10 種 operator 組合、48²～1024²、resident device ROI、CPU／CUDA 逐像素相同）顯示 CUDA 每次呼叫約 0.2 ms 固定成本，打平點依 plan 而異：`Gray→Threshold` 約 1024²、`Gray→AdaptiveMean157` 約 256²、401-AS-SN-1 型 BGR Gaussian15＋open5×10 約 192²，`Gaussian45→AdaptiveMean33` 在 48² 已 1.46×；Detector 級（含相同的 CPU contour）則 900／203／505 在各尺寸約 0.9～1.0×，401-CS-SN-1 到 768² 才打平，因此單一像素門檻不成立。新增 `core/gpu_crossover.py` 的 `PlanCrossoverPolicy`：每個（plan signature、輸入 shape／dtype、是否 device ROI）先跑 1 次 CUDA 暖機（含 native plan 建立）、3 次計時 CUDA 與 2 次 CPU shadow，CPU median×1.15 仍小於 CUDA median 時凍結為 CPU，否則 CUDA；bounded LRU 256 筆、執行緒安全，只在 `GpuRuntime.fallback_to_cpu` 時建立，strict `gpu.mode: cuda` 永不改路由。`BaseDetector` 的 linear／DAG plan 共用路由，CPU 路線 capability 標記 `cpu_crossover` 與量測依據，每個 tile 回報 `preprocess_routes`，全部 plan 走 CPU 的 tile／Detector 以 `gpu_active: false`、backend `cpu` 與繁中 `reason` 回報（不寫成 fallback）。新增 7 項測試（校準／凍結／margin／LRU、便宜 plan 校準後不再呼叫 CUDA 且結果等於 CPU、昂貴 plan 維持 CUDA、strict 無 policy、結果狀態標示）。RTX 3090 Pipeline（4 次、共用 session、暖機後 median）：4096² 圖 128² tile——401-AS-SN-1 CPU 0.925／strict 1.233／auto 1.038 s，505-AS-SN-1 0.505／0.961／0.607 s，401-CS-SN-1 0.615／1.003／0.683 s（皆改走 CPU），401-CS-AP-1 1.385／1.116／1.160 s（維持 CUDA）；512² tile 下 505 與 401-CS-SN-1 走 CPU、401 系列走 CUDA。16384×13000 原圖以 Template Anchor Grid `gap_x: 800` 取 6 個 2000×12000 ROI（6 次）：端到端 CPU／strict／auto——401-AS-SN-1 1.973／1.467／1.457 s（Detector 0.953／0.425／0.401 s）、401-CS-AP-1 1.748／1.389／1.323 s（0.733／0.260／0.260 s）、401-CS-SN-1 1.488／1.285／1.268 s（0.431／0.184／0.183 s）、505-AS-SN-1 1.275／1.234／1.324 s（0.213／0.203／0.213 s），大 ROI 全部選 CUDA；GPU 模式整圖上傳約 0.08～0.10 s 未納入 plan 比較，已另列待辦。所有情境 CPU／strict／auto 正規化結果完全一致。完整 353 tests、fault injection（四情境）、compileall、CUDA preflight、CLI 合成 NG（預期 exit 2）、GUI offscreen smoke 與 `git diff --check` 通過；未修改 CUDA source／ABI／DLL，正式真圖路由收益仍待驗證。
 
 - [x] 2026-09-14：完成 `cudaMallocAsync`／CUDA memory pool 評估，決定不採用。RTX 3090 以五份正式 Recipe（Detector 全部 `use_gpu`、`gpu.mode: cuda`、throughput session）各跑 12 張 3840×2160 合成圖，persistent context allocation count 從第 1 張起固定為 8～9，第 3～12 張增量皆為 0，代表 grow-only buffer 已消除穩態配置。cudart 微基準（各 20 次、暖機後）：同步 `cudaMalloc`+`cudaFree` 4／64／609 MiB median 0.60／5.98／20.55 ms；預設 `cudaMallocAsync` pool 因同步後釋回記憶體為 3.11／5.76／23.22 ms，沒有收益；將 release threshold 設為最大值後降至約 0.004 ms，但會持續保留 VRAM（本次保留後可用量降至 22,696 MiB）。由於正式路徑穩態不配置、會受益的只有首張圖／尺寸成長／plan 建立，以及 production 未使用的 stateless primitive 與 ROI batch，且保留 VRAM 會加劇上一項量到的 sysmem 溢出風險，因此維持現有 grow-only 策略；未修改 runtime、CUDA source／ABI／DLL。
 
