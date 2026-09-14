@@ -41,13 +41,26 @@ ROOT = Path(__file__).resolve().parent.parent
 
 CANVAS = (4000, 6000)  # (width, height) = 2 ROI widths x 3 ROI heights
 ROI = (2000, 2000)  # (height, width)
-# Exactly six 2000x2000 ROIs: two columns of width 2000, three rows of height 2000.
-# ``tile.mode: grid`` with width=2000/height=2000 and no overlap then produces exactly
-# these six tiles, so the pipeline performs one whole-image upload while the detector
-# sees six tiles.  This is a stand-in for the production ROI shape: no real
-# production image is checked in (see the acceptance items in Todo.md), so the tool
-# validates the *pipeline* path and the CPU/CUDA agreement at production-like sizes.
-ROI_ORIGINS = [(row * ROI[0], col * ROI[1]) for row in range(3) for col in range(2)]
+# Production geometry recorded in Todo.md: six 2000x12000 ROIs, which is the shape the
+# CPU detector was measured at ~4.9 s.  It needs a 6000x24000 canvas (432 MB as BGR),
+# so it is opt-in via ``--profile production`` while the quick 2000x2000 geometry is the
+# default.
+PRODUCTION_CANVAS = (6000, 24000)
+PRODUCTION_ROI = (12000, 2000)
+
+
+def _roi_origins(roi: tuple[int, int], columns: int, rows: int):
+    return [(row * roi[0], col * roi[1]) for row in range(rows) for col in range(columns)]
+
+
+# Exactly six ROIs: two columns of width 2000, three rows of height 2000.  ``tile.mode:
+# grid`` with width=2000/height=2000 and no overlap then produces exactly these six
+# tiles, so the pipeline performs one whole-image upload while the detector sees six
+# tiles.  No real production image is checked in (see the acceptance items in Todo.md),
+# so the tool validates the *pipeline* path and the CPU/CUDA agreement at production-like
+# sizes.
+ROI_ORIGINS = _roi_origins(ROI, columns=2, rows=3)
+PRODUCTION_ROI_ORIGINS = _roi_origins(PRODUCTION_ROI, columns=3, rows=2)
 
 DETECTOR_ID = "202-CS-SN-1"
 DETECTOR_PARAMS = {
@@ -59,10 +72,16 @@ DETECTOR_PARAMS = {
 }
 
 
-def _render_canvas(canvas_path: Path, seed: int = 202) -> None:
-    """Write the synthetic production canvas without holding the whole array twice."""
+def _render_canvas(
+    canvas_path: Path,
+    seed: int = 202,
+    canvas: tuple[int, int] = CANVAS,
+    roi: tuple[int, int] = ROI,
+    roi_origins: list[tuple[int, int]] = ROI_ORIGINS,
+) -> None:
+    """Write the synthetic canvas without holding more than one plane at a time."""
 
-    width, height = CANVAS
+    width, height = canvas
     rng = np.random.default_rng(seed)
     bgr = np.empty((height, width, 3), np.uint8)
 
@@ -75,8 +94,8 @@ def _render_canvas(canvas_path: Path, seed: int = 202) -> None:
 
     # Each ROI slot gets a regular part array with a handful of defects, which is the
     # content that produces exact CNR ties.
-    for index, (y0, x0) in enumerate(ROI_ORIGINS):
-        roi_height, roi_width = ROI[0], ROI[1]
+    for index, (y0, x0) in enumerate(roi_origins):
+        roi_height, roi_width = roi[0], roi[1]
         yy, xx = np.mgrid[0:roi_height, 0:roi_width]
         base = (
             150.0
@@ -109,7 +128,9 @@ def _render_canvas(canvas_path: Path, seed: int = 202) -> None:
     del bgr
 
 
-def _recipe(base: dict, dll_path: str, use_gpu: bool) -> dict:
+def _recipe(
+    base: dict, dll_path: str, use_gpu: bool, roi: tuple[int, int] = ROI
+) -> dict:
     recipe = copy.deepcopy(base)
     recipe["gpu"] = {
         "tiling": use_gpu,
@@ -128,12 +149,11 @@ def _recipe(base: dict, dll_path: str, use_gpu: bool) -> dict:
         "display_name": "202-CS-SN-1 auto CNR (production shape)",
         "params": dict(DETECTOR_PARAMS),
     }
-    # Six 2000x12000 ROIs: the grid origin positions are explicit, so express them as
-    # a tall/wide grid that yields exactly those six tiles.
+    # A grid whose cell is exactly one ROI yields exactly the intended tiles.
     recipe["tile"] = {
         "mode": "grid",
-        "width": ROI[1],
-        "height": ROI[0],
+        "width": roi[1],
+        "height": roi[0],
         "overlap_x": 0,
         "overlap_y": 0,
     }
@@ -248,25 +268,45 @@ def main() -> int:
     parser.add_argument("--json", type=Path, default=None)
     parser.add_argument("--keep", action="store_true", help="keep the generated canvas")
     parser.add_argument("--work", type=Path, default=None)
+    parser.add_argument(
+        "--profile",
+        choices=("quick", "production"),
+        default="quick",
+        help=(
+            "quick: six 2000x2000 ROIs on a 4000x6000 canvas; "
+            "production: six 2000x12000 ROIs on a 6000x24000 canvas (the geometry "
+            "recorded in Todo.md), which needs ~432 MB for the canvas"
+        ),
+    )
     args = parser.parse_args()
 
     work = args.work or Path(tempfile.mkdtemp(prefix="visionflow_production_"))
     canvas = work / "production_canvas.png"
+    if args.profile == "production":
+        canvas_size, roi, roi_origins = (
+            PRODUCTION_CANVAS,
+            PRODUCTION_ROI,
+            PRODUCTION_ROI_ORIGINS,
+        )
+    else:
+        canvas_size, roi, roi_origins = CANVAS, ROI, ROI_ORIGINS
     print(
-        f"canvas: {CANVAS[0]}x{CANVAS[1]} (w x h), six ROIs "
-        f"{ROI[0]}h x {ROI[1]}w at (y,x)={ROI_ORIGINS}"
+        f"profile: {args.profile}  canvas {canvas_size[0]}x{canvas_size[1]} (w x h), "
+        f"{len(roi_origins)} ROIs {roi[0]}h x {roi[1]}w"
     )
     if not canvas.is_file() or not args.keep:
         started = time.perf_counter()
-        _render_canvas(canvas)
+        _render_canvas(
+            canvas, canvas=canvas_size, roi=roi, roi_origins=roi_origins
+        )
         print(
             f"wrote {canvas} ({canvas.stat().st_size / 1e6:.1f} MB) in "
             f"{time.perf_counter() - started:.1f} s"
         )
 
     base = RecipeManager().load(ROOT / "recipes" / "PRODUCT_A_AOI_01.yaml")
-    cpu_recipe = _recipe(base, args.dll, use_gpu=False)
-    gpu_recipe = _recipe(base, args.dll, use_gpu=True)
+    cpu_recipe = _recipe(base, args.dll, use_gpu=False, roi=roi)
+    gpu_recipe = _recipe(base, args.dll, use_gpu=True, roi=roi)
     cpu_path = work / "cpu.yaml"
     gpu_path = work / "gpu.yaml"
     cpu_path.write_text(yaml.safe_dump(cpu_recipe, allow_unicode=True, sort_keys=False), encoding="utf-8")
@@ -373,8 +413,9 @@ def main() -> int:
 
     payload = {
         "kind": "pipeline_production",
-        "canvas": {"width": CANVAS[0], "height": CANVAS[1]},
-        "roi": {"height": ROI[0], "width": ROI[1], "origins": ROI_ORIGINS},
+        "profile": args.profile,
+        "canvas": {"width": canvas_size[0], "height": canvas_size[1]},
+        "roi": {"height": roi[0], "width": roi[1], "origins": roi_origins},
         "cpu_ms": cpu_ms,
         "gpu_ms": gpu_ms,
         "speedup": cpu_ms / gpu_ms if gpu_ms else None,
