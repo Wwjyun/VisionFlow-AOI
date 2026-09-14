@@ -193,7 +193,18 @@
 - Template Anchor Grid 定位：device 端與 OpenCV `matchTemplate` 座標 9/9 相同、分數差 ≤ 4.2e-7、逐次執行決定性；
   形狀界線內比 CPU 快 1.6～3.9 倍（界線外與失敗時回 CPU 參考）。`execution.gpu.device_host_split` 如實回報。
 
-**卡點 1：contour 追蹤已等價但慢 95～107 倍，無法啟用。**
+**卡點 1（已解決）：contour 追蹤的序列瓶頸。**
+- 原狀：`vf_find_contours_u8` 等價但 2000×12000 上約 1300 ms（cv2 約 13 ms，慢約 100 倍），瓶頸是單一 thread 的序列掃描。
+- 解法（2026-09-14 完成）：把掃描決策抽出為 `contour_stop_starts_border`，外邊界起點判定（只看 0→非 0 轉換、與標記無關）可平行處理，
+  孔洞起點與 RETR_EXTERNAL 判定才相依標記，因而保留序列部分；輸出仍依 raster 順序反序以維持 OpenCV 順序。
+- 驗證（`tools/check_contour_equivalence.py`，主 session 自行重跑）：**314/314 identical、determinism True**；
+  效能 2000×12000 sparse 200 條輪廓 39.92 ms vs cv2 14.03 ms（2.85×，仍較慢）、
+  dense 358 條輪廓 **9.92 ms vs cv2 14.41 ms（比 cv2 快 1.45×）**，kernel 3.85 ms、h2d 0 ms。
+  另 2000×2000 密集案例先前亦已量得快於 cv2。
+- 後續：等價與速度多數情境已具備，但仍有稀疏情境較慢；啟用前需定義形狀／密度界線（比照 anchor 的 `gpu_anchor_shapes_supported` 作法），
+  且必須先把 contour 接進 Detector 並通過 PASS/NG、bbox、area、confidence、metadata 等價測試。**目前仍未接進任何 Detector**，`candidate_extraction` 仍回報 cpu。
+
+**原始卡點描述（保留供追溯）：**
 - 現況：`vf_find_contours_u8` 與 `cv2.findContours` 在 `tools/check_contour_equivalence.py` 的 102 個案例
   （12 種遮罩 × 2 模式 × 多組 ROI，含 2000×12000）**全部逐點 identical 且決定性**；但 2000×12000 上
   operator 約 1300～1334 ms，對比 cv2 的 12.1～13.5 ms，且 kernel 佔 1296～1330 ms、h2d 0 ms，
