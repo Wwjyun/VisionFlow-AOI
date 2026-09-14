@@ -382,6 +382,18 @@ float32 累加、OpenCV 的 kernel 係數）與 `vf_gaussian_blur_f32_roi`，並
   （例：cv2 label 4 的首像素是 (16,1)，但掃描順序上它應為 8；cv2 label 5 的首像素 (19,0) 應為 4）。
   第二個隨機遮罩（69 個 component）有 49 個不符。
 
+**標籤編號是否真的會影響 202 的最終輸出：會，已實測確認。** 新增 `tools/cnr_label_order_impact.py`：
+在一個會產生**精確 CNR 平手**的場景（49 個完全相同缺陷的規則網格；49 個候選、7 個相異 CNR、
+5 個平手群、最大平手群 25 個），把 component 標籤套用 200 次隨機置換後重跑 `_collect_candidates`，
+**200/200 都改變了最終輸出順序**（第一個差異範例：置換後第一個缺陷 bbox `[215,95,20,20]`
+vs 原本 `[255,255,20,20]`）。因此「標籤編號順序」對 202 的最終缺陷清單順序**是可觀測的**，
+任何取代 connected components 的 GPU 實作**必須重現 OpenCV 的編號順序**，不能只重現 component 集合。
+（過程中先得到一次「200/200 相同」的結果，經查是工具只傳了置換後的 labels、未傳 `stats`／`label_count`，
+使 `_collect_candidates_with_labels` 內部又重算 cv2 標籤——**該中間結果無效，已修正並記錄**。）
+為此在 `Detector202_1` 新增 `_collect_candidates_with_labels(...)`：`_collect_candidates` 仍以
+`cv2.connectedComponentsWithStats` 產生標籤後委派給它，因此產線行為完全不變（405 tests OK）；
+新增此注入點只是讓上述實驗可以餵入不同編號的標籤。
+
 後續處理建議（剩餘工作已收斂為單一路徑）：
 1. **只差 8 連通**：把 8 連通改為 Bolelli 2×2 區塊掃描（`LabelingBolelli`）的單條紋版本，
    以「區塊左上像素建立 provisional 標籤」的順序產生 `P`，再套用已確認的 `flattenL` 編號規則。
@@ -694,6 +706,8 @@ float32 累加、OpenCV 的 kernel 係數）與 `vf_gaussian_blur_f32_roi`，並
 - [ ] 加速不得犧牲 GUI 回應、打包啟動、結果追溯、錯誤訊息或 CPU fallback。
 
 ## 完成紀錄
+
+- [x] 2026-09-15：實測確認「component 標籤編號順序」**會改變 202-CS-SN-1 的最終輸出**，因此 GPU 化的 connected components 必須重現 OpenCV 的編號，不能只重現 component 集合。新增 `tools/cnr_label_order_impact.py`：場景為 49 個位元組相同缺陷的規則網格（常數背景 → 49 個候選、7 個相異 CNR、5 個精確平手群、最大平手群 25 個），以 200 次隨機置換改寫 component 標籤後重跑候選階段，**200/200 全部改變輸出順序**（首個差異：置換後第一個缺陷 bbox `[215,95,20,20]` vs 原本 `[255,255,20,20]`）。這證實了 `tests/test_detector_202_1_cnr_contract.py` 所釘住的「平手時依 label 遞增」契約在真實場景是可觀測的，也把 connected components 的缺口從「可能不重要」升級為**確定必須修正**。過程中先得到一次「200/200 相同」的結果，追查後確認是工具只傳置換後的 labels、未傳 `stats`／`label_count`，導致 `_collect_candidates_with_labels` 內部又重算 cv2 標籤；**該中間結果無效，已在 Todo 如實記錄並修正工具**。為支援此實驗，在 `Detector202_1` 新增 `_collect_candidates_with_labels(...)` 注入點，`_collect_candidates` 仍以 `cv2.connectedComponentsWithStats` 產生標籤後委派，**產線行為完全不變**（405 tests OK、compileall exit 0）。證據：`outputs_validation/cnr_profile/cnr_label_order_impact.json`。
 
 - [x] 2026-09-15：獨立複驗 `vf_gaussian_blur_f32`（202 CNR 的 float32 Gaussian 背景）並**否決接線**，同時量到它真正的收益位置。子代理已把 export、bridge 與等價工具落地；主 session 對其建置的 DLL 自行重跑等價工具，結果與子代理證據**位元組完全相同**（sha256 `AC741DA24AE0246E31B0FDDE23CEF3E3284D553B8FE6FFC110D6BD2BDBAE41B4`）：kernel 係數在 **63 個尺寸位元相同**（sigma=0 自動規則）、float32 值域 [0,255] 的 worst `max|diff|` 9.155e-05（claimed 2.0e-04）、`mean|diff|` 1.052e-05（claimed 2.0e-05）、決定性、奇數 3～127 以外明確拒絕；`gpu/preflight_cuda_build.py` exit 0、`tests.test_cuda_source_contract` 13 OK、全套 405 tests OK。**新增缺陷並否決接線**：`vf_gaussian_blur_f32` **完全忽略 sigma 參數**（永遠回傳 sigma=0 的結果）——64×64 float32 的 4×4 方塊實測 `ksize=5/9/31 sigma=1.0` 與 host 相差 1.918／31.52／78.14，而與 host 的 sigma=0 相差 0.0。因 `detector_202_1.py` 把 `gaussian_sigma` 暴露為可設定內參，非零 sigma 時會**靜默替換語意**，違反 AGENT.md，故**未接線**（bridge 已存在但沒有任何 detector 取用，產線行為不變），已把缺陷與重現方式交回子代理修正。新增 `tools/gaussian_mask_margin.py` 獨立量測「GPU Gaussian 會不會改變候選遮罩」：11 個場景中 10 個位元相同（含兩個產線尺寸，背景 max|diff| 僅 ~6.1e-05、mask flip margin 1.5e-05～1.3e-03），唯一不同的正是 `gaussian_sigma=1.0`（背景差 42.82、遮罩不同）。**收益位置也已量清**：4000×2000 ksize=51 單獨呼叫為 13.994 ms（cv2）vs 14.637 ms（device，0.96×）**沒有收益**，但 CUDA event 顯示 **kernel 本體只有 0.607 ms**，5.013 ms H2D＋7.575 ms D2H 佔其餘——所以價值在「把 residual 留在 device」一次完成 median／絕對值／門檻／遮罩，可同時省下 94 ms 的 `threshold_and_mask` 與 59 ms 的 Gaussian+residual。另以 `tools/gaussian_202_matrix.py` 取得 39 場景最終輸出矩陣：**PASS/NG 39/39、缺陷數 39/39、結構欄位 39/39、候選遮罩 39/39 位元相同**，但 `metadata.mad`／`residual_threshold`／`robust_noise_sigma` 67/78、`residual_median` 22/78 差約 1e-5 相對值——**判定不變、值會變**，此語意差異必須在接線時揭露。證據：`outputs_validation/cnr_profile/gaussian_f32_equivalence.{txt,json}`、`gaussian_f32_timing.{txt,json}`、`gaussian_202_final_output_matrix.{txt,json}`、`gaussian_mask_margin.json`。未修改產線程式與既有 ABI v1 匯出語意。
 

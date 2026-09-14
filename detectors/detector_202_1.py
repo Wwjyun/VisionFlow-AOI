@@ -356,6 +356,37 @@ class Detector202_1(Detector202):
         candidate_mask: np.ndarray,
         inclusion_mask: np.ndarray,
     ) -> list[_CnrCandidate]:
+        label_count, labels_raw, stats_raw, _ = cv2.connectedComponentsWithStats(
+            candidate_mask,
+            connectivity=int(self.params.get("connectivity", 8)),
+        )
+        return self._collect_candidates_with_labels(
+            image_float,
+            candidate_mask,
+            inclusion_mask,
+            np.asarray(labels_raw),
+            np.asarray(stats_raw),
+            int(label_count),
+        )
+
+    def _collect_candidates_with_labels(
+        self,
+        image_float: np.ndarray,
+        candidate_mask: np.ndarray,
+        inclusion_mask: np.ndarray,
+        labels: np.ndarray,
+        stats: np.ndarray | None = None,
+        label_count: int | None = None,
+    ) -> list[_CnrCandidate]:
+        """Collect ring-CNR candidates from a supplied component label map.
+
+        ``_collect_candidates`` computes the labels with
+        ``cv2.connectedComponentsWithStats`` and delegates here.  Accepting the label
+        map lets a caller supply labels produced by a different implementation - which
+        is how ``tools/cnr_label_order_impact.py`` measures whether OpenCV's label
+        *numbering* is observable in the detector output.
+        """
+
         height, width = candidate_mask.shape[:2]
         minimum_area, maximum_area = self._effective_component_area_limits(
             height, width
@@ -365,12 +396,16 @@ class Detector202_1(Detector202):
             or float(self.params.get("max_component_area_ratio", 0.05)) > 0
         )
         connectivity = int(self.params.get("connectivity", 8))
-        label_count, labels_raw, stats_raw, _ = cv2.connectedComponentsWithStats(
-            candidate_mask,
-            connectivity=connectivity,
-        )
-        labels = np.asarray(labels_raw)
-        stats = np.asarray(stats_raw)
+        if label_count is None or stats is None:
+            label_count, labels_raw, stats_raw, _ = cv2.connectedComponentsWithStats(
+                candidate_mask,
+                connectivity=connectivity,
+            )
+            labels = np.asarray(labels_raw)
+            stats = np.asarray(stats_raw)
+        else:
+            labels = np.asarray(labels)
+            stats = np.asarray(stats)
         candidates = []
 
         for label in range(1, label_count):
