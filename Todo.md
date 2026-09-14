@@ -411,6 +411,14 @@ float32 累加、OpenCV 的 kernel 係數）與 `vf_gaussian_blur_f32_roi`，並
    **忠實移植的成本與風險都高**（goto-DAG 狀態機、3 個森林檔、須與 cv2 逐位元比對）；
    已取得的可讀來源為 YACCLAB 的 `labeling_bolelli_2019.h`（第一／第二輪掃描骨架）加上
    4 個 GRAPHGEN 森林檔。目前可用且已完全等價的黃金標準是 **4 連通**。
+   **2026-09-15 追加：已定位「為何不能簡單轉譯」的具體原因。** 我實測四個森林檔的控制流：
+   `ccl_bolelli_forest.inc.hpp` 有 **109 個標籤、280 個 goto**，其中**74 個標籤是巢狀在 `if`
+   區塊內**（`firstline` 17 個標籤中 7 個巢狀、`lastline` 39 個中 18 個、`singleline` 9 個中 2 個），
+   且**所有 goto 目標都能解析**（0 個未解析）。這解釋了我先前 `goto`→`return` 轉譯為何必然錯誤：
+   `return` 會拋棄外層區塊，而多數目標就在外層區塊內。正確做法必須把巢狀標籤提升為頂層狀態、
+   依外層 `if`／`else` 結構決定每個狀態的後繼，建立完整控制流圖後再攤平為 dispatch 迴圈
+   （即 GRAPHGEN 的 `NODE_*` 標籤本來就在做的事）。這是**多輪工程**，不適合單輪趕工；
+   因此本輪不動手，並把上述精確數字留下供後續接手，避免重複嘗試同一條錯誤路徑。
 
 **標籤編號是否真的會影響 202 的最終輸出：會，已實測確認。** 新增 `tools/cnr_label_order_impact.py`：
 在一個會產生**精確 CNR 平手**的場景（49 個完全相同缺陷的規則網格；49 個候選、7 個相異 CNR、
@@ -759,6 +767,8 @@ vs 原本 `[255,255,20,20]`）。因此「標籤編號順序」對 202 的最終
 - [ ] 加速不得犧牲 GUI 回應、打包啟動、結果追溯、錯誤訊息或 CPU fallback。
 
 ## 完成紀錄
+
+- [x] 2026-09-15：定位「OpenCV Bolelli 森林為何不能簡單轉譯」的**具體**原因，避免後續重複同一條錯誤路徑。以腳本實測四個森林檔的控制流：`ccl_bolelli_forest.inc.hpp` 有 **109 個標籤／280 個 goto**，其中 **74 個標籤巢狀在 `if` 區塊內**；`firstline` 17 個標籤中 7 個巢狀、`lastline` 39 個中 18 個、`singleline` 9 個中 2 個；**所有 goto 目標都能解析（0 個未解析）**，且每個檔案結尾深度都回到 0。這給出了我先前 `goto`→`return` 轉譯失敗的**確切機制**：`return` 會拋棄外層區塊，而 74 個目標就在外層區塊內，所以必然錯誤。正確做法是把巢狀標籤提升為頂層狀態、依外層 `if`／`else` 結構決定每個狀態的後繼，建立完整控制流圖後攤平為 dispatch 迴圈（GRAPHGEN 產生的 `NODE_*` 標籤正是為此存在）。**結論：這是多輪工程，本輪不動手**，並把精確數字寫進 Todo 缺口段落供後續接手。同時更正前兩輪記錄中的產線 ROI 方向錯誤（見上一筆）。未修改產線程式；425 tests OK。
 
 - [x] 2026-09-15：完成**產線真實幾何**的端到端 CPU/GPU 驗證，並修正一個會讓新 export 靜默失效的整合缺陷。`tools/benchmark_pipeline_production.py` 新增 `--profile production`，保留 `--profile quick`（六個 2000×2000）。**主 session 親自量測**（單次，RTX 3090）：CPU 端到端 **7086.1 ms** → CUDA **3984.4 ms**，**1.78×**；`202-CS-SN-1.automatic_cnr_mask` **4825.4 → 1620.9 ms（2.98×）**、`detectors_total` **5222.9 → 2023.7 ms（2.58×）**；PASS/NG 6/6、缺陷數 6 tiles／**618 defects** 完全相同，**decision-bearing 欄位完全相同**，而且**這個真實幾何場景上 residual 衍生的四個診斷值完全沒有漂移**（`no drift on this image`）——先前的漂移只在合成的 2000×2000 場景出現。未被 GPU 覆蓋的固定成本也如實記錄：`image_load` 1676.9→1655.5 ms（兩邊相同，占 CUDA 總時間 42%）、`recipe_setup` 97→191 ms、`initialization` 0.2→91 ms。**我自己的量測錯誤（已更正並記錄）**：第一版把產線 ROI 寫成 12000h×2000w，與 Todo 記載的 **2000h×12000w** 形狀不同（像素數相同，但對 51 像素可分離濾波器的快取行為差很多，因此方向是量測的一部分而非實作細節）；已修正為 2000h×12000w（兩個 12000 寬的欄 × 三個 2000 高的列，canvas 24000×6000），並加上「ROI 必須恰好鋪滿 canvas」的斷言。修正後數字幾乎相同（1.76×→1.78×），但**舊數字是在錯誤形狀上量的**，故以本筆為準。**整合缺陷（子代理發現、我確認並保留修正）**：我的呼叫端寫成 dict（`device["mask"]`），子代理第一版 bridge 回傳 4-tuple，`TypeError` 會被呼叫端的 `except Exception: pass` 吞掉，導致新 export **從未被實際使用**——這正是「寬鬆 except 讓接線靜默失效」的典型陷阱。修正後 bridge 回傳 dict，我用真 DLL 實測確認：`background_backend=cuda_f32`、`residual_backend=cuda_f32`、`vf_cnr_mask_f32: 1`、**`vf_median_f32: None`**（融合 export 真的取代了兩次 median）。此缺陷也解釋了先前的量測不一致：commit `87de895` 當下的 bridge 形式未定，該次記錄的 1.26× 可能來自 NumPy 回退路徑；本輪的 1.78× 是在**確認融合路徑生效**後量的。全套 **425 tests OK**、compileall exit 0、`gpu/preflight_cuda_build.py` exit 0。證據：`outputs_validation/cnr_profile/pipeline_production_real.json`、`pipeline_production_quick.json`。
 
