@@ -2,10 +2,12 @@
 #include "visionflow_cuda.h"
 #include "visionflow_cuda_internal.cuh"
 #include <algorithm>
+#include <cfloat>
 #include <climits>
 #include <chrono>
 #include <cmath>
 #include <cstring>
+#include <memory>
 #include <new>
 #include <utility>
 #include <vector>
@@ -158,6 +160,34 @@ void finalize_timing(PersistentContext* context) {
     }
 }
 
+enum AreaResizeMode {
+    AREA_RESIZE_COPY = 0,
+    AREA_RESIZE_FAST_2X2 = 1,
+    AREA_RESIZE_FAST_INTEGER = 2,
+    AREA_RESIZE_GENERAL = 3,
+};
+
+// Device tables reproducing OpenCV INTER_AREA downscale for one source/target shape.
+// indices: [x offsets (dw+1)] [y offsets (dh+1)] [x sources] [y sources]
+// alphas:  [x weights] [y weights]
+struct AreaResizeTables {
+    int mode = AREA_RESIZE_COPY;
+    int scale_x = 1;
+    int scale_y = 1;
+    float inverse_area = 1.0f;
+    int x_entries = 0;
+    int* indices = nullptr;
+    float* alphas = nullptr;
+
+    AreaResizeTables() = default;
+    AreaResizeTables(const AreaResizeTables&) = delete;
+    AreaResizeTables& operator=(const AreaResizeTables&) = delete;
+    ~AreaResizeTables() {
+        visionflow_cuda::free_device(indices);
+        visionflow_cuda::free_device(alphas);
+    }
+};
+
 struct NativePlan {
     PersistentContext* context = nullptr;
     int width = 0;
@@ -167,6 +197,7 @@ struct NativePlan {
     int input_channels = 0;
     int output_channels = 0;
     std::vector<VfPlanOperatorV1> operators;
+    std::vector<std::unique_ptr<AreaResizeTables>> area_resizes;
 };
 
 struct NativeDagPlan {
@@ -659,34 +690,56 @@ __global__ void crop_kernel(const uint8_t* src, uint8_t* dst, int src_width, int
     for (int c = 0; c < channels; ++c) dst[(y * width + x) * channels + c] = src[((y + y0) * src_width + x + x0) * channels + c];
 }
 
+// Exact OpenCV INTER_AREA downscale for CV_8UC1. Float accumulation order matches
+// ResizeArea_Invoker; the DLL is built with --fmad=false so products are never fused.
+__global__ void resize_area_kernel(
+    const uint8_t* src, uint8_t* dst, int sw, int dw, int dh, int mode,
+    int scale_x, int scale_y, float inverse_area, int x_entries,
+    const int* indices, const float* alphas) {
+    int x = blockIdx.x * blockDim.x + threadIdx.x;
+    int y = blockIdx.y * blockDim.y + threadIdx.y;
+    if (x >= dw || y >= dh) return;
+    int value = 0;
+    if (mode == AREA_RESIZE_COPY) {
+        value = src[static_cast<size_t>(y) * sw + x];
+    } else if (mode == AREA_RESIZE_FAST_2X2) {
+        const uint8_t* row0 = src + static_cast<size_t>(y) * 2 * sw;
+        const uint8_t* row1 = row0 + sw;
+        const int sx = x * 2;
+        value = (row0[sx] + row0[sx + 1] + row1[sx] + row1[sx + 1] + 2) >> 2;
+    } else if (mode == AREA_RESIZE_FAST_INTEGER) {
+        uint32_t sum = 0;
+        for (int sy = 0; sy < scale_y; ++sy) {
+            const uint8_t* row = src + (static_cast<size_t>(y) * scale_y + sy) * sw;
+            for (int sx = 0; sx < scale_x; ++sx) sum += row[x * scale_x + sx];
+        }
+        float scaled = static_cast<float>(static_cast<int>(sum)) * inverse_area;
+        value = static_cast<int>(nearbyintf(scaled));
+    } else {
+        const int y_offsets = dw + 1;
+        const int x_sources = dw + dh + 2;
+        const int y_sources = x_sources + x_entries;
+        float total = 0.0f;
+        for (int j = indices[y_offsets + y]; j < indices[y_offsets + y + 1]; ++j) {
+            const uint8_t* row = src + static_cast<size_t>(indices[y_sources + j]) * sw;
+            float row_sum = 0.0f;
+            for (int k = indices[x]; k < indices[x + 1]; ++k) {
+                float product = static_cast<float>(row[indices[x_sources + k]]) * alphas[k];
+                row_sum = row_sum + product;
+            }
+            float weighted = alphas[x_entries + j] * row_sum;
+            total = total + weighted;
+        }
+        value = static_cast<int>(nearbyintf(total));
+    }
+    dst[static_cast<size_t>(y) * dw + x] = static_cast<uint8_t>(max(0, min(255, value)));
+}
+
 __global__ void resize_gray_kernel(const uint8_t* src, uint8_t* dst, int sw, int sh, int dw, int dh) {
     int x = blockIdx.x * blockDim.x + threadIdx.x;
     int y = blockIdx.y * blockDim.y + threadIdx.y;
     if (x >= dw || y >= dh) return;
-    if (dw <= sw && dh <= sh) {
-        float scale_x = static_cast<float>(sw) / dw;
-        float scale_y = static_cast<float>(sh) / dh;
-        float source_x0 = x * scale_x;
-        float source_x1 = (x + 1) * scale_x;
-        float source_y0 = y * scale_y;
-        float source_y1 = (y + 1) * scale_y;
-        int start_x = static_cast<int>(floorf(source_x0));
-        int end_x = static_cast<int>(ceilf(source_x1));
-        int start_y = static_cast<int>(floorf(source_y0));
-        int end_y = static_cast<int>(ceilf(source_y1));
-        float sum = 0.0f;
-        for (int source_y = start_y; source_y < end_y; ++source_y) {
-            float weight_y = fmaxf(0.0f, fminf(source_y1, source_y + 1.0f) - fmaxf(source_y0, static_cast<float>(source_y)));
-            int clamped_y = max(0, min(sh - 1, source_y));
-            for (int source_x = start_x; source_x < end_x; ++source_x) {
-                float weight_x = fmaxf(0.0f, fminf(source_x1, source_x + 1.0f) - fmaxf(source_x0, static_cast<float>(source_x)));
-                int clamped_x = max(0, min(sw - 1, source_x));
-                sum += src[clamped_y * sw + clamped_x] * weight_x * weight_y;
-            }
-        }
-        dst[y * dw + x] = static_cast<uint8_t>(sum / (scale_x * scale_y) + 0.5f);
-        return;
-    }
+    // Upscale only; non-expanding targets use resize_area_kernel.
     float sx = (x + 0.5f) * sw / dw - 0.5f, sy = (y + 0.5f) * sh / dh - 0.5f;
     int raw_x0 = static_cast<int>(floorf(sx));
     int raw_y0 = static_cast<int>(floorf(sy));
@@ -1005,6 +1058,108 @@ __global__ void gather_roi_batch_kernel(
 }
 
 dim3 grid2d(int width, int height) { return dim3((width + BLOCK_X - 1) / BLOCK_X, (height + BLOCK_Y - 1) / BLOCK_Y); }
+
+// Mirrors OpenCV computeResizeAreaTab: double geometry, 1e-3 edge tolerance, float weights.
+void append_area_axis(
+    int source_size, int target_size, double scale,
+    std::vector<int>* offsets, std::vector<int>* sources, std::vector<float>* weights) {
+    offsets->push_back(0);
+    for (int target = 0; target < target_size; ++target) {
+        const double first = target * scale;
+        const double last = first + scale;
+        const double cell_width = std::min(scale, source_size - first);
+        int start = static_cast<int>(std::ceil(first));
+        int end = static_cast<int>(std::floor(last));
+        end = std::min(end, source_size - 1);
+        start = std::min(start, end);
+        if (start - first > 1e-3) {
+            sources->push_back(start - 1);
+            weights->push_back(static_cast<float>((start - first) / cell_width));
+        }
+        for (int source = start; source < end; ++source) {
+            sources->push_back(source);
+            weights->push_back(static_cast<float>(1.0 / cell_width));
+        }
+        if (last - end > 1e-3) {
+            sources->push_back(end);
+            weights->push_back(static_cast<float>(
+                std::min(std::min(last - end, 1.0), cell_width) / cell_width));
+        }
+        offsets->push_back(static_cast<int>(sources->size()));
+    }
+}
+
+int prepare_area_resize(
+    int source_width, int source_height, int target_width, int target_height,
+    AreaResizeTables* tables, unsigned long long* allocation_count) {
+    if (tables == nullptr || source_width <= 0 || source_height <= 0 || target_width <= 0 ||
+        target_height <= 0 || target_width > source_width || target_height > source_height) {
+        return VF_CUDA_INVALID_ARGUMENT;
+    }
+    if (source_width == target_width && source_height == target_height) {
+        tables->mode = AREA_RESIZE_COPY;
+        return VF_CUDA_OK;
+    }
+    const double scale_x = 1.0 / (static_cast<double>(target_width) / source_width);
+    const double scale_y = 1.0 / (static_cast<double>(target_height) / source_height);
+    const int integer_x = static_cast<int>(std::lround(scale_x));
+    const int integer_y = static_cast<int>(std::lround(scale_y));
+    if (std::abs(scale_x - integer_x) < DBL_EPSILON && std::abs(scale_y - integer_y) < DBL_EPSILON) {
+        tables->scale_x = integer_x;
+        tables->scale_y = integer_y;
+        if (integer_x == 2 && integer_y == 2) {
+            tables->mode = AREA_RESIZE_FAST_2X2;
+        } else {
+            tables->mode = AREA_RESIZE_FAST_INTEGER;
+            tables->inverse_area = static_cast<float>(1.0 / (integer_x * integer_y));
+        }
+        return VF_CUDA_OK;
+    }
+    std::vector<int> x_offsets, y_offsets, x_sources, y_sources;
+    std::vector<float> x_weights, y_weights;
+    try {
+        append_area_axis(source_width, target_width, scale_x, &x_offsets, &x_sources, &x_weights);
+        append_area_axis(source_height, target_height, scale_y, &y_offsets, &y_sources, &y_weights);
+        std::vector<int> indices;
+        indices.reserve(x_offsets.size() + y_offsets.size() + x_sources.size() + y_sources.size());
+        indices.insert(indices.end(), x_offsets.begin(), x_offsets.end());
+        indices.insert(indices.end(), y_offsets.begin(), y_offsets.end());
+        indices.insert(indices.end(), x_sources.begin(), x_sources.end());
+        indices.insert(indices.end(), y_sources.begin(), y_sources.end());
+        std::vector<float> weights(x_weights);
+        weights.insert(weights.end(), y_weights.begin(), y_weights.end());
+
+        tables->mode = AREA_RESIZE_GENERAL;
+        tables->x_entries = static_cast<int>(x_sources.size());
+        int* device_indices = nullptr;
+        cudaError_t error = cudaMalloc(&device_indices, indices.size() * sizeof(int));
+        if (error != cudaSuccess) return cuda_result(error);
+        tables->indices = device_indices;
+        if (allocation_count != nullptr) ++(*allocation_count);
+        float* device_alphas = nullptr;
+        error = cudaMalloc(&device_alphas, weights.size() * sizeof(float));
+        if (error != cudaSuccess) return cuda_result(error);
+        tables->alphas = device_alphas;
+        if (allocation_count != nullptr) ++(*allocation_count);
+        error = cudaMemcpy(tables->indices, indices.data(), indices.size() * sizeof(int),
+                           cudaMemcpyHostToDevice);
+        if (error == cudaSuccess) {
+            error = cudaMemcpy(tables->alphas, weights.data(), weights.size() * sizeof(float),
+                               cudaMemcpyHostToDevice);
+        }
+        return cuda_result(error);
+    } catch (const std::bad_alloc&) {
+        return VF_CUDA_ALLOCATION_FAILED;
+    }
+}
+
+void launch_area_resize(
+    const AreaResizeTables& tables, const uint8_t* src, uint8_t* dst,
+    int source_width, int target_width, int target_height, cudaStream_t stream = nullptr) {
+    resize_area_kernel<<<grid2d(target_width, target_height), dim3(BLOCK_X, BLOCK_Y), 0, stream>>>(
+        src, dst, source_width, target_width, target_height, tables.mode, tables.scale_x,
+        tables.scale_y, tables.inverse_area, tables.x_entries, tables.indices, tables.alphas);
+}
 }
 
 static int execute_linear_plan_device(
@@ -1017,6 +1172,7 @@ static int execute_linear_plan_device(
     int width = compiled->width;
     int height = compiled->height;
     int channels = compiled->input_channels;
+    size_t area_resize_index = 0;
     for (const VfPlanOperatorV1& op : compiled->operators) {
         uint8_t* next = current == context->u8[1] ? context->u8[2] : context->u8[1];
         switch (op.kind) {
@@ -1031,8 +1187,10 @@ static int execute_linear_plan_device(
             case VF_PLAN_RESIZE_AREA: {
                 const int target_width = op.int_params[0];
                 const int target_height = op.int_params[1];
-                resize_gray_kernel<<<grid2d(target_width, target_height), dim3(BLOCK_X, BLOCK_Y), 0, context->stream>>>(
-                    current, next, width, height, target_width, target_height);
+                if (area_resize_index >= compiled->area_resizes.size()) return VF_CUDA_INTERNAL_ERROR;
+                launch_area_resize(
+                    *compiled->area_resizes[area_resize_index++], current, next, width,
+                    target_width, target_height, context->stream);
                 current = next;
                 width = target_width;
                 height = target_height;
@@ -1563,6 +1721,29 @@ VF_CUDA_API int vf_plan_create(
     }
     auto allocation_started = std::chrono::steady_clock::now();
     result = reserve_plan_buffers(created->context, *created);
+    int current_width = width;
+    int current_height = height;
+    for (const VfPlanOperatorV1& op : created->operators) {
+        if (result != VF_CUDA_OK) break;
+        if (op.kind != VF_PLAN_RESIZE_AREA) continue;
+        std::unique_ptr<AreaResizeTables> tables(new (std::nothrow) AreaResizeTables());
+        if (!tables) {
+            result = VF_CUDA_ALLOCATION_FAILED;
+            break;
+        }
+        result = prepare_area_resize(
+            current_width, current_height, op.int_params[0], op.int_params[1], tables.get(),
+            &created->context->allocation_count);
+        current_width = op.int_params[0];
+        current_height = op.int_params[1];
+        if (result == VF_CUDA_OK) {
+            try {
+                created->area_resizes.push_back(std::move(tables));
+            } catch (const std::bad_alloc&) {
+                result = VF_CUDA_ALLOCATION_FAILED;
+            }
+        }
+    }
     created->context->pending_allocation_ms += elapsed_host_ms(allocation_started);
     if (result != VF_CUDA_OK) {
         delete created;
@@ -1828,8 +2009,17 @@ VF_CUDA_API int vf_resize_gray_u8(const uint8_t* src,int w,int h,int stride,int 
     if (result != VF_CUDA_OK) return result;
     result = visionflow_cuda::allocate_bytes(&dd, static_cast<size_t>(dw) * dh);
     if (result != VF_CUDA_OK) { visionflow_cuda::free_device(ds); return result; }
-    resize_gray_kernel<<<grid2d(dw, dh), dim3(BLOCK_X, BLOCK_Y)>>>(ds, dd, w, h, dw, dh);
-    result = visionflow_cuda::kernel_result();
+    if (dw <= w && dh <= h) {
+        AreaResizeTables tables;
+        result = prepare_area_resize(w, h, dw, dh, &tables, nullptr);
+        if (result == VF_CUDA_OK) {
+            launch_area_resize(tables, ds, dd, w, dw, dh);
+            result = visionflow_cuda::kernel_result();
+        }
+    } else {
+        resize_gray_kernel<<<grid2d(dw, dh), dim3(BLOCK_X, BLOCK_Y)>>>(ds, dd, w, h, dw, dh);
+        result = visionflow_cuda::kernel_result();
+    }
     if (result == VF_CUDA_OK) result = copy_back_free(dst, dstride, dw, dh, 1, dd);
     else visionflow_cuda::free_device(dd);
     visionflow_cuda::free_device(ds);

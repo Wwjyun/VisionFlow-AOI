@@ -137,12 +137,15 @@ foreach ($artifact in @($dllPath, $importLibraryPath, $expPath)) {
 $optimization = [string](Get-OptionalProperty -Object $nvccConfig -Name "dll_optimization" -DefaultValue "-O2")
 $cudart = [string](Get-OptionalProperty -Object $nvccConfig -Name "cudart" -DefaultValue "static")
 $testOptimization = [string](Get-OptionalProperty -Object $nvccConfig -Name "test_optimization" -DefaultValue "-O2")
+# Exact OpenCV float semantics (for example INTER_AREA accumulation) require no fused multiply-add.
+$fmad = if ([bool](Get-OptionalProperty -Object $nvccConfig -Name "fmad" -DefaultValue $true)) { "true" } else { "false" }
 
 $dllArguments = @(
     "--std=c++17",
     $optimization,
     "--shared",
     "--cudart=$cudart",
+    "--fmad=$fmad",
     "-arch=$Architecture",
     "-Xcompiler=/MD,/utf-8",
     "-Xlinker", "/IMPLIB:$importLibraryPath"
@@ -185,6 +188,7 @@ foreach ($target in $testTargets) {
         "--std=c++17",
         $testOptimization,
         "--cudart=$cudart",
+        "--fmad=$fmad",
         "-arch=$Architecture",
         "-Xcompiler=/MD,/utf-8"
     )

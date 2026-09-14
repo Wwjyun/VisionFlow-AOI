@@ -23,6 +23,12 @@ Gaussian kernel 3/5/7/9 使用與 OpenCV 相同的固定係數，其他 kernel �
 rounding 執行。BGR→Gray 使用 OpenCV 8-bit 路徑相同的 15-bit BT.601 fixed-point
 係數，避免 ±1 灰階差異在 threshold 後放大成 binary mask 差異。
 
+`Resize(area)` 只支援兩軸不放大的單通道縮小，並逐分支重現 OpenCV `INTER_AREA`：相同尺寸
+copy、2×2 `(sum+2)>>2`、其他整數倍 float 平均，以及非整數倍的 `computeResizeAreaTab`
+權重表與 half-even 捨入；權重表在 plan create 時上傳一次。`cuda_project.json` 的
+`nvcc.fmad: false` 讓 build script 傳入 `--fmad=false`，避免 GPU 將乘加融合成 FMA 而破壞
+float 累加的逐像素一致性，不可移除。
+
 ## 檔案
 
 ```text
@@ -76,8 +82,12 @@ validator 或 profiler。
   --crossover `
   --morphology-profile `
   --stress 10 100 1000 `
+  --resize-area-pipeline `
   --json-output outputs_validation\rtx3090_benchmark.json
 ```
+
+`--resize-area-pipeline` 以正式 `PRODUCT_A_CIRCLE_401_1_AOI_01.yaml` 在多個
+`process_scale` 下比對合成 PASS／NG 圖的完整 CPU/GPU Pipeline。
 
 正式 validator 覆蓋 structured/non-contiguous primitives、linear/DAG plan、resident
 ROI、coordinate batches、context reuse、4K benchmark 與 persistent-plan stress。

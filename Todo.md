@@ -74,7 +74,7 @@
 - [x] 將 Gray、Gaussian、AdaptiveMean、Threshold、Morphology 接入通用 native executor。
 - [x] 通用 native plan 達成一次 H2D、連續 kernels、最後一次必要 D2H。
 - [x] 加入 plan capability query；任一 operator 不支援時整份 plan CPU fallback，避免反覆 CPU/GPU 傳輸。
-- [ ] 完成與 OpenCV 等價的 `INTER_AREA` resize 驗收後，才將 CUDA Resize(area) 視為 production ready。（native linear 已支援兩軸不放大的單通道 `VF_PLAN_RESIZE_AREA`、動態 output shape 與一次 H2D/D2H routing；2026-09-14 RTX 3090 以生成的 32 組尺寸／縮放比測得最大像素差 1、其中 758 個像素非 bit-exact。仍須擴充隨機／邊界尺寸矩陣、量測正式 Recipe 的 binary mask／PASS-NG 與 Detector 端到端結果；不得靜默改用其他插值法。）
+- [x] 完成與 OpenCV 等價的 `INTER_AREA` resize 驗收後，才將 CUDA Resize(area) 視為 production ready。（2026-09-14 CUDA 改為逐分支重現 OpenCV：相同尺寸 copy、2×2 `(sum+2)>>2`、整數倍 float 平均、非整數倍 `computeResizeAreaTab` 權重表與 half-even 捨入，DLL 以 `--fmad=false` 建置；RTX 3090 隨機／邊界矩陣逐像素 0 差異，正式 `PRODUCT_A_CIRCLE_401_1_AOI_01.yaml` 在 `process_scale` 1.0／0.5／0.37／0.25 的合成 PASS／NG 全 Pipeline CPU/GPU 完全一致。真實樣本 PASS／NG 仍列於 RTX 驗收區。）
 - [x] Python/CPU plan 擴充 topologically ordered DAG/multi-output，支援一份 gray 產生多張 masks。
 - [x] CUDA/native plan 擴充 DAG/multi-output，讓 device gray 直接產生多張 masks。
 
@@ -171,7 +171,7 @@
 - D（pinned memory＋stream 重疊）：上方已有評估待辦；須以多張圖片的批次／監控流程量測 H2D、kernel、必要 D2H 的實際重疊、host RAM／VRAM 峰值與端到端吞吐，單張圖片的序列時間不能直接當成可重疊收益。
 - [ ] E（向量化／`__restrict__`／`__ldg`）：以 profiler 選出受記憶體存取限制的 kernel，再分別試向量化載入／儲存及適用的編譯器讀取提示；確認對齊、stride、1／3 channel、ROI 邊界與 OpenCV 輸出語意，逐項測 kernel、Detector 和端到端收益。`__restrict__`／`__ldg` 不預設有效，沒有可重現收益即不採用。
 - F（Gaussian shared memory）：P2 已有 tile／halo 與 kernel 45 的待辦，需先證明 Gaussian 在正式 Recipe 的耗時占比。
-- G（`INTER_AREA` 完整等價）：P1 已有 CUDA Resize(area) 的數值語意與 RTX 驗收待辦，不能以其他插值法替代。
+- G（`INTER_AREA` 完整等價）：2026-09-14 已完成 CUDA Resize(area) 與 OpenCV 逐像素等價及合成 Recipe 端到端驗收（見 P1）；真實樣本仍依 RTX 驗收區。
 - I（RTX 實機驗收）：上方效能 gate、下方 RTX 3090 的 production PASS／NG、GUI、打包與壓測待辦仍未完成；H（metrics／等價驗證）貫穿 A～G，不另估一份收益。
 
 簡報的 30～45 週、約 1.2 倍及各工作包百分比是評估假設，不是本 Todo 的交付承諾；讀圖與 resident ROI 路徑已有後續改動，須以同版程式、同圖、同 Recipe 重建 CPU／GPU cold、warm 與端到端基準後才可重估工期和效益。A～G 的收益有重疊，不得直接相加。
@@ -412,6 +412,8 @@
 - [ ] 加速不得犧牲 GUI 回應、打包啟動、結果追溯、錯誤訊息或 CPU fallback。
 
 ## 完成紀錄
+
+- [x] 2026-09-14：CUDA `Resize(area)` 改為與 OpenCV `INTER_AREA` 逐像素一致。先以 Python 重建 OpenCV 5.0 CV_8UC1 行為並在 393 組隨機、二值、常數及大縮放比案例與 `cv2.resize` 完全相同；CUDA 依同一規則實作：相同尺寸 copy、2×2 `(sum+2)>>2`、其他整數倍 `sum × (float)(1/area)`、非整數倍在 plan create 以 host double 建立與 `computeResizeAreaTab` 相同的來源索引／float 權重表並上傳一次（execute 仍無配置、維持一次 H2D／D2H），kernel 依 `ResizeArea_Invoker` 的 float 累加順序計算並 half-even 捨入。stateless `vf_resize_gray_u8` 的縮小路徑共用相同實作，放大路徑不變。`cuda_project.json` 新增 `fmad: false`，build script 對 DLL 與 smoke 傳入 `--fmad=false`：同矩陣以預設 `--fmad=true` 重編時 324 組輸出、7,856 個像素不一致，關閉後 483 組、7,197 萬像素 0 差異。`validate_cuda_dll.py` 的 area 比對改為 0 容差並擴充為 179 組尺寸（copy／2×2／整數倍／單軸不變／1 像素邊界／4K／13000×2300 等，含非連續來源），新增 `--resize-area-pipeline` 以正式 `PRODUCT_A_CIRCLE_401_1_AOI_01.yaml` 在 `process_scale` 1.0／0.5／0.37／0.25 對合成 PASS／NG 圖跑完整 CPU/GPU Pipeline，8 組全部相同且 GPU 無 fallback。RTX 3090 含傳輸 median：4K 0.5 倍 GPU 1.85／CPU 0.91 ms、4K 0.37 倍 1.92／3.00 ms、16384×13000 0.37 倍 34.65／51.56 ms。以 CUDA 13.3、VS 18、`sm_86` 重編 DLL，native smoke、fault injection、完整 validator（benchmark、crossover、morphology profile、10／100／1000 stress）、340 tests、compileall、CUDA preflight 與 `git diff --check` 均通過；ABI v1 與 exports 未變，真實樣本驗收仍待提供。
 
 - [x] 2026-09-14：完成 RTX 3090 實機 CUDA 故障注入並修正兩個因此發現的恢復缺陷。新增 `gpu/validate_cuda_fault_injection.py`（不使用 fake DLL）：`CUDA_VISIBLE_DEVICES=-1` 子程序中 Detector 與 `gpu.mode=auto` Pipeline 與 CPU 完全一致且零 CUDA 呼叫、`gpu.mode=cuda` 明確失敗；1×1,048,570 影像使 kernel grid 超過 65535 列，真實 launch 回傳 1001 後整顆 Detector CPU 重跑、strict 模式直接回報，同一 runtime 下一張圖恢復 CUDA 且 context allocation 不再增加；65535 張 4096² ROI batch 取得真實 1002 OOM，失敗 batch 不留 native handle，之後連續三次小批次與 resident plan 逐像素等於 CPU、allocation count 不變。缺陷一（DLL）：失敗的 `cudaMalloc` 會殘留 CUDA thread-local last error，下一次 kernel launch 檢查再回報同一個 OOM，使 OOM 後第一個小批次也失敗、`iter_roi_batches` 降批時每層被吃掉一次；`runtime_error()` 改為回報錯誤時同時消耗 last error，新增 native smoke（舊 DLL 實測回傳 exit 9／1002，重編後通過）與 source contract。缺陷二（Python）：共用 `GpuExecutionSession` 中一張圖的 GPU crop／resident upload 失敗會讓 `last_error` 永久殘留，之後正常圖片仍顯示 tiling CPU fallback 且不再嘗試 GPU crop（RTX 實測重現）；`runtime_for()` 現在於每次 Pipeline run 開始清除可恢復錯誤，新增 fake runtime 回歸測試（未修正前 2 項失敗）。另以子程序佔住 23,208 MiB 專用 VRAM，Windows 驅動預設 sysmem fallback 使 4K plan 配置溢出而非 OOM，結果仍等價、median 7.8→7.6 ms、新 context 首次 51 ms，已列 P2 待評估；sticky context error 需重建 session 另列待辦。以 CUDA 13.3、MSVC（VS 18）、`sm_86` 重編 DLL，native smoke、fault injection（含 VRAM pressure）、`validate_cuda_dll.py`（126 PASS、4K benchmark、10／100／1000 stress allocation 維持 44）、完整 339 tests、compileall、CUDA preflight、CLI 合成 NG（預期 exit 2）與 `git diff --check` 均通過。已知限制：高度 1,048,561～1,048,576 列的影像會觸發 kernel grid 上限並安全回退 CPU。ABI v1 與 exports 未變；production 真圖驗收仍待樣本。
 

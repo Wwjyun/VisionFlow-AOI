@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import unittest
 from pathlib import Path
 
@@ -65,9 +66,34 @@ class CudaSourceContractTests(unittest.TestCase):
         self.assertIn("VF_PLAN_RESIZE_AREA = 6", header)
         self.assertIn("case VF_PLAN_RESIZE_AREA", validation)
         self.assertIn("target_width", execute)
-        self.assertIn("resize_gray_kernel<<<", execute)
+        self.assertIn("launch_area_resize(", execute)
+        self.assertNotIn("resize_gray_kernel<<<", execute)
         self.assertIn("compiled->output_width", source)
         self.assertIn("compiled->output_height", source)
+
+    def test_area_resize_mirrors_opencv_tables_and_disables_fused_multiply_add(self):
+        root = Path(__file__).resolve().parents[1]
+        source = (root / "gpu" / "visionflow_cuda.cu").read_text(encoding="utf-8")
+        manifest = json.loads((root / "gpu" / "cuda_project.json").read_text(encoding="utf-8"))
+        build = (root / "gpu" / "build_cuda_dll.ps1").read_text(encoding="utf-8")
+        axis = source.split("void append_area_axis(", 1)[1].split("int prepare_area_resize(", 1)[0]
+        prepare = source.split("int prepare_area_resize(", 1)[1].split("void launch_area_resize(", 1)[0]
+        kernel = source.split("__global__ void resize_area_kernel(", 1)[1].split(
+            "__global__ void resize_gray_kernel(", 1
+        )[0]
+        create = source.split("VF_CUDA_API int vf_plan_create(", 1)[1].split(
+            "VF_CUDA_API int vf_plan_execute(", 1
+        )[0]
+
+        self.assertIs(manifest["nvcc"]["fmad"], False)
+        self.assertEqual(build.count('"--fmad=$fmad"'), 2)
+        self.assertIn("start - first > 1e-3", axis)
+        self.assertIn("std::min(std::min(last - end, 1.0), cell_width) / cell_width", axis)
+        self.assertIn("1.0 / (static_cast<double>(target_width) / source_width)", prepare)
+        self.assertIn("AREA_RESIZE_FAST_2X2", prepare)
+        self.assertIn("+ 2) >> 2", kernel)
+        self.assertIn("nearbyintf(total)", kernel)
+        self.assertIn("prepare_area_resize(", create)
 
     def test_persistent_context_owns_stream_and_fused_path_uses_it(self):
         root = Path(__file__).resolve().parents[1]

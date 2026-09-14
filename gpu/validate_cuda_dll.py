@@ -71,6 +71,10 @@ def parse_args() -> argparse.Namespace:
         "--morphology-profile", action="store_true",
         help="Profile detector-401-style morphology iterations and native CUDA event share.",
     )
+    parser.add_argument(
+        "--resize-area-pipeline", action="store_true",
+        help="Compare full CPU/GPU pipelines of the 401-CS-AP-1 production recipe across process_scale values.",
+    )
     parser.add_argument("--json-output", help="Write validation, benchmark, device and commit metadata as JSON.")
     args = parser.parse_args()
     if bool(args.image) != bool(args.recipe):
@@ -102,6 +106,59 @@ def compare(name: str, actual: np.ndarray, expected: np.ndarray, max_diff: int =
         "out_of_tolerance_ratio": round(out_of_tolerance_ratio, 6),
     }
     print(f"PASS {name}: {result}")
+    return result
+
+
+def area_resize_cases(seed: int = 20260914, random_cases: int = 160) -> list[tuple[tuple[int, int], tuple[int, int]]]:
+    """Source/target (height, width) pairs covering every OpenCV INTER_AREA branch."""
+    rng = np.random.default_rng(seed)
+    cases = [
+        ((3, 7), (1, 2)), ((17, 19), (16, 18)), ((31, 47), (10, 15)), ((64, 96), (21, 32)),
+        ((101, 173), (100, 172)), ((64, 96), (64, 96)),          # copy
+        ((64, 96), (32, 48)), ((65, 97), (32, 48)),              # 2x2 fast / non-integer
+        ((60, 90), (20, 30)), ((64, 64), (16, 32)),              # integer fast area
+        ((50, 70), (50, 35)), ((70, 50), (35, 50)),              # one axis unchanged
+        ((1, 500), (1, 7)), ((500, 1), (7, 1)), ((401, 301), (7, 3)),
+        ((2160, 3840), (1080, 1920)), ((2160, 3840), (1000, 1777)), ((4096, 4096), (1, 1)),
+        ((13000, 2300), (4333, 767)),
+    ]
+    for _ in range(random_cases):
+        height, width = (int(value) for value in rng.integers(1, 1500, size=2))
+        cases.append(((height, width), (int(rng.integers(1, height + 1)), int(rng.integers(1, width + 1)))))
+    return cases
+
+
+def validate_area_resize_matrix(runtime: GpuRuntime) -> dict:
+    """CUDA Resize(area) must be pixel-identical to cv2.INTER_AREA (no tolerance)."""
+    rng = np.random.default_rng(20260915)
+    compared = 0
+    pixels = 0
+    for index, ((source_height, source_width), (target_height, target_width)) in enumerate(area_resize_cases()):
+        pattern = index % 3
+        if pattern == 0:
+            source = rng.integers(0, 256, (source_height, source_width), dtype=np.uint8)
+        elif pattern == 1:
+            source = ((rng.random((source_height, source_width)) > 0.5) * 255).astype(np.uint8)
+        else:
+            source = rng.integers(0, 256, (source_height * 2, source_width + 3), dtype=np.uint8)[::2, 3:]
+        expected = cv2.resize(source, (target_width, target_height), interpolation=cv2.INTER_AREA)
+        label = f"resize_area_{source_height}x{source_width}_to_{target_height}x{target_width}"
+        contiguous = np.ascontiguousarray(source)
+        outputs = {"stateless": runtime.resize_gray(contiguous, target_width, target_height)}
+        if runtime.supports_native_plan:
+            plan = PreprocessPlan((Resize(target_width, target_height, "area"),), name=label)
+            outputs["native"] = runtime.execute_plan(contiguous, plan)
+        for route, actual in outputs.items():
+            if actual.shape != expected.shape or not np.array_equal(actual, expected):
+                delta = np.abs(actual.astype(np.int16) - expected.astype(np.int16))
+                raise AssertionError(
+                    f"{route}_{label}: INTER_AREA mismatch max_diff={int(delta.max(initial=0))} "
+                    f"pixels={int(np.count_nonzero(delta))}"
+                )
+            compared += 1
+        pixels += int(expected.size)
+    result = {"name": "resize_area_matrix", "outputs": compared, "target_pixels": pixels, "max_diff": 0}
+    print(f"PASS resize_area_matrix: {result}")
     return result
 
 
@@ -166,34 +223,9 @@ def validate_primitives(runtime: GpuRuntime) -> list[dict]:
             "resize_gray",
             runtime.resize_gray(gray, 96, 64),
             cv2.resize(gray, (96, 64), interpolation=cv2.INTER_AREA),
-            max_diff=1,
-            mismatch_ratio=0.001,
         )
     )
-    area_rng = np.random.default_rng(20260914)
-    for source_shape, target_shape in (
-        ((3, 7), (1, 2)),
-        ((17, 19), (16, 18)),
-        ((31, 47), (10, 15)),
-        ((64, 96), (21, 32)),
-        ((101, 173), (100, 172)),
-    ):
-        area_source = area_rng.integers(0, 256, source_shape, dtype=np.uint8)
-        target_height, target_width = target_shape
-        area_expected = cv2.resize(
-            area_source, (target_width, target_height), interpolation=cv2.INTER_AREA,
-        )
-        label = f"resize_area_{source_shape[0]}x{source_shape[1]}_to_{target_height}x{target_width}"
-        metrics.append(compare(
-            label, runtime.resize_gray(area_source, target_width, target_height),
-            area_expected, max_diff=1,
-        ))
-        if runtime.supports_native_plan:
-            plan = PreprocessPlan((Resize(target_width, target_height, "area"),), name=label)
-            metrics.append(compare(
-                f"native_{label}", runtime.execute_plan(area_source, plan),
-                area_expected, max_diff=1,
-            ))
+    metrics.append(validate_area_resize_matrix(runtime))
     metrics.append(
         compare(
             "gaussian_blur_gray",
@@ -999,6 +1031,56 @@ def validate_production_manifest(path: Path, dll_path: str) -> list[dict]:
     return results
 
 
+RESIZE_AREA_RECIPE = "PRODUCT_A_CIRCLE_401_1_AOI_01.yaml"
+RESIZE_AREA_SCALES = (1.0, 0.5, 0.37, 0.25)
+
+
+def synthetic_circle_image(seed: int, circles: int) -> np.ndarray:
+    """1300x1200 BGR background with optional bright circles sized for 401-CS-AP-1 filters."""
+    rng = np.random.default_rng(seed)
+    gray = cv2.GaussianBlur(rng.integers(90, 120, (1300, 1200), dtype=np.uint8), (0, 0), 3)
+    for _ in range(circles):
+        center = (int(rng.integers(160, 1040)), int(rng.integers(160, 1140)))
+        cv2.circle(gray, center, int(rng.integers(9, 17)), int(rng.integers(190, 240)), -1)
+    return cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
+
+
+def validate_resize_area_recipe_sweep(dll_path: str) -> list[dict]:
+    """Detector end-to-end CPU/GPU equivalence whose native plan exercises every Resize(area) branch."""
+    recipe_path = ROOT / "recipes" / RESIZE_AREA_RECIPE
+    base = RecipeManager().load(recipe_path)
+    results = []
+    with tempfile.TemporaryDirectory(prefix="visionflow_resize_area_") as temporary:
+        folder = Path(temporary)
+        images = {}
+        for label, circles in (("pass", 0), ("ng", 12)):
+            image_path = folder / f"{label}.png"
+            if not cv2.imwrite(str(image_path), synthetic_circle_image(20260914 + circles, circles)):
+                raise AssertionError(f"Failed to write {image_path}")
+            images[label] = image_path
+        for scale in RESIZE_AREA_SCALES:
+            recipe = deepcopy(base)
+            recipe["detectors"]["401-CS-AP-1"]["params"]["process_scale"] = scale
+            scaled_recipe = folder / f"circle_scale_{scale}.yaml"
+            scaled_recipe.write_text(yaml.safe_dump(recipe, allow_unicode=True, sort_keys=False), encoding="utf-8")
+            for label, image_path in images.items():
+                result = validate_pipeline(image_path, scaled_recipe, dll_path)
+                routes = {
+                    detector_id: status.get("fallback_reason", "")
+                    for detector_id, status in result["gpu"].get("detectors", {}).items()
+                }
+                if any(routes.values()):
+                    raise AssertionError(f"Resize(area) sweep fell back to CPU: {routes}")
+                results.append({
+                    "recipe": RESIZE_AREA_RECIPE, "process_scale": scale, "image": label,
+                    "final_result": result["final_result"], "summary": result["summary"],
+                })
+    if not any(item["final_result"] == "NG" for item in results):
+        raise AssertionError("Resize(area) sweep never produced an NG decision")
+    print(f"PASS resize_area_pipeline: {json.dumps(results, ensure_ascii=False)}")
+    return results
+
+
 def _disabled_report_output(output: dict) -> dict:
     return {
         key: False if isinstance(value, bool) else value
@@ -1029,6 +1111,9 @@ def main() -> int:
     )
     if args.image and args.recipe:
         validate_pipeline(Path(args.image), Path(args.recipe), str(runtime.dll_path))
+    resize_area_pipeline = (
+        validate_resize_area_recipe_sweep(str(runtime.dll_path)) if args.resize_area_pipeline else []
+    )
     if args.json_output:
         output_path = Path(args.json_output)
         output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1046,6 +1131,7 @@ def main() -> int:
                     "morphology_profile": morphology_result,
                     "stress": stress_result,
                     "production": production_results,
+                    "resize_area_pipeline": resize_area_pipeline,
                     "gpu_metrics": runtime.performance_stats(),
                 },
                 ensure_ascii=False,
