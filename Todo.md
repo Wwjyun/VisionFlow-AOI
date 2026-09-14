@@ -74,7 +74,7 @@
 - [x] 將 Gray、Gaussian、AdaptiveMean、Threshold、Morphology 接入通用 native executor。
 - [x] 通用 native plan 達成一次 H2D、連續 kernels、最後一次必要 D2H。
 - [x] 加入 plan capability query；任一 operator 不支援時整份 plan CPU fallback，避免反覆 CPU/GPU 傳輸。
-- [ ] 實作與 OpenCV 等價的 `INTER_AREA` resize 後，才開放 CUDA Resize(area)。（native linear source 已加入兩軸不放大的單通道 `VF_PLAN_RESIZE_AREA`、動態 output shape 與一次 H2D/D2H routing；CPU 模擬 structured downscale 與 OpenCV 完全一致，實際 CUDA 像素容差仍待 RTX 編譯驗收）
+- [ ] 完成與 OpenCV 等價的 `INTER_AREA` resize 驗收後，才將 CUDA Resize(area) 視為 production ready。（native linear 已支援兩軸不放大的單通道 `VF_PLAN_RESIZE_AREA`、動態 output shape 與一次 H2D/D2H routing；2026-09-14 RTX 3090 以生成的 32 組尺寸／縮放比測得最大像素差 1、其中 758 個像素非 bit-exact。仍須擴充隨機／邊界尺寸矩陣、量測正式 Recipe 的 binary mask／PASS-NG 與 Detector 端到端結果；不得靜默改用其他插值法。）
 - [x] Python/CPU plan 擴充 topologically ordered DAG/multi-output，支援一份 gray 產生多張 masks。
 - [x] CUDA/native plan 擴充 DAG/multi-output，讓 device gray 直接產生多張 masks。
 
@@ -104,8 +104,8 @@
 
 ### Morphology
 
-- [ ] 量測 detector 401 多 iterations 的 morphology 占比。（native morphology CUDA event 與 close iterations 1/2/4/8 benchmark 已完成；實際占比待 RTX runner）
-- [ ] 評估矩形 kernel 的 horizontal/vertical separable min/max filter。
+- [x] 量測 detector 401 多 iterations 的 morphology 占比：既有 close iterations 1/2/4/8 benchmark 加上 RTX 3090 合成 16384×13000／70 ROI／5×5 open iterations=10 基準，舊 kernel 的 morphology warm median 165.0 ms、占 GPU preprocessing 約 65%；正式真圖占比仍依 P4 驗收。
+- [x] 評估矩形 kernel 的 horizontal/vertical separable min/max filter：5×5 改用同一 kernel 內的 shared-memory 水平／垂直 min/max，其他尺寸保留原 kernel；RTX 3090 合成圖交錯 A/B 10 組皆勝出，逐像素及完整 Tile 結果一致。正式真圖、其他 Recipe 與長時間驗收仍依 P4 待辦。
 - [x] 多 iterations 使用 device ping-pong buffers，中間不得回傳 CPU。
 - [ ] 小 kernel/少 iterations 建立 CPU/GPU crossover 規則。（validator 已輸出各 iterations 含傳輸 CPU/GPU median/P95/speedup；production threshold 待 RTX 數據）
 
@@ -144,6 +144,7 @@
 - [ ] 建立可分離橫向／縱向形態學 CUDA 原型，並比較 shared-memory／合併有效 kernel 方案；保留矩形 kernel、OpenCV open 的侵蝕後膨脹次序、iterations、border、channel 與輸出語意。500→200 次鄰居讀取只是理論存取次數，不能當成 2.5 倍實測加速，且須計入新增的中間寫入與 kernel 啟動。
 - [ ] 以 CPU OpenCV 與現有 CUDA 作參考，比對 5×5 open、iterations=10 的 binary mask，涵蓋 ROI 邊界、不同尺寸／channel、連續與非連續輸入，並驗證正式 Recipe 的 PASS／NG、缺陷 bbox／area／metadata、排序及失敗後整顆 Detector CPU fallback；等價不通過不得替換現有路徑。
 - [ ] 在 RTX 3090 對相同真圖交錯量測舊／新 CUDA 路徑的形態學、Detector 與端到端 warm median／P95、VRAM 與長時間穩定性；只有完整等價且端到端有可重現收益才採用，否則保留原 kernel。若修改 `.cu`，須重編 DLL、跑 native smoke／CUDA validator 並確認舊 DLL 相容路由。
+- [x] 先以生成的 16384×13000 BMP／70 ROI／401-AS-SN-1 在 RTX 3090 驗證 5×5 shared-memory 形態學：舊／新 DLL 交錯 A/B 各 10 次，morphology warm median 165.0→69.8 ms、Detector 413.8→325.2 ms、整張圖 1429.1→1341.2 ms，三個指標逐對均 10/10 勝出；1960 次 kernel launch 不變，ROI／PASS-NG／完整 Tile 輸出一致。此項只代表合成圖，不替代上方真圖及 production 驗收。
 - [ ] Batch 單 stream 仍無法達標時才建立 2/4 execution slots；每 slot 獨立 stream/scratch/events/pinned output，縮小 Python lock 至 metadata/context lifecycle，不接受仍被全域 lock 序列化的 worker 數字。
 - [ ] 以相同 ROI/輸入/輸出條件比較 OpenCV CPU、自製 CUDA、OpenCV CUDA/hybrid；Gray-first 僅作 feature-flag 實驗，golden mask/PASS-NG 不等價時不得採用。
 - [ ] 最終 RTX 驗收：GPU warm median < 3.3 秒、目標 < 2 秒；ROI 座標與 PASS/NG 100% 相同、binary agreement >= 99.99%、無 silent fallback，完成 batch/stream/VRAM/100 次一致性/error/leak 報告後才調整 production backend。
@@ -560,3 +561,4 @@
 - [x] 2026-09-11：修正監控模式逐圖耗時口徑；Pipeline `duration_sec` 延後至 Reporter 完成 overlay／NG tiles／CSV／matrix CSV／debug／JSON 寫檔後定值，JSON 自身在最後 writer 執行時保存已包含前序報告的近終值。監控器從新檔案的可用建立時間（位於前後兩次輪詢區間時）或首次觀測開始持續計時，涵蓋穩定檢查、等待前序影像、完整 Pipeline、結果壓縮與處理後影像搬移，ERROR 亦不再固定回報 0 秒；逐圖另輸出 `discovery_and_stability_wait_sec`、`queue_wait_sec`、`pipeline_and_reports_sec`、`processed_image_move_sec` 與 `end_to_end_sec`。完整 319 tests、compileall、CUDA source／ABI preflight、GUI offscreen smoke 與 `git diff --check` 通過；另以真實監控輪詢 smoke 驗證 overlay／CSV／JSON 均落盤、原圖完成搬移，該次發現與穩定等待 0.352 秒、佇列等待 0.001 秒、Pipeline＋報告 0.188 秒、搬移 0.002 秒、端到端 0.544 秒。
 - [x] 2026-09-14：依 Phase2 GPU 加速簡報第 12 頁，將可分離形態學加入 Detector 401 GPU 效能待辦，明列基準量測、CUDA 原型、OpenCV／現有 CUDA 等價、真圖端到端收益及 DLL 重編驗收門檻；理論鄰居讀取量不視為實測加速。本次只更新規畫，未修改 CUDA source 或執行形態學優化。
 - [x] 2026-09-14：對照 Phase2 GPU 加速簡報第 14 頁 A～G、I 工作包與既有 Todo，補列 CUDA Graphs 和向量化／讀取提示的條件式實驗及驗收，並標出 ROI batch、形態學、pinned memory／stream、Gaussian shared memory、`INTER_AREA` 與 RTX 驗收的現有待辦；工期和加速倍率保留為須重新量測的估算。本次僅更新 Todo，未修改執行程式或 CUDA DLL。
+- [x] 2026-09-14：在 RTX 3090（Driver 610.62／CUDA 13.3／`sm_86`）將 5×5 矩形形態學改為單次 kernel launch 的 shared-memory 水平／垂直 min/max；1／3 channel、邊界與 open／close／erode／dilate 共 80 組舊 DLL／新 DLL／OpenCV primitive 和 linear plan 比對通過，正式 CUDA validator 另加 5×5 primitive／linear／DAG 案例（41 項、max diff 0，含非連續 BGR），舊／新 DLL validator、1000 次 persistent-plan stress、native ABI smoke、336 項 unit tests、compileall、preflight、strict CUDA 合成大圖 CLI（NG 為預期 exit 2）與 diff check 通過。生成的 16384×13000 BMP／70 ROI／401-AS-SN-1 交錯 A/B 各 10 次：形態學 median 165.0→69.8 ms、Detector 413.8→325.2 ms、端到端 1429.1→1341.2 ms，完整 Tile 輸出相同、逐對 10/10 勝出；新 DLL 連跑 100 張後 warm median 1350.1 ms、P95 1417.7 ms，context reserved 689,236,528 bytes、allocation count 9 均固定，無 CUDA error／fallback。另以 32 組生成尺寸先探測 `INTER_AREA`，最大像素差 1，新增 10 組 primitive／native 驗證但仍保留正式 Recipe gate。僅證明合成圖收益；真實 production 樣本、所有 Recipe 與正式發行 DLL 仍待驗收。

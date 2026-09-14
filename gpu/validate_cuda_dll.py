@@ -170,6 +170,30 @@ def validate_primitives(runtime: GpuRuntime) -> list[dict]:
             mismatch_ratio=0.001,
         )
     )
+    area_rng = np.random.default_rng(20260914)
+    for source_shape, target_shape in (
+        ((3, 7), (1, 2)),
+        ((17, 19), (16, 18)),
+        ((31, 47), (10, 15)),
+        ((64, 96), (21, 32)),
+        ((101, 173), (100, 172)),
+    ):
+        area_source = area_rng.integers(0, 256, source_shape, dtype=np.uint8)
+        target_height, target_width = target_shape
+        area_expected = cv2.resize(
+            area_source, (target_width, target_height), interpolation=cv2.INTER_AREA,
+        )
+        label = f"resize_area_{source_shape[0]}x{source_shape[1]}_to_{target_height}x{target_width}"
+        metrics.append(compare(
+            label, runtime.resize_gray(area_source, target_width, target_height),
+            area_expected, max_diff=1,
+        ))
+        if runtime.supports_native_plan:
+            plan = PreprocessPlan((Resize(target_width, target_height, "area"),), name=label)
+            metrics.append(compare(
+                f"native_{label}", runtime.execute_plan(area_source, plan),
+                area_expected, max_diff=1,
+            ))
     metrics.append(
         compare(
             "gaussian_blur_gray",
@@ -291,6 +315,48 @@ def validate_primitives(runtime: GpuRuntime) -> list[dict]:
             else cv2.erode(binary, kernel, iterations=1)
         )
         metrics.append(compare(f"morphology_{operation}", runtime.morphology(binary, operation, 3, 1), expected))
+    # The 5x5 path uses a shared-memory separable kernel. Cover partial CUDA
+    # blocks, neutral borders, BGR channels, and repeated open/close passes.
+    morphology_rng = np.random.default_rng(20260914)
+    for shape in ((1, 1), (17, 19), (65, 67), (65, 67, 3)):
+        source = morphology_rng.integers(0, 256, shape, dtype=np.uint8)
+        for operation, cv_operation, iterations in (
+            ("open", cv2.MORPH_OPEN, 10),
+            ("close", cv2.MORPH_CLOSE, 2),
+            ("erode", cv2.MORPH_ERODE, 1),
+            ("dilate", cv2.MORPH_DILATE, 1),
+        ):
+            expected = cv2.morphologyEx(
+                source, cv_operation, np.ones((5, 5), dtype=np.uint8),
+                iterations=iterations,
+            )
+            label = f"morphology_k5_{operation}_i{iterations}_{'x'.join(map(str, shape))}"
+            metrics.append(compare(label, runtime.morphology(source, operation, 5, iterations), expected))
+            if runtime.supports_native_plan:
+                plan = PreprocessPlan(
+                    (Morphology(operation, 5, iterations),), name=label,
+                )
+                metrics.append(compare(f"native_{label}", runtime.execute_plan(source, plan), expected))
+    strided_morphology = morphology_rng.integers(
+        0, 256, (67, 139, 3), dtype=np.uint8,
+    )[1:-1, 1:-1:2]
+    strided_expected = cv2.morphologyEx(
+        strided_morphology, cv2.MORPH_OPEN,
+        np.ones((5, 5), dtype=np.uint8), iterations=10,
+    )
+    metrics.append(compare(
+        "morphology_k5_strided_bgr", runtime.morphology(
+            strided_morphology, "open", 5, 10,
+        ), strided_expected,
+    ))
+    if runtime.supports_native_plan:
+        strided_plan = PreprocessPlan(
+            (Morphology("open", 5, 10),), name="native_k5_strided_bgr",
+        )
+        metrics.append(compare(
+            "native_morphology_k5_strided_bgr",
+            runtime.execute_plan(strided_morphology, strided_plan), strided_expected,
+        ))
     if runtime.supports_native_plan:
         native_plans = (
             PreprocessPlan(
@@ -344,6 +410,26 @@ def validate_primitives(runtime: GpuRuntime) -> list[dict]:
     else:
         print(f"SKIP generic native plan: {runtime.native_plan_unavailable_reason}")
     if runtime.supports_native_dag_plan:
+        morphology_dag = PreprocessDagPlan(
+            name="native_k5_bgr_morphology_dag",
+            nodes=(
+                PreprocessDagNode("morph", "root", Morphology("open", 5, 10)),
+                PreprocessDagNode("gray", "root", Gray()),
+            ),
+            outputs=("morph", "gray"),
+        )
+        morphology_source = np.random.default_rng(20260915).integers(
+            0, 256, (65, 67, 3), dtype=np.uint8,
+        )
+        morphology_expected = CpuPreprocessDagExecutor().execute(
+            morphology_source, morphology_dag,
+        )
+        morphology_actual = runtime.execute_dag_plan(morphology_source, morphology_dag)
+        for name in morphology_dag.outputs:
+            metrics.append(compare(
+                f"{morphology_dag.name}_{name}",
+                morphology_actual[name], morphology_expected[name],
+            ))
         dag_plan = PreprocessDagPlan(
             name="native_900_shared_gray",
             nodes=(

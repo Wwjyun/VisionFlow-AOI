@@ -915,6 +915,73 @@ __global__ void morph_kernel(const uint8_t* src, uint8_t* dst, int width, int he
     }
 }
 
+// A rectangular min/max filter is separable. Keep both directions in one
+// block so a 5x5 pass needs only one launch and no device scratch image.
+__global__ void morph_k5_shared_kernel(
+    const uint8_t* src, uint8_t* dst, int width, int height, int channels, int dilate) {
+    constexpr int radius = 2;
+    constexpr int tile_width = BLOCK_X + 2 * radius;
+    constexpr int tile_height = BLOCK_Y + 2 * radius;
+    __shared__ uint8_t tile[tile_width * tile_height * 3];
+    __shared__ uint8_t horizontal[tile_height * BLOCK_X * 3];
+    const int thread_index = threadIdx.y * BLOCK_X + threadIdx.x;
+    const int thread_count = BLOCK_X * BLOCK_Y;
+    const uint8_t border = static_cast<uint8_t>(dilate ? 0 : 255);
+
+    for (int index = thread_index; index < tile_width * tile_height * channels;
+         index += thread_count) {
+        const int channel = index % channels;
+        const int pixel = index / channels;
+        const int x = blockIdx.x * BLOCK_X + pixel % tile_width - radius;
+        const int y = blockIdx.y * BLOCK_Y + pixel / tile_width - radius;
+        tile[index] = (x < 0 || x >= width || y < 0 || y >= height)
+            ? border : src[(y * width + x) * channels + channel];
+    }
+    __syncthreads();
+
+    for (int index = thread_index; index < tile_height * BLOCK_X * channels;
+         index += thread_count) {
+        const int channel = index % channels;
+        const int pixel = index / channels;
+        const int x = pixel % BLOCK_X + radius;
+        const int y = pixel / BLOCK_X;
+        int value = dilate ? 0 : 255;
+        for (int dx = -radius; dx <= radius; ++dx) {
+            const int sample = tile[(y * tile_width + x + dx) * channels + channel];
+            value = dilate ? max(value, sample) : min(value, sample);
+        }
+        horizontal[index] = static_cast<uint8_t>(value);
+    }
+    __syncthreads();
+
+    const int x = blockIdx.x * BLOCK_X + threadIdx.x;
+    const int y = blockIdx.y * BLOCK_Y + threadIdx.y;
+    if (x >= width || y >= height) return;
+    for (int channel = 0; channel < channels; ++channel) {
+        int value = dilate ? 0 : 255;
+        for (int dy = -radius; dy <= radius; ++dy) {
+            const int sample = horizontal[
+                ((threadIdx.y + dy + radius) * BLOCK_X + threadIdx.x) * channels + channel];
+            value = dilate ? max(value, sample) : min(value, sample);
+        }
+        dst[(y * width + x) * channels + channel] = static_cast<uint8_t>(value);
+    }
+}
+
+dim3 grid2d(int width, int height);
+
+void launch_morph_pass(
+    const uint8_t* src, uint8_t* dst, int width, int height, int channels,
+    int radius, int dilate, cudaStream_t stream = nullptr) {
+    if (radius == 2) {
+        morph_k5_shared_kernel<<<grid2d(width, height), dim3(BLOCK_X, BLOCK_Y), 0, stream>>>(
+            src, dst, width, height, channels, dilate);
+    } else {
+        morph_kernel<<<grid2d(width, height), dim3(BLOCK_X, BLOCK_Y), 0, stream>>>(
+            src, dst, width, height, channels, radius, dilate);
+    }
+}
+
 __global__ void gather_roi_batch_kernel(
     const uint8_t* source,
     int source_width,
@@ -1037,8 +1104,9 @@ static int execute_linear_plan_device(
                     int dilate = operation == VF_MORPH_DILATE;
                     if (operation == VF_MORPH_OPEN) dilate = pass >= iterations;
                     if (operation == VF_MORPH_CLOSE) dilate = pass < iterations;
-                    morph_kernel<<<grid2d(width, height), dim3(BLOCK_X, BLOCK_Y), 0, context->stream>>>(
-                        source_buffer, destination, width, height, channels, kernel / 2, dilate);
+                    launch_morph_pass(
+                        source_buffer, destination, width, height, channels,
+                        kernel / 2, dilate, context->stream);
                     source_buffer = destination;
                     destination = destination == next ? context->u8[4] : next;
                 }
@@ -1156,9 +1224,9 @@ static int execute_dag_plan_device(
                     int dilate = operation == VF_MORPH_DILATE;
                     if (operation == VF_MORPH_OPEN) dilate = pass >= iterations;
                     if (operation == VF_MORPH_CLOSE) dilate = pass < iterations;
-                    morph_kernel<<<grid2d(width, height), dim3(BLOCK_X, BLOCK_Y), 0, context->stream>>>(
+                    launch_morph_pass(
                         source_buffer, destination, width, height, channels,
-                        op.int_params[1] / 2, dilate);
+                        op.int_params[1] / 2, dilate, context->stream);
                     source_buffer = destination;
                     destination = destination == output ? context->u8[4] : output;
                 }
@@ -2033,7 +2101,7 @@ VF_CUDA_API int vf_morphology_rect_u8(const uint8_t* src,int w,int h,int stride,
     result = visionflow_cuda::allocate_bytes(&b, static_cast<size_t>(w) * h * sc);
     if (result != VF_CUDA_OK) { visionflow_cuda::free_device(a); return result; }
     auto pass = [&](int dilate) {
-        morph_kernel<<<grid2d(w, h), dim3(BLOCK_X, BLOCK_Y)>>>(a, b, w, h, sc, kernel / 2, dilate);
+        launch_morph_pass(a, b, w, h, sc, kernel / 2, dilate);
         std::swap(a, b);
     };
     if (operation == VF_MORPH_OPEN) {
