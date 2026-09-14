@@ -242,6 +242,30 @@ class Detector202_1(Detector202):
         self._record_debug_image("202-1_gray", gray)
         return gray
 
+    def _exact_median(self, values: np.ndarray) -> float:
+        """Median of a float32 array, matching `np.median` for float32 input.
+
+        Uses the optional CUDA exact-median export when the runtime offers it. The device result is
+        bit-exact against `np.median`, and anything else - a missing export, an older DLL, or a
+        device error - falls back to `np.median` for the whole call, so a failed GPU step never
+        produces a partially device-derived value.
+        """
+        runtime = getattr(self, "gpu_runtime", None)
+        source = np.ascontiguousarray(values, dtype=np.float32)
+        if (
+            runtime is not None
+            and getattr(runtime, "available", False)
+            and getattr(runtime, "supports_exact_median", False)
+            and self.use_gpu
+        ):
+            try:
+                return float(runtime.median_f32(source))
+            except Exception:
+                pass
+        if source is values and source.dtype == np.float32:
+            return float(np.median(values))
+        return float(np.median(source))
+
     def _automatic_cnr_mask(self, gray: np.ndarray) -> dict:
         image_float = gray.astype(np.float32)
         height, width = gray.shape[:2]
@@ -253,8 +277,8 @@ class Detector202_1(Detector202):
             gaussian_sigma,
         )
         residual = image_float - background
-        residual_median = float(np.median(residual))
-        mad = float(np.median(np.abs(residual - residual_median)))
+        residual_median = self._exact_median(residual)
+        mad = self._exact_median(np.abs(residual - residual_median))
         mad_scale = float(self.params.get("mad_scale", 1.4826))
         noise_sigma_floor = float(self.params.get("noise_sigma_floor", 0.000001))
         robust_noise_sigma = float(max(mad_scale * mad, noise_sigma_floor))
