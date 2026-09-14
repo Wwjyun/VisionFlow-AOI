@@ -163,7 +163,7 @@
 - [x] RTX 3090 實機測試 8、16、32、64 ROI batch 的正確性、效能與 VRAM 平台。（2026-09-14 以 `validate_cuda_dll.py --roi-batch-matrix` 完成；ROI batch API 目前未用於正式 Pipeline，Detector 仍逐 tile 使用 resident ROI plan）
 - [x] 單張 GUI 採低延遲策略；資料夾、monitor、batch 採高吞吐策略。
 - [x] 使用 bounded 單一 GPU queue，避免多個 CPU workers 同時搶 GPU 或無限制累積 VRAM。
-- [ ] 評估 pinned host memory 與 CUDA streams，量測 upload/kernel/download 重疊收益。
+- [x] 評估 pinned host memory 與 CUDA streams，量測 upload/kernel/download 重疊收益。（2026-09-14 評估後不採用：常駐 pinned 同一陣列可讓 609 MiB 上傳 79～89→55 ms，但產線每張圖都是 OpenCV 新配置的陣列，逐張 register／upload／unregister 週期 115.0 ms 與 pageable 113.3 ms 持平；單張 Pipeline 為單一序列 stream，跨圖片重疊需依 execution slots 待辦的觸發條件另行評估）
 
 ### Phase2 GPU 加速簡報第 14 頁工作包對照（2026-09-14）
 
@@ -415,6 +415,8 @@
 - [ ] 加速不得犧牲 GUI 回應、打包啟動、結果追溯、錯誤訊息或 CPU fallback。
 
 ## 完成紀錄
+
+- [x] 2026-09-14：完成 pinned host memory 評估，決定不採用於 resident 整圖上傳。RTX 3090 以 16384×13000 BGR 與正式 401-AS-SN-1 plan（6 個 2000×12000 resident ROI）量測：同一 NumPy 陣列持續以 `cudaHostRegister` pin 住時，DLL `vf_context_upload_u8` median 由 pageable 88.97／78.8 ms 降為 55.38 ms（約 11 GB/s，接近本機 PCIe 頻寬上限），6 ROI plan 200.1→180.0 ms、單次 mask D2H 5.8→4.8 ms 差異在雜訊內。但產線每張圖由 OpenCV 解碼成新陣列，同一程序交錯 10 輪「新陣列 register（2.6 ms）→ upload → unregister（13.4 ms）」完整週期 median 115.0 ms，與 pageable 113.3 ms 持平（5/10 勝），因為新頁面的實際 pin 成本轉移到複製期間；改用常駐 pinned buffer 則需先額外複製 609 MiB，OpenCV `imdecode` 也無法直接解碼到指定 buffer。單張 Pipeline 為單一序列 stream，upload／kernel／download 無可重疊區段；跨圖片重疊依 execution slots 待辦條件另行評估。未修改 runtime、CUDA source／ABI／DLL。
 
 - [x] 2026-09-14：完成 RTX 3090 ROI batch 8／16／32／64 實機驗收。`validate_cuda_dll.py` 新增 `--roi-batch-matrix`：在 16384×13000 隨機 BGR resident 原圖上，以 256²／512²／1024² ROI 各建立 batch 8／16／32／64（各 5 次），首輪逐 ROI 全像素比對 NumPy 切片全部相同。建立（gather kernel＋同步）median：256² 0.35→1.16 ms、512² 0.59→2.42 ms、1024² 1.41→6.80 ms；逐張下載全部 ROI 1024²×64 為 59.3 ms，時間大致隨總位元組線性成長。批次存在期間 device 使用量約等於 batch bytes（1024²×64 為 194 MiB），關閉後回收至原水位（僅首例 2 MiB 驅動顆粒差異，其餘 0），無 VRAM 持續成長；`recommended_roi_batch_size` 對 256²～1024² 建議 64。另以 66 個 2000×12000 ROI（一次約 4.8 GiB）呼叫 `iter_roi_batches`，依可用記憶體建議 8 並分為 8×8＋2，最後一張 ROI 像素正確、未遺漏且不留 native handle。完整 validator、353 tests、compileall、CUDA preflight 與 `git diff --check` 通過；未修改 runtime、CUDA source／ABI／DLL，ROI batch API 仍未用於正式 Pipeline。
 
