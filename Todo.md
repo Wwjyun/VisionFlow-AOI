@@ -160,6 +160,19 @@
 - [x] 使用 bounded 單一 GPU queue，避免多個 CPU workers 同時搶 GPU 或無限制累積 VRAM。
 - [ ] 評估 pinned host memory 與 CUDA streams，量測 upload/kernel/download 重疊收益。
 
+### Phase2 GPU 加速簡報第 14 頁工作包對照（2026-09-14）
+
+- A（ROI batch 進 plan）：上方已有 `execute_plan_roi_batch` optional ABI 待辦；現有 ROI batch API 只負責 ROI 資料配置／下載，不等於整批 plan 一次提交、一次同步。
+- [ ] B（CUDA Graphs）：先以 profiler 確認 kernel launch／host 提交確實是瓶頸，再針對固定 shape、plan、ROI 批次與 context 的重複執行建立 capture／replay 原型；測 graph 建立與重建成本、參數／尺寸變更、context 釋放、錯誤後整顆 Detector fallback，並以相同資料交錯比較 warm median／P95 與端到端收益。未量得收益不加入正式路徑。
+- C（可分離形態學）：上方已有 5×5 open、iterations=10 的基準、等價與實機收益待辦。
+- D（pinned memory＋stream 重疊）：上方已有評估待辦；須以多張圖片的批次／監控流程量測 H2D、kernel、必要 D2H 的實際重疊、host RAM／VRAM 峰值與端到端吞吐，單張圖片的序列時間不能直接當成可重疊收益。
+- [ ] E（向量化／`__restrict__`／`__ldg`）：以 profiler 選出受記憶體存取限制的 kernel，再分別試向量化載入／儲存及適用的編譯器讀取提示；確認對齊、stride、1／3 channel、ROI 邊界與 OpenCV 輸出語意，逐項測 kernel、Detector 和端到端收益。`__restrict__`／`__ldg` 不預設有效，沒有可重現收益即不採用。
+- F（Gaussian shared memory）：P2 已有 tile／halo 與 kernel 45 的待辦，需先證明 Gaussian 在正式 Recipe 的耗時占比。
+- G（`INTER_AREA` 完整等價）：P1 已有 CUDA Resize(area) 的數值語意與 RTX 驗收待辦，不能以其他插值法替代。
+- I（RTX 實機驗收）：上方效能 gate、下方 RTX 3090 的 production PASS／NG、GUI、打包與壓測待辦仍未完成；H（metrics／等價驗證）貫穿 A～G，不另估一份收益。
+
+簡報的 30～45 週、約 1.2 倍及各工作包百分比是評估假設，不是本 Todo 的交付承諾；讀圖與 resident ROI 路徑已有後續改動，須以同版程式、同圖、同 Recipe 重建 CPU／GPU cold、warm 與端到端基準後才可重估工期和效益。A～G 的收益有重疊，不得直接相加。
+
 ### 大圖 GPU ROI 直通 Detector（2026-09-14 開始實作）
 
 - [x] PNG／JPEG 等圖片保持 CPU 讀檔／OpenCV BGR 解碼；啟用原生 GPU Detector 的 grid／Template Anchor Grid 路徑在切 tile 前整圖只做一次 H2D upload，tile 以 resident device ROI 執行 D2D staging 與 CUDA plan，不逐 tile 下載 BGR 或重傳原圖；tile 同時保留不複製像素的 CPU 原圖 view 供 shape、fallback 與報表。非 grid 定位（例如 contour／pattern match）仍依其 CPU 定位語意另行評估。
@@ -545,3 +558,4 @@
 - [x] 2026-09-08：將 Tile 缺陷分布報表升級為內嵌 Plotly 7 的離線互動儀表板；九種全域篩選同步更新七張 KPI、前 15 名缺陷圖片表、Tile 明細、自動洞察與 16 個圖表／診斷面板，包含缺陷／NG 率熱圖、NG 率排行、Pareto、Row／Column 剖面、Tile × 類型矩陣、Treemap、面積／score 分布及關係圖。工具會自動讀取同一輸出目錄 `json/` 的完整 PASS／NG Tile 記錄，以 `NG 次數 ÷ 檢測次數` 計算真正的 Tile NG 率；缺少或損壞分母時明確停用該指標，不以 summary 缺陷列代替。468 筆缺陷／24 份 JSON／1,152 次 Tile 檢測的合成報表完成離線渲染與 1440×7000 視覺檢查，完整 314 tests、compileall、CUDA preflight、JS syntax／placeholder 檢查均通過；依增量規則只重建本工具 EXE，packaged smoke 與實際報表輸出 exit 0，EXE 39,247,086 bytes、SHA-256 `541ee8646b98ebd3cbb824df1d38bb68b6ba012cae5aceea7994f70a582dc011`，未重建其他四支工具。
 - [x] 2026-09-11：修正監控模式逐圖耗時口徑；Pipeline `duration_sec` 延後至 Reporter 完成 overlay／NG tiles／CSV／matrix CSV／debug／JSON 寫檔後定值，JSON 自身在最後 writer 執行時保存已包含前序報告的近終值。監控器從新檔案的可用建立時間（位於前後兩次輪詢區間時）或首次觀測開始持續計時，涵蓋穩定檢查、等待前序影像、完整 Pipeline、結果壓縮與處理後影像搬移，ERROR 亦不再固定回報 0 秒；逐圖另輸出 `discovery_and_stability_wait_sec`、`queue_wait_sec`、`pipeline_and_reports_sec`、`processed_image_move_sec` 與 `end_to_end_sec`。完整 319 tests、compileall、CUDA source／ABI preflight、GUI offscreen smoke 與 `git diff --check` 通過；另以真實監控輪詢 smoke 驗證 overlay／CSV／JSON 均落盤、原圖完成搬移，該次發現與穩定等待 0.352 秒、佇列等待 0.001 秒、Pipeline＋報告 0.188 秒、搬移 0.002 秒、端到端 0.544 秒。
 - [x] 2026-09-14：依 Phase2 GPU 加速簡報第 12 頁，將可分離形態學加入 Detector 401 GPU 效能待辦，明列基準量測、CUDA 原型、OpenCV／現有 CUDA 等價、真圖端到端收益及 DLL 重編驗收門檻；理論鄰居讀取量不視為實測加速。本次只更新規畫，未修改 CUDA source 或執行形態學優化。
+- [x] 2026-09-14：對照 Phase2 GPU 加速簡報第 14 頁 A～G、I 工作包與既有 Todo，補列 CUDA Graphs 和向量化／讀取提示的條件式實驗及驗收，並標出 ROI batch、形態學、pinned memory／stream、Gaussian shared memory、`INTER_AREA` 與 RTX 驗收的現有待辦；工期和加速倍率保留為須重新量測的估算。本次僅更新 Todo，未修改執行程式或 CUDA DLL。
