@@ -257,6 +257,10 @@ VF_CUDA_API int vf_match_template_debug_planes(
 /* Diagnostics: copy the gray search ROI that the localization step computed back to the host. */
 VF_CUDA_API int vf_match_template_debug_roi(void* context, uint8_t* out_values, size_t count);
 
+/* Diagnostics: copy the per-column candidate scores and rows of the last localization call. */
+VF_CUDA_API int vf_match_template_debug_candidates(
+    void* context, double* out_scores, int* out_rows, int count, int* candidate_slots);
+
 VF_CUDA_API int vf_preprocess_401_2_u8(
     void* context,
     const uint8_t* src, int width, int height, int src_stride, int src_channels,

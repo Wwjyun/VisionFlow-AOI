@@ -69,6 +69,7 @@ struct PersistentContext {
     size_t match_plane_capacity[MATCH_PLANE_COUNT]{};
     long long* match_candidates = nullptr;
     size_t match_candidate_capacity = 0;
+    int match_candidate_output_width = 0;
     unsigned long long allocation_count = 0;
     cudaStream_t stream = nullptr;
     cudaError_t initialization_error = cudaSuccess;
@@ -1152,12 +1153,30 @@ dim3 grid2d(int width, int height) { return dim3((width + BLOCK_X - 1) / BLOCK_X
 constexpr int MATCH_TEMPLATE_BUFFER = 2;    // context->u8[2]: template gray on device
 constexpr int MATCH_ROI_BUFFER = 3;         // context->u8[3]: search ROI gray on device
 constexpr int MATCH_REDUCE_BLOCK = 256;
-constexpr int MATCH_CANDIDATE_SLOTS = MATCH_REDUCE_BLOCK;
-// Candidate slots occupy [0, 3 * MATCH_CANDIDATE_SLOTS), then two int32 result coordinates, one
-// float score and one packed best key, all inside one int64-aligned grow-only block.
-constexpr int MATCH_RESULT_OFFSET = MATCH_CANDIDATE_SLOTS * 3;
-constexpr int MATCH_KEY_OFFSET = MATCH_RESULT_OFFSET + 1;
-constexpr int MATCH_SLOT_COUNT = MATCH_RESULT_OFFSET + 3;
+// Coordinates are packed into 20 bits, so a search wider than this cannot be reported at all.
+constexpr int MATCH_MAX_OUTPUT_WIDTH = (1 << 20) - 1;
+// Candidate slots scale with the search width, not the block size: the score kernel writes one
+// entry per output column, so a fixed small count would overflow as soon as output_width exceeds
+// it. Slots are int64-sized so the double scores stay aligned, and the result fields follow them.
+constexpr int MATCH_CANDIDATE_SLOT_STRIDE = 3;   // score (double) + row (int) + padding per column
+constexpr int MATCH_RESULT_SLOTS = 3;            // two int32 coordinates, one float score, one key
+constexpr int MATCH_FIXED_SLOTS = MATCH_RESULT_SLOTS + 1;
+
+int match_candidate_slots(int output_width) {
+    return output_width > 0 ? output_width : 1;
+}
+
+int match_slot_count(int output_width) {
+    return match_candidate_slots(output_width) * MATCH_CANDIDATE_SLOT_STRIDE + MATCH_FIXED_SLOTS;
+}
+
+int match_result_offset(int output_width) {
+    return match_candidate_slots(output_width) * MATCH_CANDIDATE_SLOT_STRIDE;
+}
+
+int match_key_offset(int output_width) {
+    return match_result_offset(output_width) + 1;
+}
 // Match key layout, ordered so that a larger unsigned key is the better match:
 //   bits 62..40 score, bits 39..20 inverted y, bits 19..0 inverted x.
 // The score is quantized to 22 bits once, and that same value is what the caller receives, so a
@@ -2695,14 +2714,17 @@ VF_CUDA_API int vf_match_template_gray_u8(
     }
     result = reserve_device(
         &persistent->match_candidates, &persistent->match_candidate_capacity,
-        static_cast<size_t>(MATCH_SLOT_COUNT), &persistent->allocation_count);
+        static_cast<size_t>(match_slot_count(output_width)), &persistent->allocation_count);
     if (result != VF_CUDA_OK) return result;
+    persistent->match_candidate_output_width = output_width;
     long long* candidate_storage = persistent->match_candidates;
     // Result slots live in the same grow-only block: two int32 for the winner origin, one float
     // score and one packed best key, all int64-aligned.
-    int* match_xy_device = reinterpret_cast<int*>(candidate_storage + MATCH_RESULT_OFFSET);
+    const int result_offset = match_result_offset(output_width);
+    const int key_offset = match_key_offset(output_width);
+    int* match_xy_device = reinterpret_cast<int*>(candidate_storage + result_offset);
     float* match_score_device = reinterpret_cast<float*>(match_xy_device + 2);
-    unsigned long long* best_key = reinterpret_cast<unsigned long long*>(candidate_storage + MATCH_KEY_OFFSET);
+    unsigned long long* best_key = reinterpret_cast<unsigned long long*>(candidate_storage + key_offset);
 
     // Template statistics on the host: the template is small and constant per Recipe.
     double template_sum = 0.0;
@@ -2756,7 +2778,7 @@ VF_CUDA_API int vf_match_template_gray_u8(
     if (result != VF_CUDA_OK) return result;
 
     double* candidate_scores = reinterpret_cast<double*>(candidate_storage);
-    int* candidate_ys = reinterpret_cast<int*>(candidate_storage + MATCH_CANDIDATE_SLOTS);
+    int* candidate_ys = reinterpret_cast<int*>(candidate_storage + match_candidate_slots(output_width));
     const dim3 prefix_grid((output_width + MATCH_REDUCE_BLOCK - 1) / MATCH_REDUCE_BLOCK, 1);
     const dim3 reduce_block(MATCH_REDUCE_BLOCK, 1);
     match_prefix_kernel<<<prefix_grid, reduce_block, 0, persistent->stream>>>(
@@ -2816,8 +2838,9 @@ VF_CUDA_API int vf_match_template_debug_key(void* context, unsigned long long* o
     if (persistent == nullptr || out_key == nullptr || persistent->match_candidates == nullptr) {
         return VF_CUDA_INVALID_ARGUMENT;
     }
-    const unsigned long long* best_key =
-        reinterpret_cast<const unsigned long long*>(persistent->match_candidates + MATCH_KEY_OFFSET);
+    const unsigned long long* best_key = reinterpret_cast<const unsigned long long*>(
+        persistent->match_candidates +
+        match_key_offset(static_cast<int>(persistent->match_candidate_output_width)));
     cudaError_t error = cudaMemcpyAsync(
         out_key, best_key, sizeof(unsigned long long), cudaMemcpyDeviceToHost, persistent->stream);
     if (error != cudaSuccess) return cuda_result(error);
@@ -2851,6 +2874,35 @@ VF_CUDA_API int vf_match_template_debug_roi(void* context, uint8_t* out_values, 
     cudaError_t error = cudaMemcpyAsync(
         out_values, persistent->u8[MATCH_ROI_BUFFER], count, cudaMemcpyDeviceToHost,
         persistent->stream);
+    if (error != cudaSuccess) return cuda_result(error);
+    return visionflow_cuda::stream_result(persistent->stream);
+}
+
+// Diagnostics: copy the per-column candidate scores and rows of the last localization call, so a
+// caller can compare each column's best against the CPU match map. candidate_slots reports how
+// many slots the context currently holds.
+VF_CUDA_API int vf_match_template_debug_candidates(
+    void* context, double* out_scores, int* out_rows, int count, int* candidate_slots) {
+    PersistentContext* persistent = static_cast<PersistentContext*>(context);
+    if (candidate_slots != nullptr) {
+        *candidate_slots = static_cast<int>(persistent != nullptr
+            ? persistent->match_candidate_capacity : 0);
+    }
+    if (persistent == nullptr || out_scores == nullptr || out_rows == nullptr || count <= 0 ||
+        persistent->match_candidates == nullptr || count > MATCH_MAX_OUTPUT_WIDTH ||
+        count > persistent->match_candidate_output_width ||
+        count * MATCH_CANDIDATE_SLOT_STRIDE > (int)persistent->match_candidate_capacity) {
+        return VF_CUDA_INVALID_ARGUMENT;
+    }
+    const double* scores = reinterpret_cast<const double*>(persistent->match_candidates);
+    const int* rows = reinterpret_cast<const int*>(
+        persistent->match_candidates + match_candidate_slots(count));
+    cudaError_t error = cudaMemcpyAsync(
+        out_scores, scores, sizeof(double) * count, cudaMemcpyDeviceToHost, persistent->stream);
+    if (error == cudaSuccess) {
+        error = cudaMemcpyAsync(
+            out_rows, rows, sizeof(int) * count, cudaMemcpyDeviceToHost, persistent->stream);
+    }
     if (error != cudaSuccess) return cuda_result(error);
     return visionflow_cuda::stream_result(persistent->stream);
 }
