@@ -113,6 +113,15 @@ class TileParallelEquivalenceTests(unittest.TestCase):
         self.assertEqual(serial["summary"], parallel["summary"])
         self.assertEqual(normalized_tiles(serial), normalized_tiles(parallel))
 
+    def test_parallel_cpu_crops_match_serial_pipeline(self):
+        with mock.patch.dict(os.environ, {"AOI_CROP_WORKERS": "1"}):
+            serial = self._run(None)
+        with mock.patch.dict(os.environ, {"AOI_CROP_WORKERS": "4"}):
+            parallel = self._run(None)
+        self.assertEqual(serial["final_result"], parallel["final_result"])
+        self.assertEqual(serial["summary"], parallel["summary"])
+        self.assertEqual(normalized_tiles(serial), normalized_tiles(parallel))
+
 
 class WorkerAndGcPolicyTests(unittest.TestCase):
     def _processor(self, **env):

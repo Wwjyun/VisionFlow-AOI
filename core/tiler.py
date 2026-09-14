@@ -1,6 +1,10 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from dataclasses import replace
+from concurrent.futures import ThreadPoolExecutor
+from itertools import islice
+import os
 import time
 from typing import Iterator
 
@@ -31,6 +35,41 @@ class Tile:
     image: object
     metadata: dict | None = None
     device_roi: object | None = None
+
+
+def _iter_cropped_tiles(image, tiles: Iterator[Tile], gpu_runtime=None, crop_workers: int = 1) -> Iterator[Tile]:
+    """Crop independent CPU ROIs concurrently while yielding tiles in source order."""
+    def crop(tile: Tile) -> Tile:
+        return replace(
+            tile,
+            image=_crop_image(
+                image, tile.x, tile.y, tile.x + tile.width, tile.y + tile.height,
+                gpu_runtime,
+            ),
+        )
+
+    if crop_workers <= 1 or gpu_runtime is not None:
+        for tile in tiles:
+            yield crop(tile)
+        return
+    source = iter(tiles)
+    first_batch = list(islice(source, crop_workers * 4))
+    if len(first_batch) <= 1:
+        for tile in first_batch:
+            yield crop(tile)
+        return
+    with ThreadPoolExecutor(max_workers=crop_workers) as executor:
+        yield from executor.map(crop, first_batch)
+        while batch := list(islice(source, crop_workers * 4)):
+            yield from executor.map(crop, batch)
+
+
+def _crop_workers(config: dict, configured=None) -> int:
+    value = config.get("crop_workers", 1) if configured is None else configured
+    try:
+        return max(1, min(int(value), os.cpu_count() or 1))
+    except (TypeError, ValueError):
+        return 1
 
 
 @dataclass(frozen=True)
@@ -422,6 +461,7 @@ class Tiler:
         anchor_config: GridAnchorConfig | None = None,
         gpu_runtime=None,
         resident_image=None,
+        crop_workers: int = 1,
     ):
         if width <= 0 or height <= 0:
             raise ValueError("Tile width and height must be positive.")
@@ -438,10 +478,11 @@ class Tiler:
         self.image_loader = ImageLoader()
         self.gpu_runtime = gpu_runtime
         self.resident_image = resident_image
+        self.crop_workers = crop_workers
         self.last_profile_ms = {"template_match_ms": 0.0, "roi_generation_ms": 0.0}
 
     @classmethod
-    def from_config(cls, config: dict, gpu_runtime=None, resident_image=None) -> "Tiler":
+    def from_config(cls, config: dict, gpu_runtime=None, resident_image=None, crop_workers=None) -> "Tiler":
         anchor_config = GridAnchorConfig.from_dict(config) if str(config.get("template_path", "")).strip() else None
         width = int(config.get("width", config.get("roi_w", 512)))
         height = int(config.get("height", config.get("roi_h", 512)))
@@ -453,6 +494,7 @@ class Tiler:
             anchor_config=anchor_config,
             gpu_runtime=gpu_runtime,
             resident_image=resident_image,
+            crop_workers=_crop_workers(config, crop_workers),
         )
 
     def iter_tiles(self, image) -> Iterator[Tile]:
@@ -465,26 +507,30 @@ class Tiler:
         y_positions = self._positions(image_height, self.height, self.step_y)
         x_positions = self._positions(image_width, self.width, self.step_x)
 
-        for row, y in enumerate(y_positions):
-            for col, x in enumerate(x_positions):
-                x2 = min(x + self.width, image_width)
-                y2 = min(y + self.height, image_height)
-                tile_image = _crop_image(image, x, y, x2, y2, self.gpu_runtime)
-                yield Tile(
-                    tile_id=f"r{row:04d}_c{col:04d}",
-                    x=x,
-                    y=y,
-                    width=x2 - x,
-                    height=y2 - y,
-                    row=row,
-                    col=col,
-                    image=tile_image,
-                    metadata={"mode": "grid"},
-                    device_roi=(
-                        self.resident_image.roi(x, y, x2 - x, y2 - y)
-                        if self.resident_image is not None else None
-                    ),
-                )
+        def tile_specs():
+            for row, y in enumerate(y_positions):
+                for col, x in enumerate(x_positions):
+                    x2 = min(x + self.width, image_width)
+                    y2 = min(y + self.height, image_height)
+                    yield Tile(
+                        tile_id=f"r{row:04d}_c{col:04d}",
+                        x=x,
+                        y=y,
+                        width=x2 - x,
+                        height=y2 - y,
+                        row=row,
+                        col=col,
+                        image=None,
+                        metadata={"mode": "grid"},
+                        device_roi=(
+                            self.resident_image.roi(x, y, x2 - x, y2 - y)
+                            if self.resident_image is not None else None
+                        ),
+                    )
+        yield from _iter_cropped_tiles(
+            image, tile_specs(), self.gpu_runtime,
+            1 if self.resident_image is not None else self.crop_workers,
+        )
         self.last_profile_ms = {
             "template_match_ms": 0.0,
             "roi_generation_ms": (time.perf_counter() - generation_started) * 1000.0,
@@ -510,47 +556,51 @@ class Tiler:
 
         generation_started = time.perf_counter()
         try:
-            for row in range(config.rows):
-                for col in range(config.cols):
-                    x = int(base_x + col * (config.roi_w + config.gap_x))
-                    y = int(base_y + row * (config.roi_h + config.gap_y))
-                    x1 = max(0, x)
-                    y1 = max(0, y)
-                    x2 = min(image_width, x + config.roi_w)
-                    y2 = min(image_height, y + config.roi_h)
-                    if x2 <= x1 or y2 <= y1:
-                        continue
-                    tile_image = _crop_image(image, x1, y1, x2, y2, self.gpu_runtime)
-                    yield Tile(
-                        tile_id=f"r{row:04d}_c{col:04d}",
-                        x=x1,
-                        y=y1,
-                        width=x2 - x1,
-                        height=y2 - y1,
-                        row=row,
-                        col=col,
-                        image=tile_image,
-                        device_roi=(
-                            self.resident_image.roi(x1, y1, x2 - x1, y2 - y1)
-                            if self.resident_image is not None else None
-                        ),
-                        metadata={
-                            "mode": "grid",
-                            "grid_anchor": "template_match",
-                            "search_roi": anchor["search_roi"],
-                            "match_bbox": [
-                                anchor["x"], anchor["y"], anchor["width"], anchor["height"]
-                            ],
-                            "score": float(anchor["score"]),
-                            "base_roi": [
-                                int(base_x),
-                                int(base_y),
-                                int(config.cols * config.roi_w + max(0, config.cols - 1) * config.gap_x),
-                                int(config.rows * config.roi_h + max(0, config.rows - 1) * config.gap_y),
-                            ],
-                            "template_path": config.template_path,
-                        },
-                    )
+            def tile_specs():
+                for row in range(config.rows):
+                    for col in range(config.cols):
+                        x = int(base_x + col * (config.roi_w + config.gap_x))
+                        y = int(base_y + row * (config.roi_h + config.gap_y))
+                        x1 = max(0, x)
+                        y1 = max(0, y)
+                        x2 = min(image_width, x + config.roi_w)
+                        y2 = min(image_height, y + config.roi_h)
+                        if x2 <= x1 or y2 <= y1:
+                            continue
+                        yield Tile(
+                            tile_id=f"r{row:04d}_c{col:04d}",
+                            x=x1,
+                            y=y1,
+                            width=x2 - x1,
+                            height=y2 - y1,
+                            row=row,
+                            col=col,
+                            image=None,
+                            device_roi=(
+                                self.resident_image.roi(x1, y1, x2 - x1, y2 - y1)
+                                if self.resident_image is not None else None
+                            ),
+                            metadata={
+                                "mode": "grid",
+                                "grid_anchor": "template_match",
+                                "search_roi": anchor["search_roi"],
+                                "match_bbox": [
+                                    anchor["x"], anchor["y"], anchor["width"], anchor["height"]
+                                ],
+                                "score": float(anchor["score"]),
+                                "base_roi": [
+                                    int(base_x),
+                                    int(base_y),
+                                    int(config.cols * config.roi_w + max(0, config.cols - 1) * config.gap_x),
+                                    int(config.rows * config.roi_h + max(0, config.rows - 1) * config.gap_y),
+                                ],
+                                "template_path": config.template_path,
+                            },
+                        )
+            yield from _iter_cropped_tiles(
+                image, tile_specs(), self.gpu_runtime,
+                1 if self.resident_image is not None else self.crop_workers,
+            )
         finally:
             self.last_profile_ms = {
                 "template_match_ms": template_match_ms,
@@ -615,18 +665,20 @@ class Tiler:
 
 
 class ContourTiler:
-    def __init__(self, threshold: BinaryThresholdConfig, shapes: ShapeFilterConfig, gpu_runtime=None):
+    def __init__(self, threshold: BinaryThresholdConfig, shapes: ShapeFilterConfig, gpu_runtime=None, crop_workers: int = 1):
         self.segmenter = BinarySegmenter(threshold)
         self.analyzer = ContourShapeAnalyzer(shapes)
         self.shape_config = shapes
         self.gpu_runtime = gpu_runtime
+        self.crop_workers = crop_workers
 
     @classmethod
-    def from_config(cls, config: dict, gpu_runtime=None) -> "ContourTiler":
+    def from_config(cls, config: dict, gpu_runtime=None, crop_workers=None) -> "ContourTiler":
         return cls(
             threshold=BinaryThresholdConfig.from_dict(config.get("threshold")),
             shapes=ShapeFilterConfig.from_dict(config.get("shapes")),
             gpu_runtime=gpu_runtime,
+            crop_workers=_crop_workers(config, crop_workers),
         )
 
     def iter_tiles(self, image) -> Iterator[Tile]:
@@ -636,94 +688,98 @@ class ContourTiler:
         image_height, image_width = image.shape[:2]
         accepted_index = 0
 
-        for contour_index, contour in enumerate(contours):
-            metadata = self.analyzer.analyze(contour, gray)
-            if metadata is None:
-                continue
+        def tile_specs():
+            nonlocal accepted_index
+            for contour_index, contour in enumerate(contours):
+                metadata = self.analyzer.analyze(contour, gray)
+                if metadata is None:
+                    continue
 
-            x, y, width, height = metadata["bbox"]
-            padding = self.shape_config.crop_padding
-            x1 = max(0, x - padding)
-            y1 = max(0, y - padding)
-            x2 = min(image_width, x + width + padding)
-            y2 = min(image_height, y + height + padding)
-            if x2 <= x1 or y2 <= y1:
-                continue
+                x, y, width, height = metadata["bbox"]
+                padding = self.shape_config.crop_padding
+                x1 = max(0, x - padding)
+                y1 = max(0, y - padding)
+                x2 = min(image_width, x + width + padding)
+                y2 = min(image_height, y + height + padding)
+                if x2 <= x1 or y2 <= y1:
+                    continue
 
-            tile_image = _crop_image(image, x1, y1, x2, y2, self.gpu_runtime)
-            shape = metadata["shape"]
-            yield Tile(
-                tile_id=f"{shape}_{accepted_index:04d}",
-                x=x1,
-                y=y1,
-                width=x2 - x1,
-                height=y2 - y1,
-                row=accepted_index,
-                col=0,
-                image=tile_image,
-                metadata={
-                    "mode": "contour",
-                    "contour_index": int(contour_index),
-                    **metadata,
-                },
-            )
-            accepted_index += 1
+                shape = metadata["shape"]
+                yield Tile(
+                    tile_id=f"{shape}_{accepted_index:04d}",
+                    x=x1,
+                    y=y1,
+                    width=x2 - x1,
+                    height=y2 - y1,
+                    row=accepted_index,
+                    col=0,
+                    image=None,
+                    metadata={
+                        "mode": "contour",
+                        "contour_index": int(contour_index),
+                        **metadata,
+                    },
+                )
+                accepted_index += 1
+        yield from _iter_cropped_tiles(image, tile_specs(), self.gpu_runtime, self.crop_workers)
 
 
 class PatternMatchTiler:
-    def __init__(self, config: PatternMatchConfig, gpu_runtime=None):
+    def __init__(self, config: PatternMatchConfig, gpu_runtime=None, crop_workers: int = 1):
         self.config = config
         self.matcher = PatternMatcher(config)
         self.gpu_runtime = gpu_runtime
+        self.crop_workers = crop_workers
 
     @classmethod
-    def from_config(cls, config: dict, gpu_runtime=None) -> "PatternMatchTiler":
-        return cls(PatternMatchConfig.from_dict(config.get("pattern_match")), gpu_runtime=gpu_runtime)
+    def from_config(cls, config: dict, gpu_runtime=None, crop_workers=None) -> "PatternMatchTiler":
+        return cls(PatternMatchConfig.from_dict(config.get("pattern_match")), gpu_runtime=gpu_runtime, crop_workers=_crop_workers(config, crop_workers))
 
     def iter_tiles(self, image) -> Iterator[Tile]:
         image_height, image_width = image.shape[:2]
         matches = self.matcher.find_matches(image)
         padding = self.config.crop_padding
-        for index, match in enumerate(matches):
-            x = int(match["x"])
-            y = int(match["y"])
-            width = int(match["width"])
-            height = int(match["height"])
-            x1 = max(0, x - padding)
-            y1 = max(0, y - padding)
-            x2 = min(image_width, x + width + padding)
-            y2 = min(image_height, y + height + padding)
-            if x2 <= x1 or y2 <= y1:
-                continue
+        def tile_specs():
+            for index, match in enumerate(matches):
+                x = int(match["x"])
+                y = int(match["y"])
+                width = int(match["width"])
+                height = int(match["height"])
+                x1 = max(0, x - padding)
+                y1 = max(0, y - padding)
+                x2 = min(image_width, x + width + padding)
+                y2 = min(image_height, y + height + padding)
+                if x2 <= x1 or y2 <= y1:
+                    continue
 
-            tile_image = _crop_image(image, x1, y1, x2, y2, self.gpu_runtime)
-            yield Tile(
-                tile_id=f"pm_{index:04d}",
-                x=x1,
-                y=y1,
-                width=x2 - x1,
-                height=y2 - y1,
-                row=index,
-                col=0,
-                image=tile_image,
-                metadata={
-                    "mode": "pattern_match",
-                    "match_index": index,
-                    "score": float(match["score"]),
-                    "match_bbox": [x, y, width, height],
-                    "template_path": self.config.template_path,
-                },
-            )
+                yield Tile(
+                    tile_id=f"pm_{index:04d}",
+                    x=x1,
+                    y=y1,
+                    width=x2 - x1,
+                    height=y2 - y1,
+                    row=index,
+                    col=0,
+                    image=None,
+                    metadata={
+                        "mode": "pattern_match",
+                        "match_index": index,
+                        "score": float(match["score"]),
+                        "match_bbox": [x, y, width, height],
+                        "template_path": self.config.template_path,
+                    },
+                )
+        yield from _iter_cropped_tiles(image, tile_specs(), self.gpu_runtime, self.crop_workers)
 
 
-def create_tiler(tile_config: dict, gpu_runtime=None, resident_image=None):
+def create_tiler(tile_config: dict, gpu_runtime=None, resident_image=None, crop_workers=None):
     mode = str(tile_config.get("mode", "grid")).lower()
     if mode == "grid":
         return Tiler.from_config(
-            tile_config, gpu_runtime=gpu_runtime, resident_image=resident_image
+            tile_config, gpu_runtime=gpu_runtime, resident_image=resident_image, crop_workers=crop_workers
         )
     if mode == "contour":
-        return ContourTiler.from_config(tile_config, gpu_runtime=gpu_runtime)
+        return ContourTiler.from_config(tile_config, gpu_runtime=gpu_runtime, crop_workers=crop_workers)
     if mode == "pattern_match":
-        return PatternMatchTiler.from_config(tile_config, gpu_runtime=gpu_runtime)
+        return PatternMatchTiler.from_config(tile_config, gpu_runtime=gpu_runtime, crop_workers=crop_workers)
     raise ValueError(f"Unsupported tile mode: {mode}")

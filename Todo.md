@@ -217,6 +217,7 @@
 本區的效能功能不得改變 recipe 語意、PASS/NG、座標、缺陷 metadata 或預設輸出。無實機收益證據的平行策略維持 opt-in。
 
 - [x] 單張純 CPU 檢測支援 opt-in tile 級平行：`performance.tile_workers`／`AOI_TILE_WORKERS` 啟用，thread-local detector 避免共享 instance state；GPU detector 或 resident image 強制保持序列。
+- [x] CPU 切圖支援 opt-in `performance.crop_workers`／`AOI_CROP_WORKERS`：grid、Template Anchor Grid、contour 與 pattern_match 先固定座標，再以有界工作池平行複製 ROI；tile 順序、座標、像素與 metadata 保持一致，GPU crop／resident image 不進入 CPU 平行路徑。
 - [x] Recipe 依 path、mtime、size 建立 thread-safe process cache，cache hit 回傳 deepcopy，檔案異動後重新解析與驗證。
 - [x] Batch worker 上限調整為 `min(8, cpu_count, image_count)`，批次期間分配 OpenCV thread budget 並於結束時還原；`AOI_BATCH_WORKERS`／`max_workers` 可覆寫。
 - [x] `gc.collect(0)` 改為 `AOI_BATCH_GC_INTERVAL` 可設定週期，預設每 8 張，`0` 停用。
@@ -384,6 +385,8 @@
 - [ ] 加速不得犧牲 GUI 回應、打包啟動、結果追溯、錯誤訊息或 CPU fallback。
 
 ## 完成紀錄
+
+- [x] 2026-09-14：新增 CPU opt-in 平行切圖，`performance.crop_workers`／`AOI_CROP_WORKERS` 可設定 worker 數，獨立 tiler 支援 `tile.crop_workers`；一般 grid、先整圖 Pattern Match 再依 offset／rows／cols／ROI／gap 裁切的 Template Anchor Grid、contour 與 pattern_match 均使用有界且保序的 ROI 裁切工作池。GPU crop／resident image 仍維持序列，0～1 張 tile 不建立工作池。四模式像素、座標、metadata 與排序等價、實際多執行緒、GPU 路由及 Pipeline 串接測試通過；完整 327 tests、compileall、CUDA ABI preflight、CPU CLI 合成 PASS smoke 與 `git diff --check` 通過。未改 CUDA source／ABI／DLL，實際產線資料集加速幅度仍待量測。
 - [x] 2026-08-28：完成分類式 AI Detector 的 TensorRT 純推論規劃；固定 VisionFlow 只接收已驗證模型包並執行推論，資料集、標註、PyTorch／Transformers 訓練、評估、門檻校準、ONNX 匯出與 TensorRT engine 建置／驗證全部留在外部模型工具。新增版本化 ONNX／manifest／可選 engine 交付契約、engine 相容鍵、ROI-level 分類與 PASS/NG／低信心語意、detector-neutral 共用 session、CPU／auto／strict CUDA fallback、batch／metadata／Recipe Designer、真實 AOI acceptance set、FP32／FP16 等價、RTX 3090 1000 張穩定性及 PyInstaller 驗收待辦；除責任邊界決策外，其餘實作與硬體項目皆保持未勾選。完整 308 tests、compileall、CUDA source／ABI preflight 與 `git diff --check` 通過；本次只修改 `Todo.md`，未變更 runtime、Detector、Recipe、GUI、CUDA source／header／ABI／DLL，未執行分類模型 RTX runtime 或量產精度驗收。
 - [x] 2026-08-28：整理本機發行工件與獨立工具原始碼；將根目錄 9 份既有版本化 ZIP 原封不動移至 `release_artifacts/`，新增索引並讓 Utility Tools 合集後續直接輸出至該資料夾；四支 `export_*.py` 移入 `tools/` package，改以 `python -m tools...` 執行，同步更新 imports、PyInstaller specs、build、CI、README、AGENT、release skill、歷史紀錄與 packaging contract tests。四支原始碼及重新打包 EXE 的 `--smoke-test` 均 exit 0，驗證 ZIP 結構與 CPU 說明正確；完整 308 tests、compileall、CUDA preflight、skill validator 與 `git diff --check` 通過。驗證用 `v0.0.0` ZIP／合集目錄已刪除，9 份正式 ZIP 保持原檔名與內容，未修改 CUDA source／header／ABI／DLL，亦未移動或提交既有未追蹤簡報、圖表、課程及架構圖產物。
 - [x] 2026-08-28：整理 repository 文件結構；新增 `docs/README.md` 索引，將 8 份 release notes 依產品與版本統一移至 `docs/release-notes/`、4 份技術／階段報告移至 `docs/reports/`、2 份會收錄進發行工件的純文字說明移至 `docs/packaging/`。同步更新 README、AGENT、歷史紀錄、`aoi-release` skill 範例、Utility／NG Tile 建置腳本與 packaging contract tests；四支 Utility Tools 重建及 packaged `--smoke-test` exit 0，驗證 ZIP 內 README 正確，完整 308 tests、compileall、CUDA preflight、skill validator 與 `git diff --check` 通過。根目錄保留執行／開發入口與固定的 `weekly_reports/` 契約，未移動或提交既有未追蹤簡報與架構圖產物。

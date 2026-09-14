@@ -230,6 +230,8 @@ GUI 不會複製另一套檢測邏輯，而是由 Qt worker 執行相同的 `AOI
 
 單張影像的 tile × detector 迴圈預設維持序列執行。純 CPU 情境可透過配方 `performance.tile_workers` 或環境變數 `AOI_TILE_WORKERS` 啟用 tile 級平行；每個 worker 使用 thread-local detector，GPU detector 或 resident device image 仍固定走單一序列路徑。配方會依檔案 path、mtime 與大小快取 validated 結果，且每次回傳獨立 deepcopy，避免 batch／monitor 重複解析或共享可變狀態。
 
+CPU 切圖也可透過配方 `performance.crop_workers: 4` 或環境變數 `AOI_CROP_WORKERS=4` 啟用平行裁切（配方設定優先，預設 1，最多使用可用 CPU 核心數）。一般 grid、先對整張圖做 Template Anchor Grid Pattern Match 再按 rows/cols/ROI/gap 切圖、contour 與 pattern_match 模式皆適用；定位與座標計算維持原順序，只有獨立 ROI 的像素複製進入工作池，輸出順序不變。獨立使用 `Tiler.from_config` 或 `create_tiler` 時也可在 `tile.crop_workers` 指定。CUDA crop 或 resident image 不進入 CPU 平行裁切；是否加速應以實際影像量測 `tiling` 與端到端時間。
+
 ## YAML 配方
 
 配方至少包含下列區段：

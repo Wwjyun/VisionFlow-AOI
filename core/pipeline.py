@@ -120,6 +120,9 @@ class AOIPipeline(LogMixin):
                 tile_config,
                 gpu_runtime=(gpu_runtime if tiling_gpu_requested and resident_image is None else None),
                 resident_image=resident_image,
+                crop_workers=(recipe.get("performance", {}) or {}).get(
+                    "crop_workers", os.getenv("AOI_CROP_WORKERS", 1)
+                ),
             )
             if not detector_gpu_allowed:
                 for config in detector_configs.values():
