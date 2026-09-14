@@ -14,6 +14,8 @@ from core.gpu_runtime import GpuResidentImage, GpuRuntimeError
 from core.gpu_session import GpuExecutionSession, GpuExecutionSessionCache
 from core.monitor_processor import FolderMonitorProcessor
 from core.pipeline import AOIPipeline
+from core.pipeline_stages import TileInspector
+from core.tiler import Tile
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -64,12 +66,15 @@ class _RoiCapturingDetector:
     use_gpu = True
     gpu_active = True
     gpu_fallback_reason = ""
+    export_debug_images = False
 
     def __init__(self):
         self.device_rois = []
+        self.images = []
 
     def run(self, _image, device_roi=None, preprocess_cache=None):
         self.device_rois.append(device_roi)
+        self.images.append(_image)
         return {
             "detector_id": self.detector_id,
             "detector_name": self.detector_name,
@@ -82,6 +87,27 @@ class _RoiCapturingDetector:
 
 
 class GpuExecutionSessionTests(unittest.TestCase):
+    def test_mixed_resident_tile_copies_only_for_cpu_detectors(self):
+        source = np.zeros((80, 100, 3), dtype=np.uint8)
+        image_view = source[5:65, 10:90]
+        resident = GpuResidentImage(object(), 1, 100, 80, 3)
+        roi = resident.roi(10, 5, 80, 60)
+        tile = Tile("r0000_c0000", 10, 5, 80, 60, 0, 0, image_view, device_roi=roi)
+        gpu_detector = _RoiCapturingDetector()
+        cpu_detectors = [_RoiCapturingDetector(), _RoiCapturingDetector()]
+        for index, detector in enumerate(cpu_detectors):
+            detector.gpu_active = False
+            detector.use_gpu = False
+            detector.detector_id = f"cpu-{index}"
+
+        TileInspector.inspect(tile, [gpu_detector, *cpu_detectors])
+
+        self.assertIs(gpu_detector.images[0], image_view)
+        self.assertIs(gpu_detector.device_rois[0], roi)
+        self.assertIs(cpu_detectors[0].images[0], cpu_detectors[1].images[0])
+        self.assertFalse(np.shares_memory(source, cpu_detectors[0].images[0]))
+        self.assertEqual([detector.device_rois[0] for detector in cpu_detectors], [None, None])
+
     def test_yolox_gpu_request_uses_shared_ai_manager_without_loading_cuda_dll(self):
         recipe_path = (
             ROOT / "recipes" / "examples" / "YOLOX_TINY_REFERENCE_AOI_01.yaml"

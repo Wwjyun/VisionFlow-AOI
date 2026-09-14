@@ -514,7 +514,7 @@ class GpuRuntime:
     def native_plan_capability(self, plan, image: np.ndarray) -> tuple[bool, str]:
         if not self.supports_native_plan:
             return False, self.native_plan_unavailable_reason or "CUDA DLL has no generic native plan ABI"
-        source = self._u8_image(image, channels=(1, 3))
+        source = self._u8_image(image, channels=(1, 3), contiguous=False)
         try:
             descriptor, operators = self._plan_descriptors.linear(plan, source)
         except GpuRuntimeError as exc:
@@ -532,7 +532,7 @@ class GpuRuntime:
         return result == 0, message or self._error_message(result)
 
     def execute_plan(self, image: np.ndarray, plan, device_roi: GpuDeviceRoi | None = None) -> np.ndarray:
-        source = self._u8_image(image, channels=(1, 3))
+        source = self._u8_image(image, channels=(1, 3), contiguous=device_roi is None)
         expected = plan.validate_input(source)
         supported, reason = self.native_plan_capability(plan, source)
         if not supported:
@@ -605,7 +605,7 @@ class GpuRuntime:
     def native_dag_plan_capability(self, plan, image: np.ndarray) -> tuple[bool, str]:
         if not self.supports_native_dag_plan:
             return False, self.native_dag_plan_unavailable_reason or "CUDA DLL has no generic native DAG plan ABI"
-        source = self._u8_image(image, channels=(1, 3))
+        source = self._u8_image(image, channels=(1, 3), contiguous=False)
         try:
             descriptor, operators, output_nodes = self._plan_descriptors.dag(plan, source)
         except GpuRuntimeError as exc:
@@ -618,7 +618,7 @@ class GpuRuntime:
         return result == 0, message or self._error_message(result)
 
     def execute_dag_plan(self, image: np.ndarray, plan, device_roi: GpuDeviceRoi | None = None) -> dict[str, np.ndarray]:
-        source = self._u8_image(image, channels=(1, 3))
+        source = self._u8_image(image, channels=(1, 3), contiguous=device_roi is None)
         supported, reason = self.native_dag_plan_capability(plan, source)
         if not supported:
             raise GpuRuntimeError(reason)
@@ -1150,14 +1150,16 @@ class GpuRuntime:
             raise exc
 
     @staticmethod
-    def _u8_image(image: np.ndarray, channels: tuple[int, ...]) -> np.ndarray:
+    def _u8_image(
+        image: np.ndarray, channels: tuple[int, ...], *, contiguous: bool = True,
+    ) -> np.ndarray:
         array = np.asarray(image)
         count = 1 if array.ndim == 2 else array.shape[2] if array.ndim == 3 else 0
         if array.dtype != np.uint8 or count not in channels:
             raise GpuRuntimeError(f"CUDA DLL expects uint8 image with channels in {channels}; got {array.dtype}, {array.shape}")
         if array.shape[0] <= 0 or array.shape[1] <= 0:
             raise GpuRuntimeError(f"CUDA DLL does not accept empty images: {array.shape}")
-        return np.ascontiguousarray(array)
+        return np.ascontiguousarray(array) if contiguous else array
 
     @staticmethod
     def _resolve_path(path: str) -> Path:

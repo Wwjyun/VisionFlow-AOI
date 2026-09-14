@@ -681,8 +681,11 @@ class GpuRuntimeMetricsTests(unittest.TestCase):
         )
         host_roi = image[1:5, 2:7]
 
-        output = runtime.execute_plan(host_roi, linear, device_roi=roi)
-        outputs = runtime.execute_dag_plan(host_roi, dag, device_roi=roi)
+        self.assertFalse(host_roi.flags.c_contiguous)
+        with patch("core.gpu_runtime.np.ascontiguousarray", side_effect=AssertionError("unexpected CPU ROI copy")):
+            self.assertEqual(CudaPreprocessExecutor(runtime).capability_report(linear, host_roi).selected_backend, "cuda")
+            output = runtime.execute_plan(host_roi, linear, device_roi=roi)
+            outputs = runtime.execute_dag_plan(host_roi, dag, device_roi=roi)
 
         self.assertTrue(runtime.supports_resident_roi)
         self.assertEqual(output.shape, (4, 5))
@@ -824,6 +827,20 @@ class DetectorNativeRoutingTests(unittest.TestCase):
         self.assertFalse(result["execution"]["gpu_active"])
         self.assertEqual(result["execution"]["preprocess_capability"]["route"], "fallback")
         self.assertIn("injected native plan failure", result["execution"]["fallback_reason"])
+
+    def test_native_plan_failure_restarts_on_cpu_from_resident_tile_view(self):
+        source = np.random.default_rng(401).integers(0, 256, (72, 96, 3), dtype=np.uint8)
+        tile_view = source[4:68, 7:87]
+        self.assertFalse(tile_view.flags.c_contiguous)
+        before = source.copy()
+        reference = Detector401(params=self._params()).run(tile_view.copy())
+        runtime = _FailingNativePlanRuntimeStub()
+        result = Detector401(params=self._params(), use_gpu=True, gpu_runtime=runtime).run(tile_view)
+
+        self.assertEqual(runtime.calls, 1)
+        self.assertEqual(result["defects"], reference["defects"])
+        self.assertEqual(result["pass"], reference["pass"])
+        np.testing.assert_array_equal(source, before)
 
 
 class DetectorFusedRoutingTests(unittest.TestCase):

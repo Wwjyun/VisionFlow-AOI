@@ -75,12 +75,22 @@ class TileInspector:
         timings = []
         debug_images: dict = {}
         preprocess_cache = TilePreprocessCache(tile.image)
+        cpu_tile_image = None
+        cpu_preprocess_cache = None
         for detector in detectors:
+            detector_image = tile.image
+            detector_cache = preprocess_cache
+            if tile.device_roi is not None and not detector.gpu_active:
+                if cpu_tile_image is None:
+                    cpu_tile_image = tile.image.copy()
+                    cpu_preprocess_cache = TilePreprocessCache(cpu_tile_image)
+                detector_image = cpu_tile_image
+                detector_cache = cpu_preprocess_cache
             started = time.perf_counter()
             detector_result = detector.run(
-                tile.image,
-                device_roi=tile.device_roi,
-                preprocess_cache=preprocess_cache,
+                detector_image,
+                device_roi=tile.device_roi if detector.gpu_active else None,
+                preprocess_cache=detector_cache,
             )
             detector_results.append(map_tile_result_to_global(tile, detector_result))
             stages = detector_result.get("execution", {}).get("performance", {}).get("stages_sec", {})

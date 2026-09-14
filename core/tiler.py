@@ -37,8 +37,19 @@ class Tile:
     device_roi: object | None = None
 
 
-def _iter_cropped_tiles(image, tiles: Iterator[Tile], gpu_runtime=None, crop_workers: int | str = "auto") -> Iterator[Tile]:
-    """Crop independent CPU ROIs concurrently while yielding tiles in source order."""
+def _iter_cropped_tiles(
+    image, tiles: Iterator[Tile], gpu_runtime=None, crop_workers: int | str = "auto",
+    resident_image=None,
+) -> Iterator[Tile]:
+    """Keep resident GPU ROIs as CPU views; copy only ordinary CPU tiles."""
+    if resident_image is not None:
+        for tile in tiles:
+            yield replace(
+                tile,
+                image=image[tile.y:tile.y + tile.height, tile.x:tile.x + tile.width],
+            )
+        return
+
     def crop(tile: Tile) -> Tile:
         return replace(
             tile,
@@ -550,6 +561,7 @@ class Tiler:
         yield from _iter_cropped_tiles(
             image, tile_specs(), self.gpu_runtime,
             1 if self.resident_image is not None else self.crop_workers,
+            self.resident_image,
         )
         self.last_profile_ms = {
             "template_match_ms": 0.0,
@@ -620,6 +632,7 @@ class Tiler:
             yield from _iter_cropped_tiles(
                 image, tile_specs(), self.gpu_runtime,
                 1 if self.resident_image is not None else self.crop_workers,
+                self.resident_image,
             )
         finally:
             self.last_profile_ms = {

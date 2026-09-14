@@ -12,6 +12,7 @@ import numpy as np
 
 from core.tiler import create_tiler
 import core.tiler as tiler_module
+from core.gpu_runtime import GpuResidentImage
 
 
 class CpuParallelCropTests(unittest.TestCase):
@@ -107,9 +108,17 @@ class CpuParallelCropTests(unittest.TestCase):
             }
             serial = list(create_tiler(config, crop_workers=1).iter_tiles(image))
             parallel = list(create_tiler(config, crop_workers=4).iter_tiles(image))
+            resident = GpuResidentImage(object(), 1, image.shape[1], image.shape[0], 3)
+            resident_tiles = list(create_tiler(config, resident_image=resident).iter_tiles(image))
         self.assertEqual((parallel[0].x, parallel[0].y), (35, 26))
         self.assertEqual((parallel[1].x, parallel[1].y), (53, 26))
         self.assert_same_tiles(serial, parallel)
+        self.assertEqual(len(resident_tiles), len(serial))
+        for expected, tile in zip(serial, resident_tiles):
+            self.assertEqual((tile.x, tile.y, tile.width, tile.height),
+                             (expected.x, expected.y, expected.width, expected.height))
+            self.assertTrue(np.shares_memory(image, tile.image))
+            np.testing.assert_array_equal(tile.image, expected.image)
 
     def test_contour_crops_preserve_accepted_order_and_metadata(self):
         config = {"mode": "contour", "shapes": {"crop_padding": 3}}
@@ -153,6 +162,20 @@ class CpuParallelCropTests(unittest.TestCase):
         self.assertGreater(len(tiles), 1)
         self.assertEqual(runtime.crop.call_count, len(tiles))
         executor.assert_not_called()
+
+    def test_resident_grid_tiles_keep_cpu_views_for_fallback_and_reporting(self):
+        resident = GpuResidentImage(object(), 1, self.image.shape[1], self.image.shape[0], 3)
+        config = {"mode": "grid", "width": 43, "height": 38, "overlap_x": 5, "overlap_y": 4}
+        reference = list(create_tiler(config, crop_workers=1).iter_tiles(self.image))
+        with mock.patch("core.tiler._crop_image", side_effect=AssertionError("unexpected CPU copy")):
+            tiles = list(create_tiler(config, resident_image=resident).iter_tiles(self.image))
+        for expected, tile in zip(reference, tiles):
+            self.assertEqual((tile.x, tile.y, tile.width, tile.height),
+                             (expected.x, expected.y, expected.width, expected.height))
+            self.assertTrue(np.shares_memory(self.image, tile.image))
+            np.testing.assert_array_equal(tile.image, expected.image)
+            self.assertEqual((tile.device_roi.x, tile.device_roi.y), (tile.x, tile.y))
+        self.assertEqual(len(tiles), len(reference))
 
 
 if __name__ == "__main__":

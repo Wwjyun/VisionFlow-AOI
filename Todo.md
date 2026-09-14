@@ -157,11 +157,11 @@
 - [x] 使用 bounded 單一 GPU queue，避免多個 CPU workers 同時搶 GPU 或無限制累積 VRAM。
 - [ ] 評估 pinned host memory 與 CUDA streams，量測 upload/kernel/download 重疊收益。
 
-### 大圖 GPU ROI 直通 Detector（2026-09-14 規劃，尚未實作）
+### 大圖 GPU ROI 直通 Detector（2026-09-14 開始實作）
 
-- [ ] 保持 PNG／JPEG 等圖片由 CPU 讀檔與 OpenCV 解碼成 BGR；啟用原生 GPU Detector 的 grid 路徑在解碼後整圖只做一次 H2D upload，tile 只保存 resident image 的 ROI 座標／尺寸，Detector 由 GPU 內部 D2D staging 接續 CUDA plan，不逐 tile 下載 BGR，也不逐 tile 重傳原圖。非 grid 定位（例如 contour／pattern match）仍依其 CPU 定位語意另行評估。
-- [ ] GPU 路徑不要在切圖階段預先產生所有 CPU tile 副本；同步調整 Tile、Detector／PreprocessPlan 的輸入與能力檢查，以 ROI 的 shape／dtype／channels metadata 驗證，避免 `np.ascontiguousarray` 對非連續 CPU view 偷做等量複製。確認 GPU plan、ROI inset、generation／bounds 及 batch／monitor 共用 session 均維持正確生命週期。
-- [ ] CPU Detector、GPU 不可用或 plan/kernel/OOM 失敗時，才由保留的 CPU 原圖按 ROI 取得像素並依既有政策重跑完整 Detector；`gpu.mode=cpu/auto/cuda`、舊 DLL、strict CUDA、混用 CPU/GPU Detector 的路由與 fallback 訊息必須維持一致，不能用部分 GPU 中間結果接續 CPU。
+- [x] PNG／JPEG 等圖片保持 CPU 讀檔／OpenCV BGR 解碼；啟用原生 GPU Detector 的 grid／Template Anchor Grid 路徑在切 tile 前整圖只做一次 H2D upload，tile 以 resident device ROI 執行 D2D staging 與 CUDA plan，不逐 tile 下載 BGR 或重傳原圖；tile 同時保留不複製像素的 CPU 原圖 view 供 shape、fallback 與報表。非 grid 定位（例如 contour／pattern match）仍依其 CPU 定位語意另行評估。
+- [x] GPU resident tile 不再預製所有 CPU tile 副本；PreprocessPlan／native linear 與 DAG 能力查詢及 device ROI 執行可用非連續 NumPy view 的 shape／dtype／channels 驗證，避免 `np.ascontiguousarray` 偷做等量複製。ROI inset、generation／bounds 與 batch／monitor 共用 session 沿用既有生命週期。
+- [x] 混用 CPU Detector 時才按需建立獨立 CPU tile 副本供該 tile 的 CPU Detectors 共用；GPU 執行失敗時依既有政策從原圖 view 重跑完整 Detector。保留 `gpu.mode=cpu/auto/cuda`、舊 DLL 與 strict CUDA 路由，不混用部分 GPU 中間結果與 CPU 後續步驟。
 - [ ] Overlay、NG tile／sidecar、debug 與 GUI 預覽所需的 CPU 像素按需取得；401 等目前仍需 CPU `findContours`／幾何判定的 Detector 只下載必要的 binary mask，檢查 PASS/NG、tile 順序／座標、defect bbox／area／confidence／metadata、輸出內容與 CPU 基準等價。
 - [ ] 用同一批真實 16384×13000 圖、約六個 2300×12000 ROI 及正式 Recipe／輸出設定，在 RTX 3090 比較修改前後 cold、warm median／P95、image load、整圖 H2D、tile 建立、Detector、D2D／必要 D2H、Reporter、端到端耗時、RAM／VRAM 峰值與 100 次穩定性；未證明整體收益與完整等價前保持 production 預設不變。2026-09-14 合成尺寸基準：BGR 原圖約 609.4 MiB，六張 CPU tile 副本約 473.8 MiB，CPU 裁切 warm median 128.6 ms，整圖 H2D 85.0 ms，ROI descriptor 建立約 0.03 ms；預期省的是 CPU 副本及其約 129 ms 複製，不包含既有 H2D，端到端百分比須以目前每張總耗時為分母實測。
 
@@ -394,6 +394,7 @@
 
 ## 完成紀錄
 
+- [x] 2026-09-14：啟用 resident GPU ROI 時，grid／Template Anchor Grid tile 改為 CPU 原圖零複製 view，原生 linear／DAG plan 的 capability 與 ROI 執行不再對非連續 view 做 `ascontiguousarray`；混用 CPU Detector 時才按需複製獨立 CPU tile。RTX 3090 的 16384×13000 合成 BGR／六個 2300×12000 ROI 基準，六張 CPU tile 複製 warm median 148.5→resident view 0.1 ms，整圖 H2D 78.2 ms，單張大 ROI native Gray plan 額外 H2D 為零；4K 合成圖交錯 A/B 的 GPU Pipeline warm median 296→268 ms（約 9.5%），tile 階段 15.3→0.6 ms，PASS/NG、Tile 與 defect count 相同。1K 合成圖 CPU/GPU overlay 與九張 NG tile PNG 逐像素相同。完整 336 tests、compileall、CUDA preflight、RTX native C ABI smoke／validator（含 ROI batch 8/16/32/64 與 10/100 stress）、strict GPU CLI 預期 NG exit 2、diff check 均通過。此為合成資料與局部執行證據，完整產線 Recipe／真圖等價、端到端收益及長時間穩定性仍待驗收，production 預設未變。
 - [x] 2026-09-14：新增 Claude Code 外部模型程式碼委派 MCP：`.claude/mcp/llm_delegate_server.py` 為僅用 Python 標準函式庫的 stdio MCP server，由 `.mcp.json` 註冊，提供 `list_providers`、`delegate_code`、`apply_proposal`；支援 DeepSeek（預設 `deepseek-flash`）、GLM、Qwen 的 OpenAI-compatible API，API key 只從環境變數讀取且不回傳。遠端模型無工具權限，只收到明確列出的 repo 檔案，回傳 SEARCH/REPLACE 提案、unified diff、比對問題與 TTFT／tokens/s 計時；套用前重新比對、任一區塊失配則完全不寫入，並拒絕 repo 外、`.git`、`env` 等路徑。本機假 API smoke 覆蓋 MCP 握手、串流解析、diff 預覽、原子套用、過期提案拒絕與路徑限制；實際 DeepSeek 以合成 3 行範例（不含 repo 程式碼）測得 `deepseek-flash` TTFT 0.80 s、總時間 3.76 s、約 302 output tokens/s。未修改 runtime、Detector、Recipe、GUI、CUDA source／header／ABI／DLL。
 - [x] 2026-09-14：建立 Claude Code 開發環境設定；新增 `CLAUDE.md` 以 `@AGENT.md` 載入既有規範並補充 Claude Code 操作注意事項，將 `codex-skills/` 五個 skills 複製為 `.claude/skills/` 專案 skills（`aoi-release` 發布腳本路徑改指 `.claude/skills/`，不含 Codex 專用 `agents/openai.yaml`），新增 `.claude/agents/aoi-coder.md` 實作用 subagent，限制其不得 commit／push／修改 `Todo.md` 或 CUDA ABI。僅新增開發工具設定與文件，未修改 runtime、Detector、Recipe、GUI、CUDA source／header／ABI／DLL。
 - [x] 2026-09-14：完成大圖 GPU ROI 直通 Detector 的現況盤點、RTX 3090 合成尺寸量測與實作／驗收規劃，新增 P4 未完成項目；確認現有原生 GPU grid 路徑已整圖一次 H2D、device ROI 額外 H2D 為零，但仍預製 CPU tile，binary mask 仍依 Detector 需求 D2H。16384×13000、六個 2300×12000 ROI 的 CPU tile 複製 warm median 128.6 ms，整圖上傳 85.0 ms，約 473.8 MiB CPU 副本可望省去；此為切圖階段上限估算，尚未修改 runtime／Detector／CUDA、未驗證產線端到端加速。
