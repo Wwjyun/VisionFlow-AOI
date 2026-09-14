@@ -399,8 +399,18 @@ float32 累加、OpenCV 的 kernel 係數）與 `vf_gaussian_blur_f32_roi`，並
    標籤的順序」。另外由 OpenCV 原始碼確認該掃描是**逐欄成對**（`c` 每次前進 2、同時寫入
    `img_labels_row[c]` 與 `[c+1]`），且首列／末列／單列各有 GRAPHGEN 產生的專屬 goto-DAG
    （`ccl_bolelli_forest_{singleline,firstline,lastline,}.inc.hpp`）。
-   **忠實移植的成本與風險都高**（goto-DAG 狀態機、3 個森林檔、須與 cv2 逐位元比對），
-   因此本輪不進行；目前可用且已完全等價的黃金標準是 **4 連通**。
+3. **缺口再收窄：單列與單行完全相符，只有多列才不符。** 1×N（N=1…33）與 N×1 各 25 個
+   寬度×密度×seed 組合**全部 500 個案例相符**；多列才出現差異。這證明了缺口的來源**不是**
+   「合併產生暫時標籤」也不是配號規則，而是**多列掃描期間 provisional 標籤的建立順序**。
+4. **偏離幅度有界（實測，`tools/cc_label_order_bound.py`）**：以「每個 component 的 raster 首像素
+   排序名次」對照 cv2 的標籤，**4 連通在所有 30 個 shape×density 案例（最大 400×600、29,339 個
+   component）的 `|delta|` 全部為 0**——即 4 連通的編號**就是** raster 順序；**8 連通最大 `|delta|`
+   達 91**（400×600 稀疏：17,262 個 component 中 16,875 個不在 raster 位置）。因此 8 連通的編號
+   不是「小幅擾動」，而是與 raster 順序大幅不同，必須忠實實作 Bolelli 掃描才能重現。
+   證據：`outputs_validation/cnr_profile/cc_label_order_bound.json`。
+   **忠實移植的成本與風險都高**（goto-DAG 狀態機、3 個森林檔、須與 cv2 逐位元比對）；
+   已取得的可讀來源為 YACCLAB 的 `labeling_bolelli_2019.h`（第一／第二輪掃描骨架）加上
+   4 個 GRAPHGEN 森林檔。目前可用且已完全等價的黃金標準是 **4 連通**。
 
 **標籤編號是否真的會影響 202 的最終輸出：會，已實測確認。** 新增 `tools/cnr_label_order_impact.py`：
 在一個會產生**精確 CNR 平手**的場景（49 個完全相同缺陷的規則網格；49 個候選、7 個相異 CNR、
@@ -749,6 +759,8 @@ vs 原本 `[255,255,20,20]`）。因此「標籤編號順序」對 202 的最終
 - [ ] 加速不得犧牲 GUI 回應、打包啟動、結果追溯、錯誤訊息或 CPU fallback。
 
 ## 完成紀錄
+
+- [x] 2026-09-15：把 connected components 的缺口量化到「偏離幅度有界」並確認 4 連通編號就是 raster 順序。新增 `tools/cc_label_order_bound.py`（正式證據工具）以「每個 component 的 raster 首像素排序名次」對照 cv2 標籤：**4 連通在全部 30 個 shape×density 案例的 `|delta|` 全部為 0**（含 400×600 的 29,339 個 component），即 **4 連通的編號就是 raster 順序**；**8 連通最大 `|delta|` 為 91**（400×600 稀疏：17,262 個 component 中 16,875 個不在 raster 位置、delta 範圍 [−91, +60]），因此 8 連通的編號**不是小幅擾動**，必須忠實實作 Bolelli 掃描才能重現。另新增 `tests/test_connected_components_envelope.py`（4 tests，全套 414 → 418 tests OK）把等價包絡規則化：4 連通在 10 種形狀（含 1×1、1×8、8×1、奇偶維度）× 3 密度 × 3 seed 共 90 個案例**逐位元斷言相等**；8 連通則斷言**component 集合（排序後的 bbox+area 多重集）在所有案例完全相同**，並量測編號差異（30 個案例中 7 個不同），附一個「避免因遮罩全空或全滿而誤過」的守門測試。另有多輪探針得到的關鍵事實：**1×N 與 N×1 各 25 個組合共 500 個案例全部相符**，只有多列才不符——證明缺口來源是「多列掃描期間 provisional 標籤的建立順序」，而非合併或配號規則。未修改產線程式。證據：`outputs_validation/cnr_profile/cc_label_order_bound.json`。
 
 - [x] 2026-09-15：把 connected components 8 連通缺口的剩餘不確定性再收窄到「只缺移植」，並翻新過時的說明文字。兩項新確認：（1）**OpenCV 的 8 連通編號在本機是跨執行緒數決定性的**——600×800 隨機遮罩（3733 個 component）在預設 16 執行緒下連續 5 次結果相同，且 `cv2.setNumThreads(1/2/4/8)` 與重設回 auto 的 label map 全部相同；因此差異**不是**平行分條造成的不可重現行為，而是可複製的決定性演算法，剩餘成本是「忠實移植」而非「本質上做不到」。（2）**確認 `flattenL` 的「最小 provisional 標籤名次」配號規則本身正確**：把該規則套用在以 pixel raster 順序建立的 provisional 標籤上仍與 cv2 不符（27 個 component 中 15 個不同），但差異結構證實了規則——對應關係是「同一段連續編號整體位移」（cv2 label 2→9、3→2、4→3…8→7），即**編號序列相同、只有 provisional 標籤的產生順序不同**。因此配號規則不必再研究，缺的只有 Bolelli 掃描建立 provisional 標籤的順序（逐欄成對、首列／末列／單列各有 GRAPHGEN 的 goto-DAG 森林檔）。同步翻新 `tools/connected_components_reference.py` 的模組說明與 Todo 缺口段落，移除「規則尚未確定」的過時措辭，改為精確描述（4 連通完全等價、8 連通只缺掃描順序），避免後續誤解缺口範圍。未修改產線程式；414 tests OK 不受影響。
 
