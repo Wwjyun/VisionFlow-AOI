@@ -39,10 +39,12 @@ plan，tile metadata 以 `cpu_crossover` 路線與 `preprocess_routes` 標示。
 以 RTX 3090 完成等價量測後才可接入產線；未接入者在 `execution.gpu.device_host_split` 中
 一律回報為 cpu。**接入與否以本節與 `Todo.md` 為準，不以 export 存在為準。**
 
-- `vf_match_template_gray_u8`（Template Anchor Grid 定位）：**已接入** `core/tiler.py`。
-  與 `cv2.matchTemplate` 的定位座標在 9 個場景 9/9 相同、分數差 ≤ 4.2e-7、逐次執行決定性。
-  形狀界線內（template 每邊 ≤ 128 px 且搜尋面積 ≥ 256×256）比 CPU 快 1.6～3.9 倍，
-  界線外或失敗時回 CPU 參考；界線見 `core/tiler.py` 的 `gpu_anchor_shapes_supported`。
+- `vf_match_template_gray_u8`（Template Anchor Grid 定位）：`core/tiler.py` 已有路由，但**完整
+  pipeline 中實際未生效**（2026-09-15 查證）：`core/pipeline.py` 在 resident 模式傳給 Tiler 的
+  `gpu_runtime` 是 `None`，anchor 一律走 CPU，詳見〈v1.6.0 發行版〉一節末與 `Todo.md` P0。
+  Tiler 層級量測：與 `cv2.matchTemplate` 的定位座標在 9 個場景 9/9 相同、分數差 ≤ 4.2e-7、
+  逐次執行決定性；形狀界線內（template 每邊 ≤ 128 px 且搜尋面積 ≥ 256×256）比 CPU 快
+  1.6～3.9 倍，界線外或失敗時回 CPU 參考；界線見 `core/tiler.py` 的 `gpu_anchor_shapes_supported`。
 - `vf_find_contours_u8` / `vf_find_contours_download`（輪廓抽取）：**正確且已改善，但尚未全面勝過 CPU，
   因此不接入產線**。與 `cv2.findContours(RETR_LIST/RETR_EXTERNAL,
   CHAIN_APPROX_SIMPLE)` 在 `tools/check_contour_equivalence.py` 的 **314 個案例全部逐點
@@ -136,8 +138,8 @@ RTX 3090、CUDA 13.3、Detector `202-CS-SN-1` 的優化前結果：
 結果為 NG、6/6 NG tiles、558 defects；3/3 次的 PASS/NG、defect 數、type、bbox、area、
 confidence 與判定相關 metadata 全部相同，這張合成圖的 residual diagnostics 也無漂移。
 
-目前資料路徑：CPU 解碼後將 638,976,000-byte BGR 原圖上傳一次；anchor localization、
-ROI 與 gray preprocess 使用 resident device image，但 candidate extraction、component/ring 統計、
+目前資料路徑：CPU 解碼後將 638,976,000-byte BGR 原圖上傳一次；ROI 與 gray preprocess 使用
+resident device image（原紀錄也列 anchor localization，經查證 anchor 實際在 CPU，見〈v1.6.0 發行版〉），但 candidate extraction、component/ring 統計、
 PASS/NG 與報表仍在 CPU。202 automatic CNR 尚未真正 resident：每次六個 ROI 又經
 `vf_gaussian_blur_f32` 上傳 576 MB／下載 576 MB，並經 `vf_cnr_mask_f32` 上傳 1,152 MB／
 下載 144 MB。因此每次 pipeline 除整圖一次上傳外，這兩個舊介面仍造成約 **1.73 GB H2D +
@@ -270,7 +272,7 @@ warm-up 1 輪＋量測 3 輪。單位 ms。縮排的「└」列是上一列的�
 | Recipe 設定 `recipe_setup` | 90.1 | 95.9 | 92.8 | 93.8 | 0.97× | CPU |
 | 初始化 `initialization` | 0.1 | 0.1 | 199.3 | 200.1 | — | 推定含 CUDA 初始化與整圖上傳 |
 | Tiling 合計 `tiling` | 135.6 | 148.6 | 58.9 | 61.9 | 2.30× | 混合 |
-| └ Anchor 定位 `template_match` | 58.8 | 59.5 | 58.7 | 61.6 | 1.00× | CPU（超出 GPU 形狀界限） |
+| └ Anchor 定位 `template_match` | 58.8 | 59.5 | 58.7 | 61.6 | 1.00× | CPU（resident 模式未接上 GPU anchor，見本節末） |
 | └ ROI 產生 `roi_generation` | 77.3 | 89.1 | 0.17 | 0.24 | 444× | GPU |
 | Detector 合計 `detectors_total` | 5649.7 | 6183.5 | 859.2 | 942.8 | 6.58× | 混合 |
 | └ Gray 前處理 `preprocess` | 28.5 | 28.9 | 38.2 | 44.2 | 0.75× | GPU，並下載 gray |
@@ -332,11 +334,24 @@ flowchart TB
 
 灰色為 CPU／host、綠色為 GPU／device、黃色為 PCIe 上傳；虛線是下載回 host 的資料。
 
-**`device_host_split` 回報誤差（尚未修正，已列入 `Todo.md` P0）**：同一份 JSON 的
-`device_host_split.anchor_localization` 是 `device`，但 GPU 呼叫統計只有上表三個 export，
-沒有 `vf_match_template_gray_u8`，anchor 時間也與 CPU 相同。原因是
-`core/pipeline_stages.py` 只要 `resident_image is not None` 就把 anchor 標成 device，沒有依本次
-實際呼叫的 export 判斷。修正前，接手者判斷 anchor 位置請以 `gpu_metrics.functions` 為準。
+**GPU anchor 在 resident 模式沒有接上，且 `device_host_split` 誤報（尚未修正，已列入 `Todo.md` P0）**：
+同一份 JSON 的 `device_host_split.anchor_localization` 是 `device`，但 GPU 呼叫統計只有上表三個
+export，沒有 `vf_match_template_gray_u8`，anchor 時間也與 CPU 相同。這不是形狀界限造成的：
+基準的搜尋區 512×512、template 64×64，都在 `gpu_anchor_shapes_supported` 界限內。查證後有兩個問題：
+
+1. **接線錯誤**：`core/pipeline.py` 建立 Tiler 時傳入
+   `gpu_runtime=(gpu_runtime if tiling_gpu_requested and resident_image is None else None)`，
+   整圖已 resident 上傳時 Tiler 拿到 `None`；`core/tiler.py` 的 `_find_grid_anchor_on_device`
+   因 `runtime is None` 直接回傳，anchor 一律走 CPU。也就是 GPU anchor 在它唯一該生效的
+   resident 情境下永遠不會執行。`tests/test_tiler_anchor_backend.py` 直接建構 Tiler 並傳入
+   runtime，所以沒有測到 pipeline 這段接線。先前 anchor 1.6～3.9× 的 RTX 量測是 Tiler 層級的
+   benchmark，並非完整 pipeline。
+2. **回報錯誤**：`core/pipeline_stages.py` 只要 `resident_image is not None` 就把 anchor 標成 device，
+   沒有依本次實際呼叫的 export 判斷，因此把上面的問題遮住了。
+
+修正時需讓 resident 模式的 Tiler 取得同一個 runtime（不可因此多做 H2D），補 pipeline 層級測試證明
+`vf_match_template_gray_u8` 真的被呼叫、座標與 CPU 相同，並用本節命令重量 `template_match`。
+修正前，接手者判斷 anchor 位置請以 `gpu_metrics.functions` 為準。
 
 ## 檔案
 

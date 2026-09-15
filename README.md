@@ -20,6 +20,8 @@ VisionFlow AOI 不只是單一 Detector 範例，而是一套可實際延伸的�
 - 打包版非互動 smoke，涵蓋 bundled Recipe／MainWindow、CPU-only、缺少 DLL 時的安全 fallback、strict CUDA 失敗，以及 bundled YOLOX registry／ONNX Runtime CPU 推論。
 - 可選 CUDA DLL、CPU fallback、效能觀測及 CPU/GPU 前處理抽象層。
 
+最新發行版為 [v1.6.0](https://github.com/wjcudalearning/VisionFlow/releases/tag/v1.6.0)（CUDA-enabled Windows x64，`sm_86`）。新 GPU mode 在解碼後只整圖上傳一次，ROI、前處理與 `202-CS-SN-1` automatic CNR 直接在 GPU 執行；RTX 3090 正式尺寸合成圖（16384×13000、6 個高 12000×寬 2000 ROI）端到端 CPU 6792.8 ms、GPU 2011.1 ms（median，**3.38×**），3/3 輪判定欄位完全一致，詳見〈[新 GPU mode 效能（v1.6.0）](#新-gpu-mode-效能v160)〉。
+
 目前 CUDA DLL 已在 RTX 3090 完成既有 ABI／plan／runtime 驗證並用於 CUDA-enabled 發行包；仍待完成的重點包括：建立正式標註資料集、五份 production recipes 的完整 CPU/GPU 等價驗收、後續 CUDA 原始碼變更的 RTX 3090 重編與實測、長時間穩定度與可信效能 baseline，以及有 GPU 的打包版驗收。詳細進度以 [`Todo.md`](Todo.md) 為準，release notes、技術報告與打包說明則集中在 [`docs/`](docs/) 文件索引。
 
 ## 設計目標
@@ -475,7 +477,7 @@ Recipe Designer 會依共同 parameter schema 將每個 Detector 參數分成兩
 - 檔案：`detectors/detector_202_1.py`
 - 參考實作：[Wwjyun/AcceptanceChecker `DefectDetector`](https://github.com/Wwjyun/AcceptanceChecker/blob/117fce477744188b97659a035b031fe3bf874260/acceptance_checker/core/detector.py)
 - 用途：以大範圍 Gaussian blur 估背景，計算原灰階與背景的 residual，再以 MAD 估 robust noise sigma；預設使用 `max(8, 3 × sigma)` 建立異常 mask，執行 `3 × 3` Morphology Open 一次後套用中心／四邊屏蔽，最後用 8-connectivity connected components 取得候選。Gaussian 固定／自動核心、Sigma、MAD 倍率、sigma floor、residual 門檻、候選遮罩值、形態學及連通性皆可在管理模式調整。
-- CNR：每個 component 的缺陷平均值與周圍背景 ring 平均值之差，除以 ring 的灰階標準差；候選依 CNR 由高到低輸出，抓到任一候選即為 NG。
+- CNR：每個 component 的缺陷平均值與周圍背景 ring 平均值之差，除以 ring 的灰階標準差；候選依 CNR 由高到低輸出，CNR 完全相同時依 bbox 的 y、x 由小到大排序（與 connected components 的標籤編號無關），抓到任一候選即為 NG。
 - 自動面積：預設最小值為 `max(5, int(0.000001 × H × W))`，最大值為 `int(0.05 × H × W)`；工程模式可調固定像素值與影像面積比例。候選邊界距離、局部背景 Ring 外擴範圍／倍率也屬尺寸外參。
 - 屏蔽：中心半寬 `100`／半高 `630`，並使用共同 `0`、左 `15`、右 `26`、上 `50`、下 `20` 邊緣內縮；排除像素不產生候選，也不納入局部背景 ring。
 - 關閉屏蔽時，候選 mask、MAD、sigma、門檻、bbox、面積、CNR 與排序均與參考 commit 的自動 CNR 實作一致。
@@ -747,11 +749,54 @@ detectors:
 - Grid／Template Anchor Grid 啟用原生 GPU Detector 且 DLL 支援 resident ROI 時，圖片先在 CPU 讀檔並解碼為 BGR，再整張上傳 GPU 一次。Tile 以 device ROI 座標交給 CUDA plan，CPU 原圖僅保留不複製的 ROI view 供形狀檢查、GPU 失敗後的 CPU fallback 與 NG tile 輸出；混用 CPU Detector 時才按需建立獨立 CPU tile 副本。GPU plan 不會為非連續 CPU view 額外建立連續副本。部分 Detector 仍需下載 binary mask 在 CPU 執行 contours／幾何判定；CPU-only、舊 DLL 與非 grid 模式維持原有路徑。
 - 在 `gpu.mode: auto` 且啟用 CPU fallback 時，若該 Recipe 與該影像尺寸上每個支援 CUDA 的 Detector plan 都在本機實測 CPU 較快，之後相同 Recipe 與尺寸的圖片會整張略過 resident 上傳（完全不發生像素 H2D），直接執行已量測的 CPU 路徑；結果 JSON 以 `execution.gpu.resident_image.skipped_by_crossover` 回報。strict `gpu.mode: cuda` 永不走此路徑。
 - 舊版 DLL 缺少新 exports 時仍保留既有路徑或 CPU fallback。
-- Template Anchor Grid 定位在形狀界線內由 GPU 執行：template 每邊不超過 128 px 且搜尋面積達 256×256 時，走 resident image 上的 CUDA 定位（RTX 3090 實測比 CPU 快 1.6～3.9 倍，座標與 `matchTemplate` 相符、分數差 ≤ 4.2e-7）；界外或不支援時一律回 CPU 參考實作。
-- 202-CS-SN-1 的 CNR 背景 Gaussian 與 residual 統計（兩個 median／MAD、門檻、候選遮罩）在 CUDA 路徑下由 GPU 執行。**median 與 `np.median` 逐位元相同**；residual 統計（`vf_cnr_mask_f32`）的 median／MAD／門檻／遮罩也**全部精確相同**（623 個案例零不符），因此不再需要把 `residual` 與其絕對偏差各自上傳一次。**Gaussian 背景為數學等價、非逐位元相同**（device 加法順序不同），因此 `mad`、`residual_median`、`residual_threshold`、`robust_noise_sigma` 這四個診斷值會有約 1e-5 的尾位差異，其餘 metadata 與 PASS/NG、缺陷數、bbox、area、confidence 全部相同，候選遮罩亦逐位元相同（47 個場景 47/47）。每次執行的缺陷 metadata 會以 `background_backend`（`opencv_cpu`／`cuda_f32`）、`residual_backend`（`numpy_cpu`／`cuda_f32`）與 `background_precision_note` 明確標示該次用的是哪條路徑；需要逐位元可重現時請用 `gpu.mode: cpu`。
+- Template Anchor Grid 定位在形狀界線內由 GPU 執行：template 每邊不超過 128 px 且搜尋面積達 256×256 時，走 resident image 上的 CUDA 定位（RTX 3090 實測比 CPU 快 1.6～3.9 倍，座標與 `matchTemplate` 相符、分數差 ≤ 4.2e-7）；界外或不支援時一律回 CPU 參考實作。**已知問題（v1.6.0）**：`core/pipeline.py` 在整圖已 resident 上傳時傳給 Tiler 的 `gpu_runtime` 為 `None`，使 GPU anchor 在 pipeline 中實際不會執行，一律走 CPU 參考實作（結果正確，只是未加速）；同時 `execution.gpu.device_host_split.anchor_localization` 仍會回報 `device`。兩者皆列於 `Todo.md` P0，修正前請以 `execution.gpu` 呼叫統計是否含 `vf_match_template_gray_u8` 判斷。
+- 202-CS-SN-1 有 resident ROI 且未開啟 debug 影像時，優先使用 `vf_cnr_mask_u8_roi`：直接讀取已上傳的原圖 ROI，在 GPU 完成 BGR→gray、float32 Gaussian、residual、median／MAD、門檻與候選遮罩，只下載遮罩與三個診斷純量，metadata 標示為 `cuda_resident_fused`。它與既有 GPU chain 逐位元相同（15/15），候選遮罩與 CPU 相同（15/15）；舊 DLL、缺少 export、呼叫失敗或 debug 模式會改走下述既有路徑。connected components 與 ring CNR 仍在 CPU（GPU CCL 原型端到端僅快 0.4% 且傳輸量更大，已撤回）。
+- 202-CS-SN-1 的既有 CUDA 路徑中，CNR 背景 Gaussian 與 residual 統計（兩個 median／MAD、門檻、候選遮罩）由 GPU 執行。**median 與 `np.median` 逐位元相同**；residual 統計（`vf_cnr_mask_f32`）的 median／MAD／門檻／遮罩也**全部精確相同**（623 個案例零不符），因此不再需要把 `residual` 與其絕對偏差各自上傳一次。**Gaussian 背景為數學等價、非逐位元相同**（device 加法順序不同），因此 `mad`、`residual_median`、`residual_threshold`、`robust_noise_sigma` 這四個診斷值會有約 1e-5 的尾位差異，其餘 metadata 與 PASS/NG、缺陷數、bbox、area、confidence 全部相同，候選遮罩亦逐位元相同（47 個場景 47/47）。每次執行的缺陷 metadata 會以 `background_backend`（`opencv_cpu`／`cuda_f32`）、`residual_backend`（`numpy_cpu`／`cuda_f32`）與 `background_precision_note` 明確標示該次用的是哪條路徑；需要逐位元可重現時請用 `gpu.mode: cpu`。
 - GPU mode 統一為 `auto`、`cpu`、`cuda`：`auto` 依設定嘗試並可回退，`cpu` 不載入 CUDA，`cuda` 禁止隱性 CPU fallback；執行結果與 GUI 顯示的是實際 backend。
 
 目前 CUDA 原始碼包含 separable Gaussian、constant weights、64-bit integral Adaptive Mean Threshold、persistent context 與 grow-only buffers。這些功能仍需在目標 RTX 3090（`sm_86`）完成正式編譯、五份配方等價、效能、VRAM 與壓力驗收後，才能視為 production-ready 或預設啟用。
+
+### 新 GPU mode 效能（v1.6.0）
+
+以 v1.6.0 發行 DLL 在 RTX 3090 執行正式尺寸基準：16384×13000 合成圖、一列 6 個高 12000×寬 2000 ROI、Detector `202-CS-SN-1`，warm-up 1 輪＋量測 3 輪。
+
+```powershell
+.\env\Scripts\python.exe tools\benchmark_pipeline_production.py --profile production --warmup 1 --repetitions 3 --json outputs_validation\release_v1.6.0\production_benchmark.json
+```
+
+| 階段 | CPU median／P95 (ms) | GPU median／P95 (ms) | 倍數 | GPU mode 實際位置 |
+|---|---:|---:|---:|---|
+| **端到端** | **6792.8／7174.1** | **2011.1／2023.4** | **3.38×** | 混合 |
+| 讀檔與解碼 | 767.5／857.1 | 767.9／794.9 | 1.00× | CPU |
+| Anchor 定位 | 58.8／59.5 | 58.7／61.6 | 1.00× | CPU（resident 模式未接上 GPU anchor，見上方已知問題） |
+| 6 個 ROI 產生 | 77.3／89.1 | 0.17／0.24 | 444× | GPU |
+| Detector 合計 | 5649.7／6183.5 | 859.2／942.8 | 6.58× | 混合 |
+| └ Gray 前處理 | 28.5／28.9 | 38.2／44.2 | 0.75× | GPU |
+| └ Automatic CNR mask | 5260.6／5794.7 | 477.0／529.8 | **11.03×** | GPU |
+| └ CCL＋ring CNR | 292.5／294.4 | 278.8／296.3 | 1.05× | CPU |
+| 彙整＋報告 | 1.2／1.3 | 1.2／1.7 | 1.04× | CPU |
+
+GPU mode 每輪只有 13 次 native call：整圖上傳 638.976 MB 一次，下載 6 張 gray（144 MB，供 CPU ring CNR）與 6 張候選遮罩（144 MB，供 CPU CCL）。3/3 輪 PASS/NG、defect 數、bbox、area、confidence 與判定 metadata 完全相同。
+
+```mermaid
+flowchart LR
+    A["讀檔與解碼<br/>CPU"] --> B["整圖上傳一次<br/>H2D 639 MB"]
+    B --> C["Anchor 定位<br/>CPU"]
+    C --> D["ROI 產生<br/>GPU"]
+    D --> E["Gray 前處理<br/>GPU"]
+    E --> F["Automatic CNR mask<br/>GPU"]
+    E -. "gray 144 MB" .-> G
+    F -. "mask 144 MB" .-> G["CCL ＋ ring CNR<br/>CPU"]
+    G --> H["判定、彙整、報告<br/>CPU"]
+    classDef host fill:#F1EFE8,stroke:#5F5E5A,color:#2C2C2A
+    classDef device fill:#E1F5EE,stroke:#0F6E56,color:#04342C
+    classDef xfer fill:#FAEEDA,stroke:#854F0B,color:#412402
+    class A,C,G,H host
+    class D,E,F device
+    class B xfer
+```
+
+CPU mode 同一流程全部在 CPU 執行、不載入 CUDA。這組數字來自合成影像，只代表此幾何與 Detector；真實產線影像仍需另行驗收。完整 13 個階段、傳輸量明細、CPU／GPU 兩種 mode 流程圖、未採用方案與後續優化排序見 [`gpu/README.md`](gpu/README.md#2026-09-15-v160-發行版全流程各階段對照與兩種-mode-流程)。
 
 ### RTX 3090 編譯與驗證
 
