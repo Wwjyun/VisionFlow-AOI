@@ -195,6 +195,17 @@ int main() {
         result = vf_roi_batch_download_u8(roi_batch, 1, downloaded_roi.data(), 4 * 3, 3);
     }
     int batch_destroy_result = vf_roi_batch_destroy(roi_batch);
+    std::vector<uint8_t> resident_cnr_mask(width * height, 0);
+    float resident_cnr_median = 0.0f;
+    float resident_cnr_mad = 0.0f;
+    double resident_cnr_threshold = 0.0;
+    if (result == VF_CUDA_OK) {
+        result = vf_cnr_mask_u8_roi(
+            context, resident_generation, 0, 0, width, height,
+            3, 0.0, 3.0, 8.0, 0.000001, 1.4826, 255,
+            &resident_cnr_median, &resident_cnr_mad, &resident_cnr_threshold,
+            resident_cnr_mask.data(), static_cast<long long>(resident_cnr_mask.size()));
+    }
     // A real device OOM must not leave a stale error for the next ROI batch.
     const int oom_side = 4096;
     std::vector<uint8_t> oom_source(static_cast<size_t>(oom_side) * oom_side, 7);

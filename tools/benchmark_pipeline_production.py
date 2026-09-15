@@ -3,7 +3,7 @@
 The RTX 3090 evidence gathered so far is either per-operator (median, Gaussian,
 anchor) or a single synthetic ROI.  This tool exercises the **whole pipeline** -
 recipe load, whole-image H2D, tiling, detector, aggregation, reporting - at the
-production 202-CS-SN-1 shape: a large canvas carrying six 2000x12000 ROIs, which is
+production 202-CS-SN-1 shape: a 16384x13000 canvas carrying six 12000h x 2000w ROIs, which is
 the configuration the Todo records as the CPU bottleneck (CPU detector ~4.9 s).
 
 It reports, for one image and one recipe:
@@ -23,6 +23,8 @@ from __future__ import annotations
 import argparse
 import copy
 import json
+import math
+import statistics
 import sys
 import tempfile
 import time
@@ -35,21 +37,21 @@ import yaml
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from core.pipeline import AOIPipeline  # noqa: E402
+from core.gpu_session import GpuExecutionSession  # noqa: E402
 from core.recipe_manager import RecipeManager  # noqa: E402
 
 ROOT = Path(__file__).resolve().parent.parent
 
 CANVAS = (4000, 6000)  # (width, height) = 2 ROI widths x 3 ROI heights
 ROI = (2000, 2000)  # (height, width)
-# Production geometry recorded in Todo.md: six 2000x12000 ROIs (height x width), which
-# is the shape the CPU detector was measured at ~4.9 s.  Two columns of width 12000 and
-# three rows of height 2000 need a 24000x6000 canvas, i.e. 432 MB as BGR, so it is
-# opt-in via ``--profile production`` while the quick 2000x2000 geometry is the default.
-# Note the shape matters: 2000x12000 and 12000x2000 have the same pixel count but very
-# different cache behaviour for a 51-pixel separable filter, so the orientation is part
-# of the measurement rather than an implementation detail.
-PRODUCTION_CANVAS = (24000, 6000)
-PRODUCTION_ROI = (2000, 12000)
+# User-confirmed production geometry: the source image is 16384w x 13000h and contains six
+# 12000h x 2000w inspection ROIs. A small synthetic anchor selects one row of six ROIs so the
+# benchmark exercises the same whole-image upload and device ROI path as production.
+PRODUCTION_CANVAS = (16384, 13000)
+PRODUCTION_ROI = (12000, 2000)
+PRODUCTION_ANCHOR = (128, 128)  # x, y
+PRODUCTION_BASE = (500, 500)  # x, y of the first ROI
+PRODUCTION_GAP_X = 100
 
 
 def _roi_origins(roi: tuple[int, int], columns: int, rows: int):
@@ -63,7 +65,10 @@ def _roi_origins(roi: tuple[int, int], columns: int, rows: int):
 # so the tool validates the *pipeline* path and the CPU/CUDA agreement at production-like
 # sizes.
 ROI_ORIGINS = _roi_origins(ROI, columns=2, rows=3)
-PRODUCTION_ROI_ORIGINS = _roi_origins(PRODUCTION_ROI, columns=2, rows=3)
+PRODUCTION_ROI_ORIGINS = [
+    (PRODUCTION_BASE[1], PRODUCTION_BASE[0] + col * (PRODUCTION_ROI[1] + PRODUCTION_GAP_X))
+    for col in range(6)
+]
 
 DETECTOR_ID = "202-CS-SN-1"
 DETECTOR_PARAMS = {
@@ -81,6 +86,7 @@ def _render_canvas(
     canvas: tuple[int, int] = CANVAS,
     roi: tuple[int, int] = ROI,
     roi_origins: list[tuple[int, int]] = ROI_ORIGINS,
+    template_path: Path | None = None,
 ) -> None:
     """Write the synthetic canvas without holding more than one plane at a time."""
 
@@ -125,14 +131,30 @@ def _render_canvas(
         bgr[y0 : y0 + roi_height, x0 : x0 + roi_width, 1] = local
         bgr[y0 : y0 + roi_height, x0 : x0 + roi_width, 2] = local
 
+    if template_path is not None:
+        marker_rng = np.random.default_rng(20260915)
+        marker = marker_rng.integers(0, 256, (64, 64), dtype=np.uint8)
+        marker = cv2.GaussianBlur(marker, (3, 3), 0)
+        marker_bgr = cv2.cvtColor(marker, cv2.COLOR_GRAY2BGR)
+        anchor_x, anchor_y = PRODUCTION_ANCHOR
+        bgr[anchor_y : anchor_y + 64, anchor_x : anchor_x + 64] = marker_bgr
+        template_path.parent.mkdir(parents=True, exist_ok=True)
+        if not cv2.imwrite(str(template_path), marker_bgr):
+            raise SystemExit(f"failed to write {template_path}")
+
     canvas_path.parent.mkdir(parents=True, exist_ok=True)
-    if not cv2.imwrite(str(canvas_path), bgr, [cv2.IMWRITE_PNG_COMPRESSION, 1]):
+    write_params = [cv2.IMWRITE_PNG_COMPRESSION, 1] if canvas_path.suffix.lower() == ".png" else []
+    if not cv2.imwrite(str(canvas_path), bgr, write_params):
         raise SystemExit(f"failed to write {canvas_path}")
     del bgr
 
 
 def _recipe(
-    base: dict, dll_path: str, use_gpu: bool, roi: tuple[int, int] = ROI
+    base: dict,
+    dll_path: str,
+    use_gpu: bool,
+    roi: tuple[int, int] = ROI,
+    template_path: Path | None = None,
 ) -> dict:
     recipe = copy.deepcopy(base)
     recipe["gpu"] = {
@@ -153,16 +175,37 @@ def _recipe(
         "params": dict(DETECTOR_PARAMS),
     }
     # A grid whose cell is exactly one ROI yields exactly the intended tiles.
-    recipe["tile"] = {
-        "mode": "grid",
-        "width": roi[1],
-        "height": roi[0],
-        "overlap_x": 0,
-        "overlap_y": 0,
-    }
+    if template_path is None:
+        recipe["tile"] = {
+            "mode": "grid",
+            "width": roi[1],
+            "height": roi[0],
+            "overlap_x": 0,
+            "overlap_y": 0,
+        }
+    else:
+        recipe["tile"] = {
+            "mode": "grid",
+            "template_path": str(template_path.resolve()),
+            "search_x": 0,
+            "search_y": 0,
+            "search_w": 512,
+            "search_h": 512,
+            "match_threshold": 0.999,
+            "offset_x": PRODUCTION_BASE[0] - PRODUCTION_ANCHOR[0],
+            "offset_y": PRODUCTION_BASE[1] - PRODUCTION_ANCHOR[1],
+            "rows": 1,
+            "cols": 6,
+            "roi_w": roi[1],
+            "roi_h": roi[0],
+            "gap_x": PRODUCTION_GAP_X,
+            "gap_y": 0,
+        }
     recipe["output"] = {
         key: False
-        for key in ("save_overlay", "save_csv", "save_json", "save_ng_tiles")
+        for key in (
+            "save_overlay", "save_csv", "save_matrix_csv", "save_json", "save_ng_tiles"
+        )
     }
     return recipe
 
@@ -259,10 +302,73 @@ def _compare(cpu_result: dict, gpu_result: dict) -> dict:
     }
 
 
-def _run(recipe_path: Path, image: Path, output_dir: Path):
-    started = time.perf_counter()
-    result = AOIPipeline(recipe_path, output_dir).run(image)
-    return (time.perf_counter() - started) * 1000.0, result
+def _timing_summary(samples: list[float]) -> dict:
+    ordered = sorted(float(value) for value in samples)
+    p95_index = max(0, math.ceil(0.95 * len(ordered)) - 1)
+    return {
+        "count": len(ordered),
+        "median_ms": statistics.median(ordered),
+        "p95_ms": ordered[p95_index],
+        "min_ms": ordered[0],
+        "max_ms": ordered[-1],
+    }
+
+
+def _stage_values(results: list[dict], detector: bool = False) -> dict[str, list[float]]:
+    collected: dict[str, list[float]] = {}
+    for result in results:
+        performance = result.get("execution", {}).get("performance", {})
+        if detector:
+            rows = {
+                f"{detector_id}.{stage}": seconds * 1000.0
+                for detector_id, stages in performance.get("detector_stages_sec", {}).items()
+                for stage, seconds in stages.items()
+            }
+        else:
+            rows = {
+                stage: seconds * 1000.0
+                for stage, seconds in performance.get("stages_sec", {}).items()
+            }
+        for name, milliseconds in rows.items():
+            collected.setdefault(name, []).append(float(milliseconds))
+    return collected
+
+
+def _run_repeated(
+    cpu_path: Path,
+    gpu_path: Path,
+    image: Path,
+    work: Path,
+    warmup: int,
+    repetitions: int,
+) -> tuple[list[float], list[dict], list[float], list[dict]]:
+    cpu_pipeline = AOIPipeline(cpu_path, work / "cpu_out")
+    with GpuExecutionSession.from_recipe_path(gpu_path) as gpu_session:
+        gpu_pipeline = AOIPipeline(gpu_path, work / "gpu_out", gpu_session=gpu_session)
+        for _ in range(warmup):
+            cpu_pipeline.run(image)
+            gpu_pipeline.run(image)
+
+        cpu_times: list[float] = []
+        gpu_times: list[float] = []
+        cpu_results: list[dict] = []
+        gpu_results: list[dict] = []
+        for index in range(repetitions):
+            order = (("cpu", cpu_pipeline), ("gpu", gpu_pipeline))
+            if index % 2:
+                order = tuple(reversed(order))
+            pair = {}
+            for backend, pipeline in order:
+                started = time.perf_counter()
+                result = pipeline.run(image)
+                pair[backend] = ((time.perf_counter() - started) * 1000.0, result)
+            cpu_ms, cpu_result = pair["cpu"]
+            gpu_ms, gpu_result = pair["gpu"]
+            cpu_times.append(cpu_ms)
+            gpu_times.append(gpu_ms)
+            cpu_results.append(cpu_result)
+            gpu_results.append(gpu_result)
+    return cpu_times, cpu_results, gpu_times, gpu_results
 
 
 def main() -> int:
@@ -271,28 +377,35 @@ def main() -> int:
     parser.add_argument("--json", type=Path, default=None)
     parser.add_argument("--keep", action="store_true", help="keep the generated canvas")
     parser.add_argument("--work", type=Path, default=None)
+    parser.add_argument("--warmup", type=int, default=1, help="unmeasured CPU/GPU warm-up pairs")
+    parser.add_argument("--repetitions", type=int, default=3, help="measured CPU/GPU pairs")
     parser.add_argument(
         "--profile",
         choices=("quick", "production"),
         default="quick",
         help=(
             "quick: six 2000x2000 ROIs on a 4000x6000 canvas; "
-            "production: six 2000x12000 ROIs on a 6000x24000 canvas (the geometry "
-            "recorded in Todo.md), which needs ~432 MB for the canvas"
+            "production: six 12000h x 2000w ROIs on a 16384x13000 canvas, "
+            "which needs ~609 MiB for decoded BGR pixels"
         ),
     )
     args = parser.parse_args()
+    if args.warmup < 0 or args.repetitions <= 0:
+        parser.error("--warmup must be >= 0 and --repetitions must be > 0")
 
     work = args.work or Path(tempfile.mkdtemp(prefix="visionflow_production_"))
-    canvas = work / "production_canvas.png"
+    canvas = work / "production_canvas.bmp"
+    template_path = work / "production_anchor.png"
     if args.profile == "production":
         canvas_size, roi, roi_origins = (
             PRODUCTION_CANVAS,
             PRODUCTION_ROI,
             PRODUCTION_ROI_ORIGINS,
         )
+        selected_template = template_path
     else:
         canvas_size, roi, roi_origins = CANVAS, ROI, ROI_ORIGINS
+        selected_template = None
     print(
         f"profile: {args.profile}  canvas {canvas_size[0]}x{canvas_size[1]} (w x h), "
         f"{len(roi_origins)} ROIs {roi[0]}h x {roi[1]}w"
@@ -300,7 +413,11 @@ def main() -> int:
     if not canvas.is_file() or not args.keep:
         started = time.perf_counter()
         _render_canvas(
-            canvas, canvas=canvas_size, roi=roi, roi_origins=roi_origins
+            canvas,
+            canvas=canvas_size,
+            roi=roi,
+            roi_origins=roi_origins,
+            template_path=selected_template,
         )
         print(
             f"wrote {canvas} ({canvas.stat().st_size / 1e6:.1f} MB) in "
@@ -308,33 +425,58 @@ def main() -> int:
         )
 
     base = RecipeManager().load(ROOT / "recipes" / "PRODUCT_A_AOI_01.yaml")
-    cpu_recipe = _recipe(base, args.dll, use_gpu=False, roi=roi)
-    gpu_recipe = _recipe(base, args.dll, use_gpu=True, roi=roi)
+    cpu_recipe = _recipe(
+        base, args.dll, use_gpu=False, roi=roi, template_path=selected_template
+    )
+    gpu_recipe = _recipe(
+        base, args.dll, use_gpu=True, roi=roi, template_path=selected_template
+    )
     cpu_path = work / "cpu.yaml"
     gpu_path = work / "gpu.yaml"
     cpu_path.write_text(yaml.safe_dump(cpu_recipe, allow_unicode=True, sort_keys=False), encoding="utf-8")
     gpu_path.write_text(yaml.safe_dump(gpu_recipe, allow_unicode=True, sort_keys=False), encoding="utf-8")
 
-    cpu_ms, cpu_result = _run(cpu_path, canvas, work / "cpu_out")
-    gpu_ms, gpu_result = _run(gpu_path, canvas, work / "gpu_out")
+    cpu_times, cpu_results, gpu_times, gpu_results = _run_repeated(
+        cpu_path,
+        gpu_path,
+        canvas,
+        work,
+        warmup=args.warmup,
+        repetitions=args.repetitions,
+    )
+    cpu_timing = _timing_summary(cpu_times)
+    gpu_timing = _timing_summary(gpu_times)
+    cpu_ms = cpu_timing["median_ms"]
+    gpu_ms = gpu_timing["median_ms"]
+    cpu_result = cpu_results[-1]
+    gpu_result = gpu_results[-1]
 
     cpu_final = cpu_result.get("final_result")
     gpu_final = gpu_result.get("final_result")
     cpu_summary = cpu_result.get("summary", {})
     gpu_summary = gpu_result.get("summary", {})
     print()
-    print(f"CPU  end-to-end {cpu_ms:9.1f} ms  final={cpu_final}  {cpu_summary}")
-    print(f"CUDA end-to-end {gpu_ms:9.1f} ms  final={gpu_final}  {gpu_summary}")
+    print(
+        f"CPU  end-to-end median={cpu_ms:9.1f} ms p95={cpu_timing['p95_ms']:9.1f} ms "
+        f"final={cpu_final}  {cpu_summary}"
+    )
+    print(
+        f"CUDA end-to-end median={gpu_ms:9.1f} ms p95={gpu_timing['p95_ms']:9.1f} ms "
+        f"final={gpu_final}  {gpu_summary}"
+    )
     print(f"speedup {cpu_ms / gpu_ms:.2f}x")
 
     cpu_normalised = _normalised(cpu_result)
     gpu_normalised = _normalised(gpu_result)
     strictly_identical = cpu_normalised == gpu_normalised
-    comparison = _compare(cpu_result, gpu_result)
+    comparisons = [_compare(cpu, gpu) for cpu, gpu in zip(cpu_results, gpu_results)]
+    comparison = comparisons[-1]
+    every_decision_equal = all(item["decision_equal"] for item in comparisons)
     print(f"normalised results strictly identical: {strictly_identical}")
     print(
         "decision-bearing fields identical (PASS/NG, defect count, type, bbox, area, "
-        f"confidence, remaining metadata): {comparison['decision_equal']}"
+        f"confidence, remaining metadata): {every_decision_equal} "
+        f"({sum(item['decision_equal'] for item in comparisons)}/{len(comparisons)} runs)"
     )
     if comparison["drift_counts"]:
         print(
@@ -362,7 +504,7 @@ def main() -> int:
             f"tiling: active={tiling.get('active')} tiles={tiling.get('tile_count')} "
             f"backend={tiling.get('backend')}"
         )
-    if not comparison["decision_equal"]:
+    if not every_decision_equal:
         print()
         print("DECISION-BEARING DIFFERENCE - the CUDA run is not equivalent:")
         cpu_tiles = cpu_normalised.get("tiles", [])
@@ -373,46 +515,44 @@ def main() -> int:
                 print(f"  tile {index}: GPU={json.dumps(gpu_tile, default=str)[:400]}")
                 break
 
-    # Pipeline stage timings live under execution.performance: stages_sec holds the
-    # pipeline-level stages and detector_stages_sec holds each detector's own stages.
-    cpu_stage = dict(
-        cpu_result.get("execution", {}).get("performance", {}).get("stages_sec", {})
-    )
-    gpu_stage = dict(
-        gpu_result.get("execution", {}).get("performance", {}).get("stages_sec", {})
-    )
-    cpu_detector_stage = {
-        f"{detector_id}.{stage}": seconds
-        for detector_id, stages in cpu_result.get("execution", {})
-        .get("performance", {})
-        .get("detector_stages_sec", {})
-        .items()
-        for stage, seconds in stages.items()
-    }
-    gpu_detector_stage = {
-        f"{detector_id}.{stage}": seconds
-        for detector_id, stages in gpu_result.get("execution", {})
-        .get("performance", {})
-        .get("detector_stages_sec", {})
-        .items()
-        for stage, seconds in stages.items()
-    }
-    if cpu_detector_stage or gpu_detector_stage:
-        print()
-        print(f"{'detector stage':40s} {'CPU ms':>10s} {'CUDA ms':>10s}")
-        for key in sorted(set(cpu_detector_stage) | set(gpu_detector_stage)):
-            print(
-                f"{key:40s} {cpu_detector_stage.get(key, float('nan')) * 1000.0:10.2f} "
-                f"{gpu_detector_stage.get(key, float('nan')) * 1000.0:10.2f}"
+    # Build table-ready median/P95 rows from every measured result, not from the final run only.
+    stage_comparison = []
+    for scope, cpu_values, gpu_values in (
+        ("detector", _stage_values(cpu_results, detector=True), _stage_values(gpu_results, detector=True)),
+        ("pipeline", _stage_values(cpu_results), _stage_values(gpu_results)),
+    ):
+        for name in sorted(set(cpu_values) | set(gpu_values)):
+            if name not in cpu_values or name not in gpu_values:
+                continue
+            cpu_row = _timing_summary(cpu_values[name])
+            gpu_row = _timing_summary(gpu_values[name])
+            stage_comparison.append(
+                {
+                    "scope": scope,
+                    "stage": name,
+                    "cpu_median_ms": cpu_row["median_ms"],
+                    "cpu_p95_ms": cpu_row["p95_ms"],
+                    "gpu_median_ms": gpu_row["median_ms"],
+                    "gpu_p95_ms": gpu_row["p95_ms"],
+                    "speedup": (
+                        cpu_row["median_ms"] / gpu_row["median_ms"]
+                        if gpu_row["median_ms"] else None
+                    ),
+                }
             )
-    if cpu_stage and gpu_stage:
-        print()
-        print(f"{'pipeline stage':40s} {'CPU ms':>10s} {'CUDA ms':>10s}")
-        for key in sorted(set(cpu_stage) | set(gpu_stage)):
-            print(
-                f"{key:40s} {cpu_stage.get(key, float('nan')) * 1000.0:10.2f} "
-                f"{gpu_stage.get(key, float('nan')) * 1000.0:10.2f}"
-            )
+    print()
+    print(
+        f"{'scope/stage':52s} {'CPU med':>10s} {'CPU p95':>10s} "
+        f"{'GPU med':>10s} {'GPU p95':>10s} {'speedup':>9s}"
+    )
+    for row in stage_comparison:
+        label = f"{row['scope']}/{row['stage']}"
+        speedup = f"{row['speedup']:.2f}x" if row["speedup"] is not None else "n/a"
+        print(
+            f"{label:52s} {row['cpu_median_ms']:10.2f} {row['cpu_p95_ms']:10.2f} "
+            f"{row['gpu_median_ms']:10.2f} {row['gpu_p95_ms']:10.2f} "
+            f"{speedup:>9s}"
+        )
 
     payload = {
         "kind": "pipeline_production",
@@ -422,32 +562,32 @@ def main() -> int:
         "cpu_ms": cpu_ms,
         "gpu_ms": gpu_ms,
         "speedup": cpu_ms / gpu_ms if gpu_ms else None,
+        "warmup": args.warmup,
+        "repetitions": args.repetitions,
+        "cpu_timing": cpu_timing,
+        "gpu_timing": gpu_timing,
+        "cpu_samples_ms": cpu_times,
+        "gpu_samples_ms": gpu_times,
         "cpu_final": cpu_final,
         "gpu_final": gpu_final,
         "cpu_summary": cpu_summary,
         "gpu_summary": gpu_summary,
         "normalised_identical": strictly_identical,
-        "decision_fields_identical": comparison["decision_equal"],
+        "decision_fields_identical": every_decision_equal,
+        "decision_equal_runs": sum(item["decision_equal"] for item in comparisons),
         "drifting_diagnostics": comparison["drift_counts"],
         "worst_diagnostic_drift": comparison["worst_drift"],
         "device_host_split": split,
         "resident_image": resident,
         "tiling": tiling,
-        "cpu_stage_ms": {key: value * 1000.0 for key, value in cpu_stage.items()},
-        "gpu_stage_ms": {key: value * 1000.0 for key, value in gpu_stage.items()},
-        "cpu_detector_stage_ms": {
-            key: value * 1000.0 for key, value in cpu_detector_stage.items()
-        },
-        "gpu_detector_stage_ms": {
-            key: value * 1000.0 for key, value in gpu_detector_stage.items()
-        },
+        "stage_comparison": stage_comparison,
         "gpu_metrics": gpu_result.get("execution", {}).get("gpu", {}).get("metrics", {}),
     }
     if args.json is not None:
         args.json.parent.mkdir(parents=True, exist_ok=True)
         args.json.write_text(json.dumps(payload, indent=2, default=str, ensure_ascii=False), encoding="utf-8")
         print(f"\nwrote {args.json}")
-    return 0 if comparison["decision_equal"] else 1
+    return 0 if every_decision_equal else 1
 
 
 if __name__ == "__main__":

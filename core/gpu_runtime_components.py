@@ -151,6 +151,14 @@ class GpuCapabilities:
         """
         return self.has_exports(("vf_cnr_mask_f32",))
 
+    @property
+    def cnr_mask_u8_roi(self) -> bool:
+        """202 automatic CNR pipeline reading an already resident uint8 ROI."""
+        return bool(
+            self.resident_roi
+            and self.gaussian_blur_f32_sigma
+            and self.has_exports(("vf_cnr_mask_u8_roi",))
+        )
 
 @dataclass(slots=True)
 class GpuResourceRegistry:

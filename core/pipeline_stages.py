@@ -123,6 +123,10 @@ class InspectionResultAssembler:
     # reported as ``device`` only when the runtime really executed one of its exports during this
     # run, so the split describes measured activity rather than the recipe request.
     _DEVICE_STAGE_EXPORTS = {
+        "automatic_cnr_mask": (
+            "vf_cnr_mask_f32",
+            "vf_cnr_mask_u8_roi",
+        ),
         "candidate_extraction": (
             "vf_median_f32",
             "vf_find_contours_u8",
@@ -230,6 +234,7 @@ class InspectionResultAssembler:
             "anchor_localization": "device" if resident_image is not None else "cpu",
             "tiling_roi": "device" if tiling_gpu_requested and resident_image is not None else "cpu",
             "preprocessing": "device" if plan_on_device else "cpu",
+            "automatic_cnr_mask": step_sides["automatic_cnr_mask"],
             "candidate_extraction": step_sides["candidate_extraction"],
             "geometry_and_statistics": step_sides["geometry_and_statistics"],
             "pass_ng_decision": "cpu",

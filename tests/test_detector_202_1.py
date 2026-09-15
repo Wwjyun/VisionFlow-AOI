@@ -822,5 +822,83 @@ class Detector2021FusedResidualRoutingTests(unittest.TestCase):
         self.assertEqual(fused_defect["metadata"]["residual_backend"], "cuda_f32")
 
 
+class _ResidentRoi:
+    def __init__(self, width, height):
+        self.width = width
+        self.height = height
+
+
+class _ResidentFusedRuntime(_FusedRuntime):
+    supports_cnr_mask_u8_roi = True
+
+    def __init__(self, gray, fail_resident=False):
+        super().__init__()
+        self.gray = gray
+        self.fail_resident = fail_resident
+        self.resident_calls = []
+
+    def cnr_mask_u8_roi(self, device_roi, **params):
+        self.resident_calls.append((device_roi, dict(params)))
+        if self.fail_resident:
+            raise RuntimeError("injected resident CNR failure")
+        image = self.gray.astype(np.float32)
+        kernel = int(params["kernel_size"])
+        background = cv2.GaussianBlur(
+            image, (kernel, kernel), float(params["sigma"])
+        )
+        return self.cnr_mask_f32(
+            image,
+            background,
+            sigma_multiplier=params["sigma_multiplier"],
+            threshold_floor=params["threshold_floor"],
+            absolute_floor=params["absolute_floor"],
+            mad_scale=params["mad_scale"],
+            candidate_value=params["candidate_value"],
+        )
+
+
+class Detector2021ResidentCnrRoutingTests(unittest.TestCase):
+    @staticmethod
+    def _gray():
+        return Detector2021FusedResidualRoutingTests._gray()
+
+    @staticmethod
+    def _params():
+        return {"center_mask_enabled": False, "edge_mask_enabled": False}
+
+    def test_resident_roi_replaces_host_gaussian_and_host_operand_cnr(self):
+        gray = self._gray()
+        runtime = _ResidentFusedRuntime(gray)
+        detector = Detector202_1(params=self._params(), use_gpu=True, gpu_runtime=runtime)
+        detector._active_device_roi = _ResidentRoi(gray.shape[1], gray.shape[0])
+        analysis = detector._automatic_cnr_mask(gray)
+        self.assertEqual(len(runtime.resident_calls), 1)
+        self.assertEqual(runtime.gaussian_calls, [])
+        self.assertEqual(analysis["background_backend"], "cuda_resident_fused")
+        self.assertEqual(analysis["residual_backend"], "cuda_resident_fused")
+        reference = Detector202_1(params=self._params())._automatic_cnr_mask(gray)
+        np.testing.assert_array_equal(analysis["candidate_mask"], reference["candidate_mask"])
+
+    def test_resident_failure_uses_the_existing_host_operand_gpu_path(self):
+        gray = self._gray()
+        runtime = _ResidentFusedRuntime(gray, fail_resident=True)
+        detector = Detector202_1(params=self._params(), use_gpu=True, gpu_runtime=runtime)
+        detector._active_device_roi = _ResidentRoi(gray.shape[1], gray.shape[0])
+        analysis = detector._automatic_cnr_mask(gray)
+        self.assertEqual(len(runtime.resident_calls), 1)
+        self.assertEqual(len(runtime.gaussian_calls), 1)
+        self.assertEqual(analysis["residual_backend"], "cuda_f32")
+
+    def test_debug_export_keeps_the_host_residual_needed_for_the_debug_image(self):
+        gray = self._gray()
+        runtime = _ResidentFusedRuntime(gray)
+        detector = Detector202_1(params=self._params(), use_gpu=True, gpu_runtime=runtime)
+        detector.export_debug_images = True
+        detector._active_device_roi = _ResidentRoi(gray.shape[1], gray.shape[0])
+        detector._automatic_cnr_mask(gray)
+        self.assertEqual(runtime.resident_calls, [])
+        self.assertIn("202-1_residual_abs", detector.debug_images)
+
+
 if __name__ == "__main__":
     unittest.main()

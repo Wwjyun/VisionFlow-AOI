@@ -214,6 +214,11 @@ class GpuRuntime:
         """Optional device-side 202-CS-SN-1 residual threshold and candidate mask export."""
         return self._capabilities.cnr_mask_f32
 
+    @property
+    def supports_cnr_mask_u8_roi(self) -> bool:
+        """Optional 202 CNR export that reads the current resident uint8 ROI."""
+        return self._capabilities.cnr_mask_u8_roi
+
     def status(self, requested: bool = False) -> dict:
         active = bool(requested and self.available and not self.last_error)
         return {
@@ -238,6 +243,7 @@ class GpuRuntime:
                 "gaussian_blur_f32_roi": self.supports_gaussian_blur_f32_roi,
                 "gaussian_blur_f32_sigma": self.supports_gaussian_f32_sigma,
                 "cnr_mask_f32": self.supports_cnr_mask_f32,
+                "cnr_mask_u8_roi": self.supports_cnr_mask_u8_roi,
             },
             "queue": {
                 "depth": self.queue_depth,
@@ -672,6 +678,71 @@ class GpuRuntime:
             )
         if result != 0:
             raise self._native_error("vf_cnr_mask_f32", result)
+        return {
+            "residual_median": np.float32(residual_median.value),
+            "mad": np.float32(mad.value),
+            "threshold": float(threshold.value),
+            "mask": mask,
+        }
+
+    def cnr_mask_u8_roi(
+        self,
+        device_roi: GpuDeviceRoi,
+        *,
+        kernel_size: int,
+        sigma: float,
+        sigma_multiplier: float,
+        threshold_floor: float,
+        absolute_floor: float,
+        mad_scale: float,
+        candidate_value: int = 255,
+    ) -> dict[str, object]:
+        """Run the 202 Gaussian/residual/MAD/mask chain from a resident uint8 ROI.
+
+        Only the uint8 candidate mask and three scalar diagnostics return to the host. The gray
+        conversion, float32 Gaussian and residual operands remain on the device.
+        """
+        if not self.supports_cnr_mask_u8_roi:
+            raise GpuRuntimeError(
+                "CUDA DLL has no resident CNR mask export (vf_cnr_mask_u8_roi)"
+            )
+        if not isinstance(device_roi, GpuDeviceRoi) or device_roi.image.runtime is not self:
+            raise GpuRuntimeError("vf_cnr_mask_u8_roi requires an ROI from this runtime")
+        self._require_gaussian_f32_sigma(sigma)
+        candidate = int(candidate_value)
+        if candidate < 0 or candidate > 255:
+            raise GpuRuntimeError(
+                f"vf_cnr_mask_u8_roi candidate_value must be 0..255, got {candidate_value!r}"
+            )
+        width, height = int(device_roi.width), int(device_roi.height)
+        mask = np.empty((height, width), dtype=np.uint8)
+        residual_median = ctypes.c_float(0.0)
+        mad = ctypes.c_float(0.0)
+        threshold = ctypes.c_double(0.0)
+        queued = time.perf_counter()
+        with self._queue_slots, self._lock:
+            lock_acquired = time.perf_counter()
+            result = int(self._dll.vf_cnr_mask_u8_roi(
+                self._context,
+                ctypes.c_uint64(int(device_roi.image.generation)),
+                int(device_roi.x), int(device_roi.y), width, height,
+                int(kernel_size), ctypes.c_double(float(sigma)),
+                ctypes.c_double(float(sigma_multiplier)),
+                ctypes.c_double(float(threshold_floor)),
+                ctypes.c_double(float(absolute_floor)),
+                ctypes.c_double(float(mad_scale)),
+                candidate,
+                ctypes.byref(residual_median), ctypes.byref(mad), ctypes.byref(threshold),
+                mask.ctypes.data_as(ctypes.POINTER(ctypes.c_uint8)),
+                ctypes.c_longlong(int(mask.size)),
+            ))
+            completed = time.perf_counter()
+            self._record_performance(
+                "vf_cnr_mask_u8_roi", 0, int(mask.nbytes),
+                completed - lock_acquired, lock_acquired - queued,
+            )
+        if result != 0:
+            raise self._native_error("vf_cnr_mask_u8_roi", result)
         return {
             "residual_median": np.float32(residual_median.value),
             "mad": np.float32(mad.value),
@@ -1288,6 +1359,7 @@ class GpuRuntime:
         self._load_optional_exact_median()
         self._load_optional_gaussian_blur_f32()
         self._load_optional_cnr_mask_f32()
+        self._load_optional_cnr_mask_u8_roi()
 
     def _load_optional_native_plan(self) -> None:
         query = getattr(self._dll, "vf_plan_query", None)
@@ -1467,6 +1539,22 @@ class GpuRuntime:
             ctypes.POINTER(ctypes.c_float), ctypes.c_int,
             ctypes.POINTER(ctypes.c_float), ctypes.c_int,
             ctypes.c_int, ctypes.c_int,
+            ctypes.c_double, ctypes.c_double, ctypes.c_double, ctypes.c_double,
+            ctypes.c_int,
+            ctypes.POINTER(ctypes.c_float), ctypes.POINTER(ctypes.c_float),
+            ctypes.POINTER(ctypes.c_double),
+            ctypes.POINTER(ctypes.c_uint8), ctypes.c_longlong,
+        ]
+        mask.restype = ctypes.c_int
+
+    def _load_optional_cnr_mask_u8_roi(self) -> None:
+        mask = getattr(self._dll, "vf_cnr_mask_u8_roi", None)
+        if mask is None:
+            return
+        mask.argtypes = [
+            ctypes.c_void_p, ctypes.c_uint64,
+            ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+            ctypes.c_int, ctypes.c_double,
             ctypes.c_double, ctypes.c_double, ctypes.c_double, ctypes.c_double,
             ctypes.c_int,
             ctypes.POINTER(ctypes.c_float), ctypes.POINTER(ctypes.c_float),

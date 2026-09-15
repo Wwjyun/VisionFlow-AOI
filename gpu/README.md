@@ -97,6 +97,156 @@ plan，tile metadata 以 `cpu_crossover` 路線與 `preprocess_routes` 標示。
 `vf_match_template_debug_*` 與 `vf_find_contours_*` 的下載介面只供等價驗證與診斷使用，
 不屬於產線路徑。
 
+## 新 GPU mode：接手紀錄與正式尺寸基準
+
+本節是新 GPU mode 的持續接手紀錄。後續每個實驗都必須記下測試圖形、命令、
+CPU/GPU median 與 P95、加速倍數、傳輸量、等價結果、是否接線，以及未採用方案的原因。
+
+### 2026-09-15 正式尺寸修正與優化前 baseline
+
+使用者確認的幾何是原圖 **寬 16384、高 13000**，其中有 6 個 **高 12000、寬 2000**
+的 ROI；舊紀錄中高 2000、寬 12000 的量測方向不適用於此目標。基準工具
+`tools/benchmark_pipeline_production.py` 已改成：
+
+- 以固定 seed 生成 16384×13000 BGR BMP（解碼後 638,976,000 bytes）。
+- 在 `(x, y)=(500,500)` 起放一列 6 個 2000×12000 ROI，水平間距 100 px。
+- 生成 64×64 template anchor，讓 CPU/GPU 都走正式 anchor grid；GPU 由 resident 原圖定位與切 ROI。
+- 一個 `GpuExecutionSession` 跨 warm-up 與量測重用；CPU/GPU 交錯執行以降低順序偏差。
+- 正式命令：
+
+```powershell
+.\env\Scripts\python.exe tools\benchmark_pipeline_production.py `
+  --profile production --warmup 1 --repetitions 3 `
+  --work outputs_validation\gpu_mode_goal\production --keep `
+  --json outputs_validation\gpu_mode_goal\production_baseline.json
+```
+
+RTX 3090、CUDA 13.3、Detector `202-CS-SN-1` 的優化前結果：
+
+| 範圍 / 階段 | CPU median ms | CPU P95 ms | GPU median ms | GPU P95 ms | CPU/GPU 倍數 |
+|---|---:|---:|---:|---:|---:|
+| Pipeline end-to-end | 6282.0 | 6409.9 | 3243.9 | 3289.0 | **1.94×** |
+| detectors total | 5234.5 | 5339.8 | 2159.8 | 2188.1 | **2.42×** |
+| automatic CNR mask | 4823.6 | 4932.9 | 1735.4 | 1782.0 | **2.78×** |
+| connected components + ring CNR | 307.0 | 308.7 | 288.8 | 317.6 | 1.06× |
+| detector preprocess | 30.3 | 31.5 | 45.4 | 49.1 | 0.67× |
+| tiling total | 140.7 | 145.3 | 63.0 | 67.8 | 2.23× |
+| image load | 748.2 | 761.9 | 753.2 | 772.6 | 0.99× |
+
+結果為 NG、6/6 NG tiles、558 defects；3/3 次的 PASS/NG、defect 數、type、bbox、area、
+confidence 與判定相關 metadata 全部相同，這張合成圖的 residual diagnostics 也無漂移。
+
+目前資料路徑：CPU 解碼後將 638,976,000-byte BGR 原圖上傳一次；anchor localization、
+ROI 與 gray preprocess 使用 resident device image，但 candidate extraction、component/ring 統計、
+PASS/NG 與報表仍在 CPU。202 automatic CNR 尚未真正 resident：每次六個 ROI 又經
+`vf_gaussian_blur_f32` 上傳 576 MB／下載 576 MB，並經 `vf_cnr_mask_f32` 上傳 1,152 MB／
+下載 144 MB。因此每次 pipeline 除整圖一次上傳外，這兩個舊介面仍造成約 **1.73 GB H2D +
+720 MB D2H**。下一個實作項目是 resident ROI 的 fused gray/float Gaussian/residual/median/MAD/mask
+export，只下載候選 mask與必要純量；完成後需重編 `visionflow_cuda.dll`、做 CPU/GPU 等價矩陣，
+再以同一命令產出改動後表格。`findContours` 因產線尚未接線且 GPU 對稀疏長輪廓仍慢於 CPU，
+不是本輪第一優先。
+
+### 2026-09-15 resident 202 CNR 完成後
+
+新增 optional ABI-v1 export `vf_cnr_mask_u8_roi`。它直接讀取 `vf_context_upload_u8` 保存的
+resident 原圖 ROI，在 device 上依序完成 OpenCV 等價 BGR→uint8 gray→float32、Gaussian、
+residual、exact median、MAD、threshold 與 candidate mask，只下載 mask 與三個純量。Detector
+在 `export_debug_images=False` 時優先使用此路徑；debug 模式為了產生 residual 圖保留原路徑；
+舊 DLL、缺 export、尺寸不符或 device 錯誤會回到既有 host-operand GPU/CPU 路徑。
+
+獨立驗收命令：
+
+```powershell
+.\env\Scripts\python.exe tools\cnr_mask_u8_roi_equivalence.py
+```
+
+15/15 個案例（1/3 channels、非零 ROI offset、kernel 3/31/51、sigma 0/1.25，並含 3 次
+高 12000×寬 2000）與既有 `vf_gaussian_blur_f32`→`vf_cnr_mask_f32` 的 median/MAD/threshold/mask
+逐位元相同，且 15/15 candidate mask 與 CPU OpenCV 參考逐 byte 相同。相對 CPU 的診斷浮點
+最大差異維持既有 Gaussian 容差：median 1.145e-5、MAD 7.630e-6、threshold 3.394e-5；
+不影響 mask。高 12000×寬 2000 單一 resident export median **10.98 ms**。
+
+同一張 16384×13000／6 ROI 合成圖、同一基準方法的改動前後比較：
+
+| 指標 | 改動前 GPU | resident GPU | 改善 |
+|---|---:|---:|---:|
+| Pipeline median | 3243.9 ms | **2022.2 ms** | **1.60× / -37.7%** |
+| Pipeline P95 | 3289.0 ms | **2214.3 ms** | 1.49× / -32.7% |
+| 對同輪 CPU 的端到端倍數 | 1.94× | **3.26×** | +1.32× |
+| detectors total median | 2159.8 ms | **923.0 ms** | **2.34× / -57.3%** |
+| automatic CNR median | 1735.4 ms | **526.1 ms** | **3.30× / -69.7%** |
+| 每次 pipeline H2D | 2366.976 MB | **638.976 MB** | **-73.0%** |
+| 每次 pipeline D2H | 864 MB | **288 MB** | **-66.7%** |
+| 每次 native calls | 19 | **13** | -31.6% |
+
+改動後正式量測 CPU median/P95 6595.6/6703.3 ms、GPU 2022.2/2214.3 ms，3/3 次仍為
+NG、6/6 NG tiles、558 defects，所有判定欄位相同且此圖診斷值也無漂移。完整 JSON：
+`outputs_validation/gpu_mode_goal/production_resident.json`。目前剩餘 D2H 是 144 MB gray
+（CPU ring CNR 統計使用）與 144 MB candidate mask（CPU connected components 使用）。下一個
+可量化上限是 `connected_components_and_cnr` 約 285 ms；必須先證明 GPU CCL＋ring 統計在
+高瘦 ROI 上快於這個 CPU 路徑，才接線，避免重演 `findContours` 雖正確卻更慢的情況。
+
+### 2026-09-15 GPU connected components 實驗：不接入產線
+
+實驗版以 CUDA atomic union-find、root 壓縮、CUB prefix scan 與 atomic stats 實作 4/8-connectivity
+CCL。合成遮罩及一張正式 benchmark 候選遮罩的 component 數量、像素集合與 stats 都和 OpenCV
+相同；但它的輸入仍是已下載到 host 的 candidate mask，輸出又要下載整張 int32 label map。
+因此單看 kernel 有改善，放回完整 pipeline 後幾乎沒有收益。
+
+| 指標 | resident GPU（CPU CCL） | 實驗 GPU CCL | 差異 |
+|---|---:|---:|---:|
+| Pipeline median | 2022.2 ms | 2014.0 ms | **8.2 ms / 0.4%** |
+| Pipeline P95 | 2214.3 ms | 2032.6 ms | 181.7 ms；跨輪溫度/快取波動較大 |
+| connected components + ring median | 288.85 ms（CPU） | 265.76 ms（GPU CCL + CPU ring） | **1.09×** |
+| 每次 pipeline H2D | 638.976 MB | 782.976 MB | **+144 MB** |
+| 每次 pipeline D2H | 288 MB | 864.011 MB | **+576.011 MB** |
+| 每次 native calls | 13 | 19 | +6 |
+
+同一個 12000×2000 mask 的獨立交錯量測曾得到 GPU median 33.38 ms、CPU 58.54 ms（1.75×），
+但另一輪 CPU-only 是 35.79 ms，證明該微基準受排程／快取影響，不能取代完整 pipeline 結果。
+完整 pipeline 實驗 JSON 為 `outputs_validation/gpu_mode_goal/production_ccl.json`；它仍維持 3/3
+判定完全相同、558 defects。由於端到端 median 只改善 0.4%，並破壞低傳輸目標，實驗 export、
+runtime binding 與 detector 路由已撤回，正式版本維持 OpenCV CCL。這和先前 `findContours` 的
+結論一致：不能只因工作能在 CUDA 執行就接線，必須以完整 pipeline 淨收益判斷。
+
+若日後重做 CCL，啟用條件是 candidate mask 在 CNR export 後繼續留在 device，且 GPU 同時完成
+ring 統計，只下載少量候選 bbox/area/CNR；不能再下載 96 MB/ROI 的 int32 label map。還必須重現
+OpenCV 可觀測的 label 編號順序，或先明確修改並驗證排序契約。這才可能同時減少 144 MB mask
+D2H、避免 144 MB mask H2D，並讓 CCL 的 kernel 加速反映到端到端時間。
+
+### 2026-09-15 最終重編與驗收
+
+撤回 CCL 實驗後，以 CUDA 13.3、Visual Studio 2026、`sm_86` 重新編譯 DLL，並用重編成品重跑
+一輪 warm-up 加三輪交錯 CPU/GPU 正式 benchmark。這是交接時應採用的最終數字：
+
+| 範圍 | CPU median / P95 | GPU median / P95 | median 倍數 |
+|---|---:|---:|---:|
+| 完整 pipeline | 6504.0 / 6665.2 ms | **2097.0 / 2123.5 ms** | **3.10×** |
+| detectors total | 5451.2 / 5614.1 ms | **970.9 / 1024.1 ms** | **5.61×** |
+| automatic CNR mask | 5035.9 / 5213.2 ms | **571.3 / 609.9 ms** | **8.81×** |
+| connected components + ring | 305.8 / 307.5 ms | 287.6 / 299.4 ms | 1.06×（兩邊皆 CPU） |
+| tiling | 152.5 / 159.1 ms | **62.7 / 63.1 ms** | **2.43×** |
+
+三輪 CPU/GPU 都是 NG、6/6 NG tiles、558 defects，PASS/NG、defect count/type/bbox/area/
+confidence 與判定 metadata **3/3 完全相同**；此圖的 residual diagnostics 也沒有漂移。GPU 每輪只有
+一次整圖 upload：H2D 638.976 MB；D2H 288 MB（六張 gray 加六張 candidate mask）；共 13 次
+native calls。實際 split 是 decode、CCL/ring、PASS/NG 彙整在 CPU；resident upload、anchor、ROI、
+preprocess 與 automatic CNR mask 在 GPU。證據：
+`outputs_validation/gpu_mode_goal/production_final.json`。
+
+最終驗證結果：
+
+- `gpu/test_cuda_api.exe`：RTX 3090 / compute capability 8.6，C ABI、plan、resident ROI、batch smoke 通過。
+- `tools/cnr_mask_u8_roi_equivalence.py`：15/15 與 chained GPU 逐位元相同、15/15 CPU mask 相同；
+  12000×2000 resident export median 11.139 ms。
+- `gpu/validate_cuda_dll.py --warmup 5 --benchmark 20 --crossover --morphology-profile
+  --stress 10 100 1000 --resize-area-pipeline`：全部 requested CUDA validations 通過。
+- `gpu/validate_cuda_fault_injection.py --vram-pressure`：init failure、kernel launch error、device OOM、
+  sticky context 與 VRAM pressure 全部通過並能依契約 fallback／恢復。
+- `python -m unittest discover -s tests -v`：435 tests 通過；compileall 與 CUDA preflight 通過。
+- CLI 合成 NG smoke 正常完成並寫出 overlay、NG tile、CSV、matrix CSV 與 JSON；CLI exit 1 代表檢出
+  NG，是既有命令列結果契約。
+
 ## 檔案
 
 ```text

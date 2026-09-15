@@ -508,6 +508,34 @@ VF_CUDA_API int vf_cnr_mask_f32(
     unsigned char* out_mask,
     long long out_mask_capacity);
 
+/*
+ * Resident-image variant of the 202 automatic CNR operation. It reads one isolated ROI from the
+ * image previously uploaded by vf_context_upload_u8, converts BGR to the exact OpenCV uint8 gray
+ * value (or reads a one-channel resident image), promotes that value to float32, runs the verified
+ * float32 Gaussian, residual median/MAD and threshold pipeline, and downloads only the mask and
+ * three scalar diagnostics. No ROI image or Gaussian background crosses PCIe.
+ *
+ * `generation` must identify the current resident image. The ROI must be in bounds, the resident
+ * image must have one or three channels, and all remaining parameter/output contracts are the same
+ * as vf_gaussian_blur_f32 plus vf_cnr_mask_f32. This is an additive ABI-v1 export; callers must
+ * probe for it and fall back to the host-operand exports when loading an older DLL.
+ */
+VF_CUDA_API int vf_cnr_mask_u8_roi(
+    void* context,
+    uint64_t generation,
+    int x, int y, int width, int height,
+    int kernel_size, double sigma,
+    double sigma_multiplier,
+    double threshold_floor,
+    double absolute_floor,
+    double mad_scale,
+    int candidate_value,
+    float* out_residual_median,
+    float* out_mad,
+    double* out_threshold,
+    unsigned char* out_mask,
+    long long out_mask_capacity);
+
 #ifdef __cplusplus
 }
 #endif

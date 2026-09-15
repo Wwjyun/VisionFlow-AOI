@@ -4380,6 +4380,32 @@ __global__ void cnr_mask_kernel(
     mask[index] = absdev[index] > threshold ? candidate_value : static_cast<unsigned char>(0);
 }
 
+// Convert a resident uint8 ROI directly to the float32 gray operand used by Detector202_1. The BGR
+// expression deliberately rounds to uint8 first and only then promotes, matching
+// cv2.cvtColor(..., COLOR_BGR2GRAY).astype(np.float32) exactly.
+__global__ void resident_gray_f32_kernel(
+    const unsigned char* resident, int resident_width, int resident_channels,
+    int offset_x, int offset_y, float* gray, int width, int height) {
+    const int x = blockIdx.x * blockDim.x + threadIdx.x;
+    const int y = blockIdx.y * blockDim.y + threadIdx.y;
+    if (x >= width || y >= height) return;
+    const size_t source_index =
+        (static_cast<size_t>(y + offset_y) * resident_width + x + offset_x) * resident_channels;
+    unsigned char value = resident[source_index];
+    if (resident_channels == 3) {
+        constexpr int gray_shift = 15;
+        constexpr int blue_to_gray = 3735;
+        constexpr int green_to_gray = 19235;
+        constexpr int red_to_gray = 9798;
+        value = static_cast<unsigned char>(
+            (blue_to_gray * resident[source_index] +
+             green_to_gray * resident[source_index + 1] +
+             red_to_gray * resident[source_index + 2] +
+             (1 << (gray_shift - 1))) >> gray_shift);
+    }
+    gray[static_cast<size_t>(y) * width + x] = static_cast<float>(value);
+}
+
 // Python's two-argument max(): the first argument is returned unless the second is strictly greater.
 // That keeps a NaN first argument (Python's max propagates it) and ignores a NaN second argument,
 // which is what the detector's threshold expressions rely on: `max(mad_scale * mad, noise_floor)`
@@ -4517,6 +4543,125 @@ VF_CUDA_API int vf_cnr_mask_f32(
     if (result != VF_CUDA_OK) return result;
     finalize_timing(persistent);
 
+    *out_residual_median = residual_median;
+    *out_mad = mad;
+    *out_threshold = residual_threshold;
+    return VF_CUDA_OK;
+}
+
+VF_CUDA_API int vf_cnr_mask_u8_roi(
+    void* context,
+    uint64_t generation,
+    int x, int y, int width, int height,
+    int kernel_size, double sigma,
+    double sigma_multiplier,
+    double threshold_floor,
+    double absolute_floor,
+    double mad_scale,
+    int candidate_value,
+    float* out_residual_median,
+    float* out_mad,
+    double* out_threshold,
+    unsigned char* out_mask,
+    long long out_mask_capacity) {
+    PersistentContext* persistent = static_cast<PersistentContext*>(context);
+    if (persistent == nullptr || out_residual_median == nullptr || out_mad == nullptr ||
+        out_threshold == nullptr || out_mask == nullptr || generation == 0 ||
+        generation != persistent->resident_generation || persistent->resident_u8 == nullptr ||
+        (persistent->resident_channels != 1 && persistent->resident_channels != 3) ||
+        width <= 0 || height <= 0 || x < 0 || y < 0 ||
+        x > persistent->resident_width - width || y > persistent->resident_height - height ||
+        candidate_value < 0 || candidate_value > 255) {
+        return VF_CUDA_INVALID_ARGUMENT;
+    }
+    const int kernel_status = gaussian_f32_kernel_request(kernel_size, sigma);
+    if (kernel_status != VF_CUDA_OK) return kernel_status;
+    const long long requested = static_cast<long long>(width) * static_cast<long long>(height);
+    if (requested > static_cast<long long>(INT_MAX)) return VF_CUDA_UNSUPPORTED;
+    if (out_mask_capacity < requested) return VF_CUDA_INVALID_ARGUMENT;
+
+    const int items = static_cast<int>(requested);
+    const size_t item_count = static_cast<size_t>(items);
+    int result = reserve_device(
+        &persistent->cnr_mask_image, &persistent->cnr_mask_image_capacity, item_count,
+        &persistent->allocation_count);
+    if (result == VF_CUDA_OK) result = reserve_device(
+        &persistent->gaussian_f32_intermediate, &persistent->gaussian_f32_intermediate_capacity,
+        item_count, &persistent->allocation_count);
+    if (result == VF_CUDA_OK) result = reserve_device(
+        &persistent->gaussian_f32_output, &persistent->gaussian_f32_output_capacity, item_count,
+        &persistent->allocation_count);
+    if (result == VF_CUDA_OK) result = reserve_device(
+        &persistent->cnr_mask_residual, &persistent->cnr_mask_residual_capacity, item_count,
+        &persistent->allocation_count);
+    if (result == VF_CUDA_OK) result = reserve_device(
+        &persistent->cnr_mask_absdev, &persistent->cnr_mask_absdev_capacity, item_count,
+        &persistent->allocation_count);
+    if (result == VF_CUDA_OK) result = reserve_device(
+        &persistent->cnr_mask_mask, &persistent->cnr_mask_mask_capacity, item_count,
+        &persistent->allocation_count);
+    if (result == VF_CUDA_OK) result = reserve_median_scratch(persistent, items);
+    if (result != VF_CUDA_OK) return result;
+
+    reset_timing(persistent, false);
+    resident_gray_f32_kernel<<<grid2d(width, height), dim3(BLOCK_X, BLOCK_Y), 0, persistent->stream>>>(
+        persistent->resident_u8, persistent->resident_width, persistent->resident_channels,
+        x, y, persistent->cnr_mask_image, width, height);
+    result = visionflow_cuda::kernel_launch_result();
+    if (result != VF_CUDA_OK) return result;
+    cudaEventRecord(persistent->timing_events[TIMING_AFTER_INPUT], persistent->stream);
+
+    int radius = 0;
+    result = prepare_gaussian_f32_weights(kernel_size, sigma, &radius, persistent->stream);
+    if (result != VF_CUDA_OK) return result;
+    cudaEventRecord(persistent->timing_events[TIMING_GAUSSIAN_START], persistent->stream);
+    launch_gaussian_f32(
+        persistent->cnr_mask_image, persistent->gaussian_f32_intermediate,
+        persistent->gaussian_f32_output, width, height, radius, persistent->stream);
+    result = visionflow_cuda::kernel_launch_result();
+    if (result != VF_CUDA_OK) return result;
+    cudaEventRecord(persistent->timing_events[TIMING_GAUSSIAN_END], persistent->stream);
+    persistent->timing_has_gaussian = true;
+
+    constexpr int CNR_THREADS = 256;
+    const unsigned int blocks = static_cast<unsigned int>(
+        (static_cast<long long>(items) + CNR_THREADS - 1) / CNR_THREADS);
+    cnr_residual_kernel<<<blocks, CNR_THREADS, 0, persistent->stream>>>(
+        persistent->cnr_mask_image, persistent->gaussian_f32_output,
+        persistent->cnr_mask_residual, items);
+    result = visionflow_cuda::kernel_launch_result();
+    if (result != VF_CUDA_OK) return result;
+
+    float residual_median = 0.0f;
+    result = run_device_median(
+        persistent, persistent->cnr_mask_residual, items, &residual_median, false);
+    if (result != VF_CUDA_OK) return result;
+    cnr_absdev_kernel<<<blocks, CNR_THREADS, 0, persistent->stream>>>(
+        persistent->cnr_mask_residual, persistent->cnr_mask_absdev, items, residual_median);
+    result = visionflow_cuda::kernel_launch_result();
+    if (result != VF_CUDA_OK) return result;
+
+    float mad = 0.0f;
+    result = run_device_median(persistent, persistent->cnr_mask_absdev, items, &mad, false);
+    if (result != VF_CUDA_OK) return result;
+    const double robust_noise_sigma = python_max(mad_scale * static_cast<double>(mad), absolute_floor);
+    const double residual_threshold = python_max(threshold_floor, sigma_multiplier * robust_noise_sigma);
+    cnr_mask_kernel<<<blocks, CNR_THREADS, 0, persistent->stream>>>(
+        persistent->cnr_mask_absdev, persistent->cnr_mask_mask, items,
+        static_cast<float>(residual_threshold), static_cast<unsigned char>(candidate_value));
+    result = visionflow_cuda::kernel_launch_result();
+    if (result != VF_CUDA_OK) return result;
+    cudaEventRecord(persistent->timing_events[TIMING_AFTER_KERNEL], persistent->stream);
+
+    const size_t mask_row_bytes = static_cast<size_t>(width);
+    cudaError_t error = cudaMemcpy2DAsync(
+        out_mask, mask_row_bytes, persistent->cnr_mask_mask, mask_row_bytes,
+        mask_row_bytes, static_cast<size_t>(height), cudaMemcpyDeviceToHost, persistent->stream);
+    if (error != cudaSuccess) return cuda_result(error);
+    cudaEventRecord(persistent->timing_events[TIMING_AFTER_OUTPUT], persistent->stream);
+    result = visionflow_cuda::stream_result(persistent->stream);
+    if (result != VF_CUDA_OK) return result;
+    finalize_timing(persistent);
     *out_residual_median = residual_median;
     *out_mad = mad;
     *out_threshold = residual_threshold;

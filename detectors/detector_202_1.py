@@ -384,10 +384,6 @@ class Detector202_1(Detector202):
         height, width = gray.shape[:2]
         background_kernel = self._background_kernel(height, width)
         gaussian_sigma = float(self.params.get("gaussian_sigma", 0.0))
-        background, background_backend = self._background_blur(
-            image_float, background_kernel, gaussian_sigma
-        )
-        residual = image_float - background
         mad_scale = float(self.params.get("mad_scale", 1.4826))
         noise_sigma_floor = float(self.params.get("noise_sigma_floor", 0.000001))
         residual_threshold_floor = float(
@@ -397,22 +393,61 @@ class Detector202_1(Detector202):
             self.params.get("residual_sigma_multiplier", 3.0)
         )
         candidate_max_value = int(self.params.get("candidate_max_value", 255))
-        (
-            candidate_mask,
-            residual_median,
-            mad,
-            residual_threshold,
-            mask_backend,
-        ) = self._residual_statistics(
-            image_float,
-            background,
-            residual,
-            candidate_max_value,
-            mad_scale,
-            noise_sigma_floor,
-            residual_threshold_floor,
-            residual_sigma_multiplier,
-        )
+        residual = None
+        resident_result = None
+        runtime = getattr(self, "gpu_runtime", None)
+        device_roi = getattr(self, "_active_device_roi", None)
+        if (
+            runtime is not None
+            and getattr(runtime, "available", False)
+            and getattr(runtime, "supports_cnr_mask_u8_roi", False)
+            and self.use_gpu
+            and not self.export_debug_images
+            and device_roi is not None
+            and (int(device_roi.height), int(device_roi.width)) == (height, width)
+        ):
+            try:
+                resident_result = runtime.cnr_mask_u8_roi(
+                    device_roi,
+                    kernel_size=background_kernel,
+                    sigma=gaussian_sigma,
+                    sigma_multiplier=residual_sigma_multiplier,
+                    threshold_floor=residual_threshold_floor,
+                    absolute_floor=noise_sigma_floor,
+                    mad_scale=mad_scale,
+                    candidate_value=candidate_max_value,
+                )
+            except Exception:
+                resident_result = None
+
+        if resident_result is not None and resident_result["mask"].shape == (height, width):
+            candidate_mask = resident_result["mask"]
+            residual_median = float(resident_result["residual_median"])
+            mad = float(resident_result["mad"])
+            residual_threshold = float(resident_result["threshold"])
+            background_backend = "cuda_resident_fused"
+            mask_backend = "cuda_resident_fused"
+        else:
+            background, background_backend = self._background_blur(
+                image_float, background_kernel, gaussian_sigma
+            )
+            residual = image_float - background
+            (
+                candidate_mask,
+                residual_median,
+                mad,
+                residual_threshold,
+                mask_backend,
+            ) = self._residual_statistics(
+                image_float,
+                background,
+                residual,
+                candidate_max_value,
+                mad_scale,
+                noise_sigma_floor,
+                residual_threshold_floor,
+                residual_sigma_multiplier,
+            )
         robust_noise_sigma = float(max(mad_scale * mad, noise_sigma_floor))
         morph_operation = str(self.params.get("morph_operation", "open")).lower()
         morph_kernel = int(self.params.get("morph_kernel", 3))
@@ -443,10 +478,11 @@ class Detector202_1(Detector202):
         )
         candidate_mask = cv2.bitwise_and(candidate_mask, inclusion_mask)
 
-        self._record_debug_image(
-            "202-1_residual_abs",
-            np.clip(np.abs(residual - residual_median), 0, 255).astype(np.uint8),
-        )
+        if residual is not None:
+            self._record_debug_image(
+                "202-1_residual_abs",
+                np.clip(np.abs(residual - residual_median), 0, 255).astype(np.uint8),
+            )
         self._record_debug_image("202-1_candidate_mask", candidate_mask)
         minimum_area, maximum_area = self._effective_component_area_limits(
             height, width
@@ -650,7 +686,9 @@ class Detector202_1(Detector202):
                     "residual_threshold／robust_noise_sigma 這四個殘差衍生診斷值會有"
                     "尾位（約 1e-5）差異。residual_backend 則不引入任何額外差異："
                     "cuda_f32（vf_cnr_mask_f32）的 residual_median／mad 逐位元相同、"
-                    "residual_threshold double 完全相同、候選遮罩逐位元組相同。"
+                    "residual_threshold double 完全相同、候選遮罩逐位元組相同；"
+                    "cuda_resident_fused（vf_cnr_mask_u8_roi）與這條既有 GPU chain"
+                    "逐位元相同，且不再傳輸 gray/background operands。"
                 ),
                 "background_kernel_config": {
                     "configured_size": int(

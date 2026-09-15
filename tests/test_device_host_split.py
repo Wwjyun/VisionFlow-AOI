@@ -65,7 +65,7 @@ class DeviceHostSplitTests(unittest.TestCase):
         split = self._split([_Detector(use_gpu=False, gpu_active=False)], resident=False)
         for step in (
             "image_decode", "resident_upload", "anchor_localization", "tiling_roi",
-            "preprocessing", "candidate_extraction", "geometry_and_statistics",
+            "preprocessing", "automatic_cnr_mask", "candidate_extraction", "geometry_and_statistics",
             "pass_ng_decision", "aggregation_and_reporting",
         ):
             self.assertEqual(split[step], "cpu", step)
@@ -80,6 +80,7 @@ class DeviceHostSplitTests(unittest.TestCase):
         # No device export for these steps ran in this run, so they must not be implied as device
         # work just because the recipe requested CUDA.
         self.assertEqual(split["candidate_extraction"], "cpu")
+        self.assertEqual(split["automatic_cnr_mask"], "cpu")
         self.assertEqual(split["geometry_and_statistics"], "cpu")
         self.assertEqual(split["pass_ng_decision"], "cpu")
         self.assertEqual(split["hybrid_steps"], {})
@@ -110,6 +111,14 @@ class DeviceHostSplitTests(unittest.TestCase):
                 self.assertEqual(split["candidate_extraction"], "cpu")
                 self.assertEqual(split["geometry_and_statistics"], "cpu")
                 self.assertEqual(split["hybrid_steps"], {})
+
+    def test_resident_cnr_export_is_reported_in_its_own_stage(self):
+        runtime = _CountingRuntime({"vf_cnr_mask_u8_roi": 6})
+        split = self._split([_Detector(routes={"cuda": 6})], resident=True, runtime=runtime)
+        self.assertEqual(split["automatic_cnr_mask"], "device")
+        self.assertEqual(
+            split["hybrid_steps"], {"automatic_cnr_mask": ["vf_cnr_mask_u8_roi"]}
+        )
 
     def test_a_runtime_without_metrics_does_not_break_result_assembly(self):
         class _BrokenRuntime(_Runtime):

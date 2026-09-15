@@ -229,6 +229,18 @@ class CudaSourceContractTests(unittest.TestCase):
         self.assertIn("oom_recovery_result = vf_roi_batch_create(", smoke)
         self.assertIn("std::vector<VfRoiV1> oom_rois(65535", smoke)
 
+    def test_resident_cnr_export_has_no_host_input_copy_and_is_in_native_smoke(self):
+        root = Path(__file__).resolve().parents[1]
+        source = (root / "gpu" / "visionflow_cuda.cu").read_text(encoding="utf-8")
+        smoke = (root / "gpu" / "test_cuda_api.cu").read_text(encoding="utf-8")
+        execute = source.split("VF_CUDA_API int vf_cnr_mask_u8_roi(", 1)[1]
+
+        self.assertIn("persistent->resident_u8", execute)
+        self.assertIn("resident_gray_f32_kernel<<<", execute)
+        self.assertNotIn("cudaMemcpyHostToDevice", execute)
+        self.assertEqual(execute.count("cudaMemcpyDeviceToHost"), 1)
+        self.assertIn("vf_cnr_mask_u8_roi(", smoke)
+
 
 if __name__ == "__main__":
     unittest.main()

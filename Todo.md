@@ -16,6 +16,8 @@
 
 ## 目前狀態摘要
 
+- [x] 2026-09-15 新 GPU mode 目標：CPU 解碼後整圖只做一次 resident upload，6 個高 12000×寬 2000 ROI 從切 tile起直接在 GPU 執行 202 detector CNR；保持 CPU fallback 與判定等價，並以 RTX 3090 的 median/P95/倍數/傳輸量驗收。正式 benchmark 已修正為 16384×13000 原圖與一列 6 ROI。最終重編成品 CPU 6504.0/6665.2 ms、GPU 2097.0/2123.5 ms（皆 median/P95），端到端 **3.10×**、detector **5.61×**、automatic CNR **8.81×**；每輪只有一次 638.976 MB 整圖 H2D、288 MB D2H、13 calls，3/3 判定欄位相同。GPU CCL 實驗在完整 pipeline 只改善 8.2 ms／0.4%，卻增加 144 MB H2D、576.011 MB D2H 與 6 次 native call，因此已撤回接線；正式版本維持 CPU CCL/ring，未來只有在 mask、CCL、ring 全部 device-resident 且只下載候選統計時才重做。RTX native smoke、15-case resident 等價、完整 CUDA validator、1000 次 stress、fault injection、435 tests、compileall、preflight 與 CLI 合成圖 smoke 全部通過；完整交接紀錄與表格在 `gpu/README.md`。
+
 - [x] CUDA DLL 已在 RTX 3090 編譯，並在另一台電腦確認可載入及顯示 CUDA active。
 - [x] 已確認 CUDA active 不代表整條 AOI pipeline 都在 GPU；首次跨機測試端到端沒有加速。
 - [x] 已有 CPU-only、缺 DLL fallback、GPU 呼叫統計及 detector 整體 CPU 重跑機制。
@@ -783,6 +785,8 @@ vs 原本 `[255,255,20,20]`）。因此「標籤編號順序」對 202 的最終
 - [ ] 加速不得犧牲 GUI 回應、打包啟動、結果追溯、錯誤訊息或 CPU fallback。
 
 ## 完成紀錄
+
+- [x] 2026-09-15：完成 16384×13000 原圖、六個高 12000×寬 2000 ROI 的新 GPU mode 最佳化與 RTX 3090 最終驗收。新增 `vf_cnr_mask_u8_roi`，CPU 解碼後只上傳整圖一次，直接由 resident ROI 在 GPU 完成 BGR→gray、float Gaussian、residual、exact median/MAD、threshold 與 candidate mask；只下載 mask 與三個診斷純量，舊 DLL／錯誤／debug 模式皆保留安全 fallback。最終三輪 CPU 6504.0/6665.2 ms、GPU 2097.0/2123.5 ms（median/P95），完整 pipeline 3.10×、detector 5.61×、automatic CNR 8.81×，3/3 判定欄位相同、558 defects。另完成 GPU CCL 原型實驗後依完整 pipeline 淨收益撤回：只快 0.4%，卻多 720.011 MB 傳輸與 6 calls；正式版維持 CPU CCL/ring。CUDA 13.3 `sm_86` DLL 重編、native smoke、15/15 resident/chained GPU 位元等價與 CPU mask 等價、完整 validator、1000 次 stress、fault injection、435 tests、compileall、preflight、CLI 合成圖 NG smoke 均通過。證據與後續接手條件完整記於 `gpu/README.md`；benchmark JSON 為 `outputs_validation/gpu_mode_goal/production_final.json`。
 
 - [x] 2026-09-15：**依使用者決定移除 connected components 的標籤排序依賴，CCL 缺口不再是 GPU 化的阻擋。** `Detector202_1._collect_candidates` 原本靠 Python 穩定排序的副作用決定平手順序（CNR 完全相等時保留 component 標籤的走訪順序），因此輸出與 OpenCV 的標籤**編號**綁在一起；這是候選抽取 GPU 化的唯一阻擋。現改為**明確的平手鍵**：`(-cnr, bbox.y, bbox.x)`，即 CNR 遞減、同分依 bounding box 的 raster 順序。連通元件的 bounding box 彼此不相交，因此這是**全序**，輸出與編號完全無關。**先量化影響再改**（新增 `tools/cnr_tie_share.py`）：**產線形狀的雜訊表面 0/121 個候選位於平手群**（2000×12000 含 96 缺陷為 0/97、2000×4000 含 24 缺陷為 0/24、乾淨表面 0 候選），因此這項改變在產線上**是 no-op**；只有「完全相同缺陷的規則陣列」會受影響（pitch40 283/285、pitch64 120/120、pitch128 30/30，合計 433/435）。**契約測試更新**：`test_cnr_ties_follow_bounding_box_raster_order`（原為 `..._ascending_component_label_order`）改為斷言 bbox raster 順序；新增 `test_output_is_independent_of_the_component_label_numbering`，以 50 次隨機置換 component 標籤（**並同步置換以 label 為索引的 stats 表**）驗證產出的缺陷清單逐欄相同。**過程中修掉兩個我自己造成的 stats 錯誤**：`tools/cnr_label_order_impact.py` 與新測試第一版都只置換了 label map、沒有置換 stats 表，於是每個 component 拿到別人的 bbox／area，量到「100/100 不同」的假結果；修正後為 **100/100 相同**，工具說明也同步改寫（它原本的結論已被本筆取代）。全套 425 → **426 tests OK**、compileall exit 0；產線 quick 幾何端到端仍為 CPU 1443.2 → CUDA 985.3 ms、decision-bearing 欄位相同，確認改動沒有副作用。**仍未完成**：GPU 版 connected components 本身（現在只差「component 集合與 stats 相同」這個較弱的條件，不再需要重現 OpenCV 的編號）。
 
