@@ -40,6 +40,7 @@
 - [ ] 在 RTX 3090 固定 production 測試集執行並建立可重現 baseline。（workflow_dispatch 已支援可選 production manifest；待真實樣本與 runner）
 - [x] benchmark 分開記錄 cold、warm-up 次數、純檢測與既有 pipeline/report 端到端數據。
 - [x] benchmark 記錄平均、median、P95、process CPU%、GPU utilization、VRAM、溫度與功耗快照。
+- [ ] **修正 `device_host_split` 的 anchor 誤報**（2026-09-15 v1.6.0 發行驗收發現）：`core/pipeline_stages.py` 只要 `resident_image is not None` 就把 `anchor_localization` 標成 `device`，但 16384×13000 正式尺寸 benchmark 的 GPU 呼叫統計只有 `vf_context_upload_u8`、`vf_plan_execute_roi`、`vf_cnr_mask_u8_roi`，完全沒有 `vf_match_template_gray_u8`，`template_match` 也與 CPU 同為約 58.7 ms，實際是 CPU 執行（超出 `gpu_anchor_shapes_supported` 量測界限）。改為與其他步驟相同，以本次執行實際呼叫的 export 判定，並補「resident 上傳但 anchor 走 CPU」的回歸測試；GUI 與報告的 backend 標示依此修正。
 
 ### CPU 與 fallback 正確性
 
@@ -589,6 +590,17 @@ vs 原本 `[255,255,20,20]`）。因此「標籤編號順序」對 202 的最終
 - [x] **大量資料操作**：Batch／Monitor 表格使用 model/view 與增量更新，提供 PASS／NG／ERROR 篩選；scatter 超過上限採 deterministic sampling，避免每筆結果重建整表。
 - [x] **繁中一致性與可及性**：操作訊息統一繁體中文，PASS／NG／CPU／CUDA 等工業縮寫保留；狀態不得只依賴顏色，並補 tooltip／文字標籤與鍵盤操作測試。
 - [ ] 有 GPU、無 GPU、DLL 缺少、DLL 版本不符、fallback 開/關各完成一次打包實機測試。（runtime tests 已覆蓋 missing/ABI mismatch/no-device/context-failure 與 fallback policy；無 NVIDIA/CUDA DLL 電腦已完成 CPU-compatible package build 與 5 recipes bundle，packaged smoke 進一步驗證 MainWindow、CPU-only pipeline、缺 DLL fallback 開啟時與 CPU 結果一致且 GPU call count=0、fallback 關閉/strict CUDA 明確失敗，EXE exit 0；有 GPU 與 packaged ABI mismatch 待實機）
+
+### GUI 後續優化（2026-09-15 v1.6.0 發行後盤點）
+
+- [ ] **檢測效能分析面板**：GUI 目前只在 viewer tooltip 顯示預覽的 QImage／QPixmap 時間，`execution.performance` 的各階段耗時、Detector 子階段、`device_host_split`、H2D／D2H bytes 與 native call 數都沒有呈現。在 Results（或 Run 側欄摺疊區）新增唯讀面板，資料一律取自本次執行結果 metadata，不得由 Recipe 推論；hybrid 步驟與 fallback 原因以文字標示。需測試 CPU-only、CUDA、fallback 三種結果的顯示。
+- [ ] **執行進度訊息繁中化**：`core/pipeline.py` 的 `Starting inspection`、`Recipe loaded`、`Tiles prepared`、`Inspecting tile n/m`、`Writing overlay, CSV, and JSON` 等英文訊息直接顯示在 Run 面板，違反操作文字繁中契約。改為繁中（保留 ROI、NG 等縮寫），並補 GUI 訊息測試；log 可維持英文。
+- [ ] **大圖預覽記憶體與 LOD**：`ImagePreviewWorker` 對 16384×13000 影像會建立全解析 RGB `QImage.copy()`（約 639 MB），`set_qimage` 再轉成全尺寸 `QPixmap`，同一張圖在 GUI 行程內至少佔兩份大型記憶體。改為依 viewport 顯示降採樣金字塔或分塊，放大後才載入原解析度區塊；overlay 座標、縮放與游標座標仍以原圖像素為準。需量測記憶體峰值與顯示時間前後對照。
+- [ ] **預覽與檢測重複解碼**：預覽與 `InspectionWorker` 各自解碼同一檔案，正式尺寸 `image_load` 約 768 ms（GPU 模式端到端的 38%）。評估以路徑＋mtime＋size 為 key 的單份解碼快取（設記憶體上限、檔案變更即失效、回傳唯讀或獨立副本），不得違反 GPU 模式「解碼後只上傳一次」邊界；以量測決定是否採用。
+- [ ] **預覽不再逐張建立 GpuRuntime**：`ImagePreviewWorker.run` 每次預覽都建立新的 `GpuRuntime`（載入 DLL／建立 context）只為做 BGR→RGB，與「GUI 共用單一 runtime／session」原則不一致。改用 GUI 共用 session 或直接走 CPU（先量測 GPU 轉換是否真的有收益），並測試 strict CUDA 與 fallback 行為不變。
+- [ ] **GPU session 預熱與重建條件**：`GpuExecutionSessionCache` 以 Recipe 路徑＋mtime＋size 當 key，Designer 儲存任何外參（例如面積上限）都會關閉並重建 CUDA session，下一張檢測重新承擔初始化成本。改為只在 `gpu` 區段、DLL 路徑或影響 plan 的設定變更時重建；載入 GPU Recipe 後可於背景預熱 context，第一張檢測不承擔冷啟動。需量測冷／熱第一張的差距並測試 Recipe 快取失效語意不變。
+- [ ] **VRAM 與整圖上傳狀態**：runtime 已回報 `resident_image.device_memory_before_upload`（可用 VRAM、上傳大小、`dedicated_vram_low`）與 crossover 略過上傳，但 GUI 未顯示。於 TopBar backend chip tooltip 或效能面板顯示，VRAM 不足時以 inline notice 提示，狀態不得只依賴顏色。
+- [ ] **CPU／GPU 對照執行（工程／管理模式）**：同一張影像、同一份 Recipe 各跑一次 CPU 與 GPU，顯示判定欄位（PASS/NG、defect 數、bbox、area、confidence、metadata）是否一致與各階段倍數，比較邏輯沿用 `tools/benchmark_pipeline_production.py`，不修改 Recipe、不產生 dirty 狀態；OP 模式不可見。
 
 ## P7：CI、GitHub Actions 與發布
 
