@@ -35,10 +35,17 @@ def _cached_build_provenance() -> tuple[str, bool | None, str]:
     if packaged is not None:
         return str(packaged["commit"]), bool(packaged["dirty"]), str(packaged["source"])
     try:
-        commit = _git("rev-parse", "HEAD")
-        dirty = bool(_git("status", "--porcelain", "--untracked-files=no"))
+        status = _git("status", "--porcelain=v2", "--branch", "--untracked-files=no")
+        commit = next(
+            line.removeprefix("# branch.oid ")
+            for line in status.splitlines()
+            if line.startswith("# branch.oid ")
+        )
+        if not commit or commit == "(initial)":
+            raise ValueError("Git did not report a commit")
+        dirty = any(line and not line.startswith("# ") for line in status.splitlines())
         return commit, dirty, "git"
-    except (OSError, subprocess.SubprocessError):
+    except (OSError, StopIteration, ValueError, subprocess.SubprocessError):
         return "unknown", None, "unavailable"
 
 

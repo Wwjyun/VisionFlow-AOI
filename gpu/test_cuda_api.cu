@@ -116,6 +116,42 @@ int main() {
             context, bgr.data(), width, height, width * 3, 3, &resident_generation);
     }
     if (result == VF_CUDA_OK) {
+        const int row_bytes = width * 3;
+        std::vector<uint8_t> bottom_up(bgr.size(), 0);
+        for (int row = 0; row < height; ++row) {
+            std::memcpy(
+                bottom_up.data() + static_cast<size_t>(height - 1 - row) * row_bytes,
+                bgr.data() + static_cast<size_t>(row) * row_bytes,
+                static_cast<size_t>(row_bytes));
+        }
+        uint64_t bottom_up_generation = 0;
+        result = vf_context_upload_u8_file_order(
+            context,
+            bottom_up.data() + static_cast<size_t>(height - 1) * row_bytes,
+            width, height, -row_bytes, 3, &bottom_up_generation);
+        VfRoiV1 full_roi{sizeof(VfRoiV1), 0, 0, width, height};
+        void* full_batch = nullptr;
+        if (result == VF_CUDA_OK) {
+            result = vf_roi_batch_create(
+                context, bottom_up_generation, &full_roi, 1, &full_batch);
+        }
+        std::vector<uint8_t> bottom_up_download(bgr.size(), 0);
+        if (result == VF_CUDA_OK) {
+            result = vf_roi_batch_download_u8(
+                full_batch, 0, bottom_up_download.data(), row_bytes, 3);
+        }
+        int full_destroy_result = vf_roi_batch_destroy(full_batch);
+        if (result == VF_CUDA_OK &&
+            (full_destroy_result != VF_CUDA_OK || bottom_up_download != bgr)) {
+            std::cerr << "negative-stride resident upload changed row order\n";
+            return 11;
+        }
+        if (result == VF_CUDA_OK) {
+            result = vf_context_upload_u8(
+                context, bgr.data(), width, height, row_bytes, 3, &resident_generation);
+        }
+    }
+    if (result == VF_CUDA_OK) {
         result = vf_plan_execute_roi(
             plan, resident_generation, 0, 0, plan_binary.data(), resized_width, 1);
     }

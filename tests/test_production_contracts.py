@@ -376,13 +376,16 @@ class ProvenanceAndDatasetTests(unittest.TestCase):
         _cached_build_provenance.cache_clear()
         try:
             with patch("core.provenance._read_packaged_provenance", return_value=None), patch(
-                "core.provenance._git", side_effect=("abc123", " M core/pipeline.py")
+                "core.provenance._git",
+                return_value="# branch.oid abc123\n# branch.head main\n1 .M N... core/pipeline.py",
             ) as git:
                 first = build_provenance()
                 first["commit"] = "mutated"
                 second = build_provenance()
 
-            self.assertEqual(git.call_count, 2)
+            git.assert_called_once_with(
+                "status", "--porcelain=v2", "--branch", "--untracked-files=no"
+            )
             self.assertEqual(second, {"commit": "abc123", "dirty": True, "source": "git"})
         finally:
             _cached_build_provenance.cache_clear()

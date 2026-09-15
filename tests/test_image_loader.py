@@ -94,6 +94,48 @@ class ImageLoaderTests(unittest.TestCase):
                     np.testing.assert_array_equal(decoded, self._opencv(path))
                     np.testing.assert_array_equal(decoded, image)
 
+    def test_bmp_reader_can_preserve_packed_24_bit_file_rows_without_copying(self):
+        rng = np.random.default_rng(19)
+        reader = BmpReader(max_workers=4)
+        reader.PARALLEL_MIN_BYTES = 1
+        with tempfile.TemporaryDirectory() as directory:
+            for width in range(1, 9):
+                image = rng.integers(0, 256, size=(7, width, 3), dtype=np.uint8)
+                path = Path(directory) / f"packed_{width}.bmp"
+                ok, encoded = cv2.imencode(".bmp", image)
+                self.assertTrue(ok)
+                encoded.tofile(str(path))
+
+                decoded = reader.read(path, preserve_file_order=True)
+
+                self.assertLess(decoded.strides[0], 0)
+                self.assertEqual(abs(decoded.strides[0]), ((width * 3 + 3) // 4) * 4)
+                np.testing.assert_array_equal(decoded, image)
+
+    def test_bmp_reader_preserves_top_down_file_rows_with_positive_stride(self):
+        rng = np.random.default_rng(23)
+        image = rng.integers(0, 256, size=(6, 5, 3), dtype=np.uint8)
+        ok, encoded = cv2.imencode(".bmp", image)
+        self.assertTrue(ok)
+        payload = bytearray(encoded.tobytes())
+        pixel_offset = struct.unpack_from("<I", payload, 10)[0]
+        stride = ((image.shape[1] * 24 + 31) // 32) * 4
+        stored_rows = [
+            bytes(payload[pixel_offset + row * stride : pixel_offset + (row + 1) * stride])
+            for row in range(image.shape[0])
+        ]
+        struct.pack_into("<i", payload, 22, -image.shape[0])
+        payload[pixel_offset:] = b"".join(reversed(stored_rows))
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "top_down_color.bmp"
+            path.write_bytes(payload)
+
+            decoded = BmpReader(max_workers=1).read(path, preserve_file_order=True)
+
+            self.assertGreater(decoded.strides[0], 0)
+            self.assertEqual(decoded.strides[0], stride)
+            np.testing.assert_array_equal(decoded, image)
+
     def test_bmp_reader_matches_opencv_for_palettes_and_top_down_rows(self):
         rng = np.random.default_rng(11)
         with tempfile.TemporaryDirectory() as directory:

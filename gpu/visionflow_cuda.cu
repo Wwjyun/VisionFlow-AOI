@@ -1484,6 +1484,18 @@ __global__ void gather_roi_batch_kernel(
 
 dim3 grid2d(int width, int height) { return dim3((width + BLOCK_X - 1) / BLOCK_X, (height + BLOCK_Y - 1) / BLOCK_Y); }
 
+__global__ void flip_vertical_u8_in_place_kernel(
+    uint8_t* image, int row_bytes, int height) {
+    int column = blockIdx.x * blockDim.x + threadIdx.x;
+    int top = blockIdx.y * blockDim.y + threadIdx.y;
+    if (column >= row_bytes || top >= height / 2) return;
+    int bottom = height - 1 - top;
+    uint8_t value = image[static_cast<size_t>(top) * row_bytes + column];
+    image[static_cast<size_t>(top) * row_bytes + column] =
+        image[static_cast<size_t>(bottom) * row_bytes + column];
+    image[static_cast<size_t>(bottom) * row_bytes + column] = value;
+}
+
 // --- Template Anchor Grid localization (TM_CCOEFF_NORMED) -------------------------------
 // Reproduces core/tiler.py::Tiler._find_grid_anchor: the same correlation formula and the same
 // "topmost then leftmost wins a tie" order as the CPU argmax over the result map. Only the
@@ -2806,18 +2818,25 @@ VF_CUDA_API int vf_context_stats(
     return VF_CUDA_OK;
 }
 
-VF_CUDA_API int vf_context_upload_u8(
+static int context_upload_u8_impl(
     void* context,
     const uint8_t* src,
     int width,
     int height,
     int src_stride,
     int src_channels,
-    uint64_t* generation) {
+    uint64_t* generation,
+    bool allow_file_order) {
     PersistentContext* persistent = static_cast<PersistentContext*>(context);
+    const long long stride64 = static_cast<long long>(src_stride);
+    const long long absolute_stride = stride64 < 0 ? -stride64 : stride64;
+    const long long logical_row_bytes = static_cast<long long>(width) * src_channels;
     if (persistent == nullptr || generation == nullptr ||
         (src_channels != 1 && src_channels != 3) ||
-        !visionflow_cuda::valid_image(src, width, height, src_stride, src_channels)) {
+        src == nullptr || width <= 0 || height <= 0 ||
+        logical_row_bytes <= 0 || logical_row_bytes > INT_MAX ||
+        (src_stride < 0 && !allow_file_order) ||
+        absolute_stride < logical_row_bytes) {
         return VF_CUDA_INVALID_ARGUMENT;
     }
     reset_timing(persistent, true);
@@ -2828,11 +2847,24 @@ VF_CUDA_API int vf_context_upload_u8(
         row_bytes * static_cast<size_t>(height), &persistent->allocation_count);
     persistent->last_timings.allocation_ms += elapsed_host_ms(allocation_started);
     if (result != VF_CUDA_OK) return result;
+    const uint8_t* file_first_row = src;
+    size_t source_stride = static_cast<size_t>(absolute_stride);
+    if (src_stride < 0 && height > 1) {
+        file_first_row = src + static_cast<long long>(height - 1) * src_stride;
+    }
     cudaError_t error = cudaMemcpy2DAsync(
-        persistent->resident_u8, row_bytes, src, src_stride, row_bytes, height,
+        persistent->resident_u8, row_bytes, file_first_row, source_stride, row_bytes, height,
         cudaMemcpyHostToDevice, persistent->stream);
     if (error != cudaSuccess) return cuda_result(error);
     cudaEventRecord(persistent->timing_events[TIMING_AFTER_INPUT], persistent->stream);
+    if (src_stride < 0 && height > 1) {
+        flip_vertical_u8_in_place_kernel<<<
+            grid2d(static_cast<int>(row_bytes), height / 2),
+            dim3(BLOCK_X, BLOCK_Y), 0, persistent->stream>>>(
+                persistent->resident_u8, static_cast<int>(row_bytes), height);
+        result = visionflow_cuda::kernel_launch_result();
+        if (result != VF_CUDA_OK) return result;
+    }
     cudaEventRecord(persistent->timing_events[TIMING_AFTER_KERNEL], persistent->stream);
     cudaEventRecord(persistent->timing_events[TIMING_AFTER_OUTPUT], persistent->stream);
     auto synchronize_started = std::chrono::steady_clock::now();
@@ -2847,6 +2879,30 @@ VF_CUDA_API int vf_context_upload_u8(
     if (persistent->resident_generation == 0) ++persistent->resident_generation;
     *generation = persistent->resident_generation;
     return VF_CUDA_OK;
+}
+
+VF_CUDA_API int vf_context_upload_u8(
+    void* context,
+    const uint8_t* src,
+    int width,
+    int height,
+    int src_stride,
+    int src_channels,
+    uint64_t* generation) {
+    return context_upload_u8_impl(
+        context, src, width, height, src_stride, src_channels, generation, false);
+}
+
+VF_CUDA_API int vf_context_upload_u8_file_order(
+    void* context,
+    const uint8_t* src,
+    int width,
+    int height,
+    int src_stride,
+    int src_channels,
+    uint64_t* generation) {
+    return context_upload_u8_impl(
+        context, src, width, height, src_stride, src_channels, generation, true);
 }
 
 VF_CUDA_API int vf_roi_batch_create(

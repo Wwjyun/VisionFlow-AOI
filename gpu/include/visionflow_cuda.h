@@ -133,6 +133,11 @@ VF_CUDA_API int vf_context_upload_u8(
     void* context,
     const uint8_t* src, int width, int height, int src_stride, int src_channels,
     uint64_t* generation);
+/* A negative src_stride denotes bottom-up rows; src points at the logical top row. */
+VF_CUDA_API int vf_context_upload_u8_file_order(
+    void* context,
+    const uint8_t* src, int width, int height, int src_stride, int src_channels,
+    uint64_t* generation);
 VF_CUDA_API int vf_roi_batch_create(
     void* context, uint64_t generation,
     const VfRoiV1* rois, int roi_count, void** batch);

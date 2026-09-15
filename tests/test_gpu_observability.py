@@ -201,6 +201,7 @@ class _NativeDagPlanDll(_NativePlanDll):
         self.vf_dag_plan_execute = _Function(self._dag_execute)
         self.vf_dag_plan_destroy = _Function(self._dag_destroy)
         self.vf_context_upload_u8 = _Function(self._upload)
+        self.vf_context_upload_u8_file_order = _Function(self._upload)
         self.vf_plan_execute_roi = _Function(self._plan_execute_roi)
         self.vf_dag_plan_execute_roi = _Function(self._dag_execute_roi)
         self.vf_gpu_memory_info = _Function(self._memory_info)
@@ -752,6 +753,50 @@ class GpuRuntimeMetricsTests(unittest.TestCase):
         self.assertEqual(metrics["host_to_device_bytes"], image.nbytes)
         self.assertEqual(metrics["functions"]["vf_plan_execute_roi"]["host_to_device_bytes"], 0)
         self.assertEqual(metrics["functions"]["vf_dag_plan_execute_roi"]["host_to_device_bytes"], 0)
+
+    def test_resident_upload_passes_packed_negative_row_stride_without_host_copy(self):
+        runtime = GpuRuntime(enabled=False)
+        dll = _NativeDagPlanDll()
+        runtime._dll = dll
+        runtime.device_count = 1
+        runtime._load_optional_context()
+        backing = np.arange(6 * 7 * 3, dtype=np.uint8).reshape(6, 7, 3)
+        logical_top_down = backing[::-1]
+
+        with patch(
+            "core.gpu_runtime.np.ascontiguousarray",
+            side_effect=AssertionError("unexpected full-image host copy"),
+        ):
+            resident = runtime.upload_image(logical_top_down)
+
+        self.assertEqual(
+            (resident.height, resident.width, resident.channels), logical_top_down.shape
+        )
+        np.testing.assert_array_equal(dll.resident, logical_top_down)
+        metrics = runtime.performance_stats()
+        self.assertEqual(metrics["host_to_device_bytes"], logical_top_down.nbytes)
+        self.assertIn("vf_context_upload_u8_file_order", metrics["functions"])
+
+    def test_old_dll_copies_negative_stride_before_legacy_upload(self):
+        runtime = GpuRuntime(enabled=False)
+        dll = _NativeDagPlanDll()
+        del dll.vf_context_upload_u8_file_order
+        runtime._dll = dll
+        runtime.device_count = 1
+        runtime._load_optional_context()
+        backing = np.arange(6 * 7 * 3, dtype=np.uint8).reshape(6, 7, 3)
+        logical_top_down = backing[::-1]
+        contiguous = np.ascontiguousarray
+
+        with patch("core.gpu_runtime.np.ascontiguousarray", wraps=contiguous) as copied:
+            runtime.upload_image(logical_top_down)
+
+        self.assertTrue(copied.called)
+        self.assertFalse(runtime.supports_file_order_upload)
+        np.testing.assert_array_equal(dll.resident, logical_top_down)
+        self.assertIn(
+            "vf_context_upload_u8", runtime.performance_stats()["functions"]
+        )
 
     def test_resident_sub_roi_validates_parent_bounds_and_runtime(self):
         runtime = GpuRuntime(enabled=False)

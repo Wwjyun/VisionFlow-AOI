@@ -181,6 +181,10 @@ class GpuRuntime:
         return self._capabilities.resident_roi
 
     @property
+    def supports_file_order_upload(self) -> bool:
+        return self._capabilities.file_order_upload
+
+    @property
     def supports_roi_batch(self) -> bool:
         return self._capabilities.roi_batch
 
@@ -239,6 +243,7 @@ class GpuRuntime:
                 "native_plan": self.supports_native_plan,
                 "native_dag_plan": self.supports_native_dag_plan,
                 "resident_roi": self.supports_resident_roi,
+                "file_order_upload": self.supports_file_order_upload,
                 "roi_batch": self.supports_roi_batch,
                 "fused_401_2": self.supports_fused_401_2,
                 "template_match": self.supports_template_match,
@@ -402,13 +407,28 @@ class GpuRuntime:
     def upload_image(self, image: np.ndarray) -> GpuResidentImage:
         if not self.supports_resident_roi:
             raise GpuRuntimeError("CUDA DLL has no resident image/ROI exports")
-        source = self._u8_image(image, channels=(1, 3))
+        source = self._u8_image(image, channels=(1, 3), contiguous=False)
         channels = 1 if source.ndim == 2 else int(source.shape[2])
+        packed_columns = source.strides[1] == (1 if source.ndim == 2 else channels)
+        packed_channels = source.ndim == 2 or source.strides[2] == 1
+        if (
+            not packed_columns
+            or not packed_channels
+            or abs(int(source.strides[0])) < int(source.shape[1]) * channels
+            or (int(source.strides[0]) < 0 and not self.supports_file_order_upload)
+        ):
+            source = np.ascontiguousarray(source)
+        function_name = (
+            "vf_context_upload_u8_file_order"
+            if int(source.strides[0]) < 0
+            else "vf_context_upload_u8"
+        )
+        function = getattr(self._dll, function_name)
         generation = ctypes.c_uint64()
         queued = time.perf_counter()
         with self._queue_slots, self._lock:
             lock_acquired = time.perf_counter()
-            result = int(self._dll.vf_context_upload_u8(
+            result = int(function(
                 self._context,
                 source.ctypes.data_as(ctypes.POINTER(ctypes.c_uint8)),
                 int(source.shape[1]), int(source.shape[0]), int(source.strides[0]), channels,
@@ -416,13 +436,13 @@ class GpuRuntime:
             ))
             completed = time.perf_counter()
             self._record_performance(
-                "vf_context_upload_u8", int(source.nbytes), 0,
+                function_name, int(source.nbytes), 0,
                 completed - lock_acquired, lock_acquired - queued,
             )
             if result == 0 and self._capture_native_cumulative:
                 self._record_native_performance_unlocked()
         if result != 0 or generation.value == 0:
-            raise self._native_error("vf_context_upload_u8", result)
+            raise self._native_error(function_name, result)
         return GpuResidentImage(
             self, int(generation.value), int(source.shape[1]), int(source.shape[0]), channels
         )
@@ -1516,6 +1536,7 @@ class GpuRuntime:
 
     def _load_optional_resident_roi(self) -> None:
         upload = getattr(self._dll, "vf_context_upload_u8", None)
+        file_order_upload = getattr(self._dll, "vf_context_upload_u8_file_order", None)
         linear = getattr(self._dll, "vf_plan_execute_roi", None)
         dag = getattr(self._dll, "vf_dag_plan_execute_roi", None)
         if upload is not None:
@@ -1525,6 +1546,13 @@ class GpuRuntime:
                 ctypes.POINTER(ctypes.c_uint64),
             ]
             upload.restype = ctypes.c_int
+        if file_order_upload is not None:
+            file_order_upload.argtypes = [
+                ctypes.c_void_p, ctypes.POINTER(ctypes.c_uint8),
+                ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+                ctypes.POINTER(ctypes.c_uint64),
+            ]
+            file_order_upload.restype = ctypes.c_int
         if linear is not None:
             linear.argtypes = [
                 ctypes.c_void_p, ctypes.c_uint64, ctypes.c_int, ctypes.c_int,

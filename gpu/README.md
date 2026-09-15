@@ -637,6 +637,54 @@ candidate extraction、geometry/statistics 在 device；最終 PASS/NG aggregati
 `production_provenance_release_final.json`。這輪沒有修改 `.cu`、CUDA header 或 ABI，因此不需要重編 DLL；量測使用
 前一輪已為 RTX 3090／`sm_86` 重編並驗證的 DLL。
 
+### 2026-09-15 BMP file-order 直讀與 resident upload
+
+平行 BMP reader 原本在每段讀完時直接翻成 top-down rows；這會在 CPU 觸碰並重排完整 639 MB 影像，之後才整張
+上傳。GPU grid/resident 模式現在讓 24-bit BMP 保留磁碟列序：bottom-up BMP 回傳負 row stride 的 logical
+top-down NumPy view，CUDA 先依實體連續列做一次 H2D，再用 device kernel 上下交換列。Detector、anchor 與 ROI
+看到的座標仍是 top-down，裁切後不回傳 CPU。
+
+新能力使用 additive optional export `vf_context_upload_u8_file_order`。既有 `vf_context_upload_u8` 仍只接受正
+stride，ABI v1 不變；舊 DLL 缺少新 export 時，pipeline 不要求 file-order reader，runtime 若收到負 stride 也會先
+建立連續 host image 再呼叫舊 export。這讓程式與舊 CUDA DLL 保持相容。
+
+同一 Python process、同圖同 Recipe 的交錯 A/B（warm-up 後 7 對，加 warm-up 記錄共 8 次）結果：
+
+| 路徑 | 端到端 median／P95 | image load median | initialization median |
+|---|---:|---:|---:|
+| 原平行 reader，CPU 翻列 | 384.1／505.6 ms | 183.5 ms | 79.9 ms |
+| **保留 file-order，device 翻列** | **304.4／337.1 ms** | **103.1 ms** | 80.9 ms |
+
+新路徑 **1.26×**，8/8 次較快，判定欄位相同。最終重建 DLL 後的獨立正式基準（RTX 3090、16384×13000
+BMP、六個高 12000／寬 2000 ROI、warm-up 1＋量測 3）如下：
+
+| 階段 | CPU median／P95 | GPU median／P95 | CPU/GPU 倍數 |
+|---|---:|---:|---:|
+| **端到端** | 5453.3／5684.8 ms | **397.7／418.9 ms** | **13.71×** |
+| image load | 175.8／190.8 ms | **102.6／116.9 ms** | 1.71× |
+| initialization／整圖 H2D | 0.09／0.14 ms | 173.5／180.0 ms | — |
+| tiling | 67.0／67.5 ms | 2.45／2.51 ms | 27.30× |
+| detector | 5147.0／5399.7 ms | 86.3／86.9 ms | 59.66× |
+
+每輪仍只有一次 638,976,000-byte H2D，六次 device candidate export 加一次 anchor match 的 D2H 合計
+22,340 bytes。3/3 輪 PASS/NG、tile／defect 數、type、bbox、area、confidence 與 decision metadata 相同；
+不參與判定的六個 `anchor_score` 最大絕對漂移為 6.557e-7。
+
+另外兩個原型未採用：整張 pinned buffer 的 pageable upload 78.35→53.79 ms，但 BMP 讀入 pinned memory 較慢，
+讀取＋上傳只從 257.5→243.0 ms（5.6%），同時鎖住約 609 MiB RAM；mmap BMP 為 171.5 ms，也慢於同輪
+reader 的 166.4 ms。下一個值得量測的方向是以 bounded pinned staging buffer 將分段 BMP read 與分段 H2D
+重疊，避免鎖住整張影像；它需要新增可中止的 begin/chunk/commit native contract，必須先證明完整 pipeline 穩定勝出。
+CUDA Graphs 暫不投入，現行每張只有 8 次 native calls，launch 管理不是主要成本。
+
+provenance 冷路徑也由兩個 Git subprocess 合併成一次 `git status --porcelain=v2 --branch`：獨立微基準
+94.2→50.4 ms，實際冷呼叫 median 54.0 ms；process 內仍沿用既有快取，warm 成本近乎為零。
+
+證據：`outputs_validation/decode_profile/direct_bmp_ab.json`、`production_file_order_final.json`、
+`reused_pinned_upload_probe.json`、`mmap_bmp_probe.json`、`direct_raw_bmp_probe.json`、
+`outputs_validation/cuda_file_order_validation.json`。本輪修改 `.cu` 與 header，DLL 已以 CUDA 13.3、`sm_86`
+重編；C++ native smoke、完整 CUDA validator、ROI batch、resize pipeline、crossover、morphology 與
+10/100/1000 次 stress 均通過。
+
 ## 檔案
 
 ```text

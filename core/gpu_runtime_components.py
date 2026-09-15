@@ -90,6 +90,14 @@ class GpuCapabilities:
         )
 
     @property
+    def file_order_upload(self) -> bool:
+        """Optional upload that accepts BMP-style bottom-up row order."""
+        return bool(
+            self.resident_roi
+            and self.has_exports(("vf_context_upload_u8_file_order",))
+        )
+
+    @property
     def roi_batch(self) -> bool:
         return bool(
             self.resident_roi

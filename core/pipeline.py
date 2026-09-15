@@ -94,19 +94,28 @@ class AOIPipeline(LogMixin):
             self.logger.warning("CUDA requested; falling back to CPU: %s", gpu_runtime.unavailable_reason)
         self.logger.info("Recipe loaded: name=%s version=%s", recipe.get("recipe_name"), recipe.get("version"))
         self._progress(5, "Recipe loaded")
+        tile_config = recipe["tile"]
+        detector_gpu_requested = detector_gpu_allowed and any(
+            bool(config.get("use_gpu", False))
+            and self.detector_manager.uses_native_cuda_runtime(detector_id)
+            for detector_id, config in detector_configs.items()
+        )
+        preserve_bmp_file_order = bool(
+            detector_gpu_requested
+            and gpu_runtime.available
+            and gpu_runtime.supports_resident_roi
+            and bool(getattr(gpu_runtime, "supports_file_order_upload", False))
+            and str(tile_config.get("mode", "grid")).lower() == "grid"
+        )
         with profiler.measure("image_load"):
-            image = load_image(image_path)
+            image = load_image(
+                image_path, preserve_bmp_file_order=preserve_bmp_file_order
+            )
         self.logger.info("Image loaded: image=%s shape=%s", image_path, getattr(image, "shape", None))
         self._progress(10, "Image loaded")
         with profiler.measure("initialization"):
-            tile_config = recipe["tile"]
             resident_image = None
             resident_upload_memory = {}
-            detector_gpu_requested = detector_gpu_allowed and any(
-                bool(config.get("use_gpu", False))
-                and self.detector_manager.uses_native_cuda_runtime(detector_id)
-                for detector_id, config in detector_configs.items()
-            )
             crossover_policy = getattr(gpu_runtime, "crossover_policy", None)
             resident_skip_key = (provenance.get("effective_recipe_sha256", ""), tuple(image.shape))
             resident_skipped_by_crossover = bool(

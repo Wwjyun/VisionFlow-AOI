@@ -48,7 +48,7 @@ class BmpReader:
     def __init__(self, max_workers: int | None = None):
         self.max_workers = max(1, int(max_workers or min(self.MAX_WORKERS, os.cpu_count() or 1)))
 
-    def read(self, path: Path) -> np.ndarray | None:
+    def read(self, path: Path, *, preserve_file_order: bool = False) -> np.ndarray | None:
         path = Path(path)
         with open(path, "rb") as handle:
             header = handle.read(1024)
@@ -57,21 +57,53 @@ class BmpReader:
             return None
         rows = abs(layout.height)
         pixel_bytes = layout.stride * rows
-        output = np.empty((rows, layout.width, 3), dtype=np.uint8)
+        direct_file_rows = bool(preserve_file_order and layout.bits_per_pixel == 24)
+        if direct_file_rows:
+            backing = np.empty((rows, layout.stride), dtype=np.uint8)
+            pixels = backing[:, : layout.width * 3].reshape(rows, layout.width, 3)
+            output = pixels[::-1] if layout.bottom_up else pixels
+        else:
+            backing = None
+            output = np.empty((rows, layout.width, 3), dtype=np.uint8)
         workers = self.max_workers if pixel_bytes >= self.PARALLEL_MIN_BYTES else 1
         bands = min(rows, workers * self.BANDS_PER_WORKER)
         bounds = np.linspace(0, rows, bands + 1, dtype=np.int64)
         if bands == 1:
-            self._read_band(path, layout, output, 0, rows)
+            if direct_file_rows:
+                self._read_raw_band(path, layout, backing, 0, rows)
+            else:
+                self._read_band(path, layout, output, 0, rows)
         else:
             with ThreadPoolExecutor(max_workers=workers) as pool:
                 futures = [
-                    pool.submit(self._read_band, path, layout, output, int(bounds[i]), int(bounds[i + 1]))
+                    pool.submit(
+                        self._read_raw_band if direct_file_rows else self._read_band,
+                        path,
+                        layout,
+                        backing if direct_file_rows else output,
+                        int(bounds[i]),
+                        int(bounds[i + 1]),
+                    )
                     for i in range(bands)
                 ]
                 for future in futures:
                     future.result()
         return output
+
+    @staticmethod
+    def _read_raw_band(
+        path: Path, layout: _BmpLayout, backing: np.ndarray, start: int, stop: int,
+    ) -> None:
+        """Read packed file rows directly; the returned image view supplies the row orientation."""
+        with open(path, "rb", buffering=0) as handle:
+            handle.seek(layout.pixel_offset + start * layout.stride)
+            view = memoryview(backing[start:stop]).cast("B")
+            done = 0
+            while done < len(view):
+                received = handle.readinto(view[done:])
+                if not received:
+                    raise ImageLoadError(f"BMP pixel data ended early: {path}")
+                done += received
 
     @staticmethod
     def _layout(header: bytes, file_size: int, handle) -> _BmpLayout | None:
@@ -137,11 +169,13 @@ class ImageLoader(LogMixin):
         self.supported_extensions = supported_extensions or SUPPORTED_EXTENSIONS
         self.bmp_reader = bmp_reader or BmpReader()
 
-    def load_bgr(self, path: Path):
+    def load_bgr(self, path: Path, *, preserve_bmp_file_order: bool = False):
         image_path = self._validate_path(path)
         if image_path.suffix.lower() == ".bmp":
             try:
-                image = self.bmp_reader.read(image_path)
+                image = self.bmp_reader.read(
+                    image_path, preserve_file_order=preserve_bmp_file_order
+                )
             except (OSError, ValueError, ImageLoadError):
                 self.logger.debug("Fast BMP read failed, using OpenCV: %s", image_path, exc_info=True)
                 image = None
@@ -174,5 +208,7 @@ class ImageLoader(LogMixin):
         return image_path
 
 
-def load_image(path: Path):
-    return ImageLoader().load_bgr(path)
+def load_image(path: Path, *, preserve_bmp_file_order: bool = False):
+    return ImageLoader().load_bgr(
+        path, preserve_bmp_file_order=preserve_bmp_file_order
+    )

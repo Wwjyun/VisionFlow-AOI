@@ -18,11 +18,14 @@
 
 - [ ] **2026-09-15 使用者排定的新 GPU mode 下一步優先順序**（依序執行；P0 anchor 接線與 split 誤報已完成）：
   1. ~~CCL＋ring CNR 留在 device~~ **已完成（2026-09-15，見完成紀錄）**：`vf_cnr_candidates_u8_roi` 接入，正式尺寸 GPU 端到端 1957.5 → 1467.7 ms（4.58×），每輪 D2H 288 MB → 0.022 MB。小 ROI 平行化亦已完成：ring 統計全部資料平行後 256×256 起快於既有路徑，已移除尺寸界線，GPU 端到端再降為 1111.2 ms（5.80×）。
-  2. ~~影像解碼~~ **已完成（2026-09-15，見完成紀錄）**：使用者確認產線為 BMP；`BmpReader` 平行分段讀取，正式尺寸 826 → 223 ms、像素與 OpenCV 相同，GPU 端到端 1111.2 → 647.4 ms（9.10×）。PNG／JPEG 未處理。
-  3. 初始化預熱：預熱按鈕已完成（第一張 2075.5 → 1859.2 ms）；剩 session 重建條件與自動預熱（見 P6）。
-  4. findContours／鏈間並行：等 CCL 重做時順路處理，不單獨投入。
+  2. ~~影像解碼與 BMP file-order upload~~ **已完成（2026-09-15，見完成紀錄）**：`BmpReader` 先以平行分段讀取把正式尺寸 826 → 223 ms；GPU resident 路徑再保留 BMP 底向上列序，省掉 CPU 全圖翻轉，正式尺寸 GPU 端到端降至 397.7 ms、CPU/GPU 13.71×。PNG／JPEG 未處理。
+  3. 分段 BMP read/H2D overlap：目前 GPU median 的 image load 102.6 ms、初始化／整圖上傳 173.5 ms 仍循序；先做 bounded pinned staging buffer 的雙緩衝原型，只在逐像素／判定等價且端到端穩定勝出時採用。整張 609 MiB pinned buffer 與 mmap 原型已量測無足夠收益，不採用。
+  4. 初始化預熱：預熱按鈕已完成（第一張 2075.5 → 1859.2 ms）；剩 session 重建條件與自動預熱（見 P6）。
+  5. findContours／鏈間並行：等 CCL 重做時順路處理，不單獨投入。
 
 - [x] 2026-09-15 新 GPU mode 目標：CPU 解碼後整圖只做一次 resident upload，6 個高 12000×寬 2000 ROI 從切 tile起直接在 GPU 執行 202 detector CNR；保持 CPU fallback 與判定等價，並以 RTX 3090 的 median/P95/倍數/傳輸量驗收。正式 benchmark 已修正為 16384×13000 原圖與一列 6 ROI。最終重編成品 CPU 6504.0/6665.2 ms、GPU 2097.0/2123.5 ms（皆 median/P95），端到端 **3.10×**、detector **5.61×**、automatic CNR **8.81×**；每輪只有一次 638.976 MB 整圖 H2D、288 MB D2H、13 calls，3/3 判定欄位相同。GPU CCL 實驗在完整 pipeline 只改善 8.2 ms／0.4%，卻增加 144 MB H2D、576.011 MB D2H 與 6 次 native call，因此已撤回接線；正式版本維持 CPU CCL/ring，未來只有在 mask、CCL、ring 全部 device-resident 且只下載候選統計時才重做。RTX native smoke、15-case resident 等價、完整 CUDA validator、1000 次 stress、fault injection、435 tests、compileall、preflight 與 CLI 合成圖 smoke 全部通過；完整交接紀錄與表格在 `gpu/README.md`。
+
+- [x] 2026-09-15 BMP file-order resident upload：24-bit BMP 在 GPU grid/resident 模式直接把磁碟列序讀入 backing，以負 stride 提供邏輯 top-down view；新增 optional `vf_context_upload_u8_file_order`，一次 H2D 後在 device 翻列，省掉 CPU 639 MB 全圖翻轉。舊 DLL 沒有新 export 時自動改回連續 host image 與既有 `vf_context_upload_u8`。同 process 交錯 A/B 8/8 勝出，端到端 384.1→304.4 ms（1.26×）、讀圖 183.5→103.1 ms；最終正式重測 CPU 5453.3 ms、GPU 397.7 ms（13.71×），3/3 判定欄位完全相同，D2H 22,340 bytes。整張 pinned buffer 只使讀取＋上傳 257.5→243.0 ms（5.6%）且鎖住約 609 MiB，mmap 171.5 ms 慢於既有 reader 166.4 ms，均不採用。CUDA DLL 已以 CUDA 13.3／`sm_86` 重編，native smoke 與完整 validator（含 10/100/1000 stress、crossover、morphology、ROI batch、resize pipeline）通過。
 
 - [x] CUDA DLL 已在 RTX 3090 編譯，並在另一台電腦確認可載入及顯示 CUDA active。
 - [x] 已確認 CUDA active 不代表整條 AOI pipeline 都在 GPU；首次跨機測試端到端沒有加速。
