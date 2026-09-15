@@ -803,7 +803,7 @@ flowchart LR
 
 CPU mode 同一流程全部在 CPU 執行、不載入 CUDA。這組數字來自合成影像，只代表此幾何與 Detector；真實產線影像仍需另行驗收。完整 13 個階段、傳輸量明細、CPU／GPU 兩種 mode 流程圖、未採用方案與後續優化排序見 [`gpu/README.md`](gpu/README.md#2026-09-15-v160-發行版全流程各階段對照與兩種-mode-流程)。
 
-**`main`（v1.6.1 之後）：CCL＋ring CNR 移到 GPU 並平行化。** 同一正式尺寸基準：端到端 CPU 6441.7 ms、GPU **1111.2 ms（5.80×）**，GPU 端比 v1.6.1 的 1957.5 ms 快 43%；Detector 合計 CPU 5399.6 ms、GPU 88.7 ms（60.9×）。每輪 GPU 傳輸只剩整圖上傳 639 MB 與 22 KB 的候選紀錄（v1.6.1 需下載 288 MB 的 gray 與 mask），native call 由 14 次降為 8 次；3/3 輪判定欄位完全相同。GPU 模式剩下最大的一段是影像解碼（約 760 ms，68%）。詳見 [`gpu/README.md`](gpu/README.md)〈CCL＋ring CNR 留在 device〉。
+**`main`（v1.6.1 之後）：CCL＋ring CNR 移到 GPU 並平行化。** 同一正式尺寸基準：端到端 CPU 6441.7 ms、GPU **1111.2 ms（5.80×）**，GPU 端比 v1.6.1 的 1957.5 ms 快 43%；Detector 合計 CPU 5399.6 ms、GPU 88.7 ms（60.9×）。每輪 GPU 傳輸只剩整圖上傳 639 MB 與 22 KB 的候選紀錄（v1.6.1 需下載 288 MB 的 gray 與 mask），native call 由 14 次降為 8 次；3/3 輪判定欄位完全相同。BMP 影像改由平行分段讀取器載入（與 OpenCV 逐像素相同，未支援的 BMP 變體與其他格式仍用 OpenCV）後，正式尺寸讀檔由約 760 ms 降為 203 ms，GPU 端到端再降為 **647.4 ms（9.10×）**，CPU 模式也由 6441.7 ms 降為 5890.8 ms。詳見 [`gpu/README.md`](gpu/README.md)〈CCL＋ring CNR 留在 device〉。
 
 ### RTX 3090 編譯與驗證
 

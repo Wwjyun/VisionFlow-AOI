@@ -531,6 +531,62 @@ Detector 89 ms（8%）。剩下最大的一段是影像解碼（使用者優先�
 JSON：`outputs_validation/cnr_candidates/production_parallel.json`（循序版：`production_candidates.json`）、
 `outputs_validation/cnr_candidates/cnr_candidates_u8_roi_equivalence.json`。
 
+### 2026-09-15 影像解碼：BMP 平行分段讀取
+
+使用者排定的新 GPU mode 第 2 優先，產線影像格式經使用者確認為 **BMP**。以下改動在 `main`，尚未包含在任何發行檔。
+
+**先量再做**（16384×13000 正式尺寸影像轉存三種格式，4 次取後 3 次 median）
+
+| 格式 | 檔案 | `np.fromfile` 讀檔 | `cv2.imdecode` 解碼 |
+|---|---:|---:|---:|
+| BMP 24-bit | 639.0 MB | 367.8 ms | **589.4 ms** |
+| PNG（壓縮 3） | 136.0 MB | 62.4 ms | 2029.0 ms |
+| JPEG（品質 95） | 36.2 MB | 17.8 ms | 955.2 ms |
+
+BMP 的「解碼」本質上只是列翻轉，OpenCV 卻逐列串流處理而佔掉 589 ms；另外讀檔與首次觸碰 639 MB 配置也有
+數百 ms。PNG／JPEG 的瓶頸在壓縮演算法（JPEG 若用 nvJPEG 也不會與 libjpeg-turbo 逐位元相同），因使用者
+產線是 BMP，本輪不處理。
+
+**做法**：`core/image_loader.py` 新增 `BmpReader`，`ImageLoader.load_bgr` 對 `.bmp` 先使用它：
+
+- 只接受無壓縮（BI_RGB）24-bit 與 8-bit 調色盤、bottom-up 或 top-down；其餘（32-bit、BITFIELDS、RLE、
+  1/4/16-bit、header 不一致、檔案截斷）回傳 `None`，改走原本 `cv2.imdecode`。
+- 以 `min(8, CPU 數)` 個 worker、每 worker 2 段平行 positional read，每段讀完直接寫入翻轉後的目的列；
+  32 MB 以下的影像不開 thread。8-bit 以調色盤查表展開成 BGR，超出調色盤數的索引為黑色（與 OpenCV 相同）。
+- 記憶體峰值：一份解碼影像加上正在讀的段落，不高於原本「整個檔案 bytes＋解碼影像」同時存在的做法。
+
+原型比較（同一張 BMP，後 4 次 median）：`cv2.imdecode` 847.6 ms、`np.fromfile`＋翻轉 469.5 ms、
+單次讀取＋平行翻轉 374.8 ms、**平行分段讀取 240.9 ms**；再增加到 16 worker 不會更快（225–319 ms），
+剩下的是記憶體頻寬與 639 MB 首次觸碰的 page fault。
+
+**驗證**
+
+- `tests/test_image_loader.py`：寬度 1–8 × 高度 1/2/5 的 24-bit（涵蓋每種 row padding）、OpenCV 寫出的
+  8-bit 灰階、手工建立的 8-bit 彩色調色盤（含超出調色盤的索引）bottom-up 與 top-down、平行分段、中文路徑，
+  全部與 `cv2.imdecode` 逐像素相同；32-bit、截斷檔、假 BMP 確實回退。
+- `tools/benchmark_image_load.py --image <bmp>`：正式尺寸 `cv2.imdecode` 826.0 ms → `ImageLoader` 222.9 ms
+  （3.71×），像素完全相同。
+- 正式 Recipe manifest 12/12 等價；BMP 版 CLI 合成圖 smoke 正常；464 tests 通過。
+
+**完整 pipeline**（同一正式尺寸基準，warm-up 1＋量測 3 輪；BMP 讀取器同時加速 CPU 與 GPU 兩種 mode）
+
+| 階段 | CPU median／P95 | 解碼前 GPU（平行 ring） | **本次 GPU median／P95** | CPU/GPU 倍數 |
+|---|---:|---:|---:|---:|
+| **端到端** | 5890.8／5929.9 ms | 1111.2 ms | **647.4／680.6 ms** | **9.10×** |
+| 讀檔與解碼 | 208.3／210.8 ms | 759.6 ms | **202.6／226.3 ms** | 1.03× |
+| Detector 合計 | 5461.9／5498.8 ms | 88.7 ms | 96.5／179.8 ms | 56.60× |
+| 初始化（含整圖上傳） | 0.1 ms | 122.0 ms | 113.9／199.9 ms | — |
+| Recipe 設定 | 94.3 ms | 97.8 ms | 108.8／120.8 ms | 0.87× |
+| Tiling 合計 | 74.6 ms | 2.5 ms | 2.6／8.1 ms | 28.42× |
+
+3/3 輪判定欄位完全相同。GPU 三輪為 647.4、521.7、680.6 ms。GPU 端到端 647 ms 中，各階段合計約 526 ms：
+解碼 203 ms（31%）、整圖上傳 114 ms（18%）、Recipe 設定 109 ms（17%）、Detector 97 ms（15%）；另有約
+121 ms 不在任何 profiler 階段內（結果組裝、metrics 快照與序列化等），是下一輪值得先量清楚的部分。
+JSON：`outputs_validation/decode_profile/production_bmp_reader.json`、`image_load_bmp.json`。
+
+**v1.6.1 → 目前 `main` 的 GPU 端到端**：1957.5 ms → CCL＋ring 上 GPU 1467.7 ms → ring 平行化 1111.2 ms →
+BMP 讀取器 **647.4 ms**（-67%）。
+
 ## 檔案
 
 ```text
