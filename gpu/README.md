@@ -43,16 +43,18 @@ plan，tile metadata 以 `cpu_crossover` 路線與 `preprocess_routes` 標示。
   與 `cv2.matchTemplate` 的定位座標在 9 個場景 9/9 相同、分數差 ≤ 4.2e-7、逐次執行決定性。
   形狀界線內（template 每邊 ≤ 128 px 且搜尋面積 ≥ 256×256）比 CPU 快 1.6～3.9 倍，
   界線外或失敗時回 CPU 參考；界線見 `core/tiler.py` 的 `gpu_anchor_shapes_supported`。
-- `vf_find_contours_u8` / `vf_find_contours_download`（輪廓抽取）：**正確但全面較慢，
-  已判定不接入產線**。與 `cv2.findContours(RETR_LIST/RETR_EXTERNAL,
+- `vf_find_contours_u8` / `vf_find_contours_download`（輪廓抽取）：**正確且已改善，但尚未全面勝過 CPU，
+  因此不接入產線**。與 `cv2.findContours(RETR_LIST/RETR_EXTERNAL,
   CHAIN_APPROX_SIMPLE)` 在 `tools/check_contour_equivalence.py` 的 **314 個案例全部逐點
-  相同且決定性**（含輪廓數、每條 shape、點順序、子區域座標契約），但**在每一個量測形狀都
-  慢於 cv2**（GPU／CPU 毫秒）：512×512 稀疏 0.24→1.06（0.22×）、512×512 密集
+  相同且決定性**（含輪廓數、每條 shape、點順序、子區域座標契約）。**warp 改善前在每一個量測
+  形狀都慢於 cv2**（GPU／CPU 毫秒）：512×512 稀疏 0.24→1.06（0.22×）、512×512 密集
   0.23→3.91（0.06×）、2048×2048 密集 3.04→23.17（0.13×）、2000×12000 稀疏
   13.77→34.16（0.40×）、中型 18.63→136.54（0.14×）、大型 26.97→261.85（0.10×）、
-  `RETR_EXTERNAL` 13.83→1234.75（0.01×）。**沒有任何形狀勝出，故不訂啟用界線、維持停用**；
-  此結論已更正先前的錯誤記載，日後若要重啟需先提出新的演算法（例如 tile 化後只下載輪廓點，
-  而非整張 label 影像）。
+  `RETR_EXTERNAL` 13.83→1234.75（0.01×）。這是 warp 改善前的完整 enablement matrix；目前仍不訂
+  啟用界線、維持停用。2026-09-15 把 `RETR_LIST` 每一步序列讀取 8 鄰域改成 warp 同時讀取、只由
+  lane 0 寫標記與點，舊／新 DLL 各暖機後 15 次 A/B：高 12000×寬 2000 的稀疏長輪廓
+  **37.08→29.89 ms（減少 19.4%）**、密集短輪廓 **8.93→8.00 ms（減少 10.4%）**，314/314
+  逐點相同。稀疏長輪廓仍慢於 cv2，`RETR_EXTERNAL` 也仍是序列 byte 掃描，故尚不能接入 Detector。
 - `vf_cnr_mask_f32`（residual 門檻與候選遮罩一次算完）：**已接入** `detectors/detector_202_1.py`
   的 `_residual_statistics`。它把 `residual` 與 `|residual − median|` 都建在 device 上，用與
   `vf_median_f32` 相同的 key／排序機制取兩個中位數、以 double 算門檻、再以 **float32** 比較

@@ -190,12 +190,12 @@ def benchmark(runtime: GpuRuntime, rows: list[str], report: dict) -> None:
     for name, mask in benchmark_masks():
         reference, _ = cv2.findContours(mask, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
         cpu = time_call(
-            lambda: cv2.findContours(mask, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE), 3
+            lambda: cv2.findContours(mask, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE), 7
         )
-        # One warm-up call, then a single measured call: the serialized device trace is expected to
-        # be far slower than the CPU reference, so the gate reports it instead of hiding it.
+        # Warm up both paths and use medians. Single-call readings previously produced a false
+        # dense-mask win, so the acceptance gate must not make routing decisions from one sample.
         contours = runtime.find_contours_gray(mask, "list")
-        gpu = time_call(lambda: runtime.find_contours_gray(mask, "list"), 1)
+        gpu = time_call(lambda: runtime.find_contours_gray(mask, "list"), 7)
         timings = runtime.performance_stats().get("native_timings_ms") or {}
         same, detail = compare(reference, contours)
         entry = {

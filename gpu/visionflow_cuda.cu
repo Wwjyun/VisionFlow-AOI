@@ -1978,6 +1978,94 @@ __device__ void contour_fetch(
     }
 }
 
+// Warp-cooperative form of contour_fetch for RETR_LIST. The border walk is still sequential, but
+// its expensive operation is choosing the first non-zero pixel in an eight-neighbour ring. Eight
+// lanes load that ring together and a ballot selects the same first neighbour as OpenCV's serial
+// loop. Lane zero remains the sole writer, so marking and CHAIN_APPROX_SIMPLE output stay exact.
+__device__ void contour_fetch_warp(
+    signed char* image, int stride, int i0_y, int i0_x, int is_hole, int pt_x, int pt_y,
+    int32_t* points, int point_capacity, int* point_index, int* overflow) {
+    constexpr unsigned int warp_mask = 0xffffffffu;
+    const int lane = static_cast<int>(threadIdx.x) & (warpSize - 1);
+    int s_end = is_hole ? 0 : 4;
+
+    int search_s = 0;
+    int search_y = 0;
+    int search_x = 0;
+    bool occupied = false;
+    if (lane < 8) {
+        search_s = (s_end - 1 - lane) & 7;
+        int dy = 0;
+        int dx = 0;
+        contour_ring_step(search_s, &dy, &dx);
+        search_y = i0_y + dy;
+        search_x = i0_x + dx;
+        occupied = image[static_cast<size_t>(search_y) * stride + search_x] != 0;
+    }
+    unsigned int occupied_lanes = __ballot_sync(warp_mask, occupied) & 0xffu;
+    if (occupied_lanes == 0) {
+        if (lane == 0) {
+            image[static_cast<size_t>(i0_y) * stride + i0_x] =
+                static_cast<signed char>(CONTOUR_MARKED);
+            contour_store_point(points, point_capacity, point_index, overflow, pt_x, pt_y);
+        }
+        __syncwarp(warp_mask);
+        return;
+    }
+
+    int selected_lane = __ffs(static_cast<int>(occupied_lanes)) - 1;
+    int s = (s_end - 1 - selected_lane) & 7;
+    int dy = 0;
+    int dx = 0;
+    contour_ring_step(s, &dy, &dx);
+    const int i1_y = i0_y + dy;
+    const int i1_x = i0_x + dx;
+    int i3_y = i0_y;
+    int i3_x = i0_x;
+    int prev_s = s ^ 4;
+
+    for (;;) {
+        s_end = s;
+        occupied = false;
+        if (lane < 8) {
+            search_s = (s_end + lane + 1) & 7;
+            contour_ring_step(search_s, &dy, &dx);
+            search_y = i3_y + dy;
+            search_x = i3_x + dx;
+            occupied = image[static_cast<size_t>(search_y) * stride + search_x] != 0;
+        }
+        occupied_lanes = __ballot_sync(warp_mask, occupied) & 0xffu;
+        selected_lane = __ffs(static_cast<int>(occupied_lanes)) - 1;
+        s = (s_end + selected_lane + 1) & 7;
+        contour_ring_step(s, &dy, &dx);
+        const int i4_y = i3_y + dy;
+        const int i4_x = i3_x + dx;
+
+        if (lane == 0) {
+            if (s >= 1 && (s - 1) < s_end) {
+                image[static_cast<size_t>(i3_y) * stride + i3_x] =
+                    static_cast<signed char>(CONTOUR_MARKED);
+            } else if (image[static_cast<size_t>(i3_y) * stride + i3_x] == 1) {
+                image[static_cast<size_t>(i3_y) * stride + i3_x] =
+                    static_cast<signed char>(CONTOUR_NBD);
+            }
+            if (s != prev_s) {
+                contour_store_point(points, point_capacity, point_index, overflow, pt_x, pt_y);
+            }
+        }
+        if (s != prev_s) prev_s = s;
+        pt_y += dy;
+        pt_x += dx;
+        const bool complete =
+            i4_y == i0_y && i4_x == i0_x && i3_y == i1_y && i3_x == i1_x;
+        __syncwarp(warp_mask);
+        if (complete) break;
+        i3_y = i4_y;
+        i3_x = i4_x;
+        s = (s + 4) & 7;
+    }
+}
+
 // Builds the 1-pixel-zero-framed label image of the requested region. Every padded pixel is
 // written by exactly one thread, so the buffer is a pure function of the mask.
 __global__ void contour_init_label_kernel(
@@ -2046,6 +2134,40 @@ __device__ __forceinline__ void contour_open_border(
         *overflow = 1;
     }
     *contour_count += 1;
+}
+
+// RETR_LIST calls this from one full warp. Lane zero owns the offset table and counters while all
+// lanes cooperate in the neighbour reads performed by contour_fetch_warp.
+__device__ __forceinline__ void contour_open_border_warp(
+    signed char* image, int stride, int y, int x, int is_hole,
+    int32_t* offsets, int offset_capacity,
+    int32_t* points, int point_capacity,
+    int* contour_count, int* point_index, int* overflow) {
+    constexpr unsigned int warp_mask = 0xffffffffu;
+    const int lane = static_cast<int>(threadIdx.x) & (warpSize - 1);
+    const int origin_y = y;
+    const int origin_x = x - is_hole;
+    if (lane == 0) {
+        if (*contour_count < offset_capacity) {
+            offsets[*contour_count] = *point_index;
+        } else {
+            *overflow = 1;
+        }
+    }
+    __syncwarp(warp_mask);
+    contour_fetch_warp(
+        image, stride, origin_y, origin_x, is_hole, origin_x - 1, origin_y - 1,
+        points, point_capacity, point_index, overflow);
+    __syncwarp(warp_mask);
+    if (lane == 0) {
+        if (*contour_count + 1 < offset_capacity) {
+            offsets[*contour_count + 1] = *point_index;
+        } else {
+            *overflow = 1;
+        }
+        *contour_count += 1;
+    }
+    __syncwarp(warp_mask);
 }
 
 // Serial port of the cvStartFindContours_Impl / cvFindNextContour raster scan plus the per-border
@@ -2160,7 +2282,9 @@ __global__ void contour_scan_list_kernel(
     int32_t* offsets, int offset_capacity,
     int32_t* points, int point_capacity,
     int* counts) {
-    if (blockIdx.x != 0 || blockIdx.y != 0 || threadIdx.x != 0 || threadIdx.y != 0) return;
+    if (blockIdx.x != 0 || blockIdx.y != 0 || threadIdx.x >= warpSize || threadIdx.y != 0) return;
+    constexpr unsigned int warp_mask = 0xffffffffu;
+    const int lane = static_cast<int>(threadIdx.x) & (warpSize - 1);
     int contour_count = 0;
     int point_index = 0;
     int overflow = 0;
@@ -2172,22 +2296,32 @@ __global__ void contour_scan_list_kernel(
         for (int index = row_start[y]; index < end; ++index) {
             const int position = transitions[index];
             const int x = position - y * stride;
+            int starts_border = 0;
             int is_hole = 0;
-            if (!contour_stop_starts_border(
-                    image, stride, y, x, VF_CONTOURS_RETR_LIST, &lnbd_x, &lnbd_y, &is_hole)) {
-                continue;
+            if (lane == 0) {
+                starts_border = contour_stop_starts_border(
+                    image, stride, y, x, VF_CONTOURS_RETR_LIST, &lnbd_x, &lnbd_y, &is_hole)
+                    ? 1 : 0;
+                if (starts_border != 0) {
+                    lnbd_x = x - is_hole;
+                    lnbd_y = y;
+                }
             }
-            lnbd_x = x - is_hole;
-            lnbd_y = y;
-            contour_open_border(
-                image, stride, y, x, is_hole, offsets, offset_capacity,
-                points, point_capacity, &contour_count, &point_index, &overflow);
+            starts_border = __shfl_sync(warp_mask, starts_border, 0);
+            is_hole = __shfl_sync(warp_mask, is_hole, 0);
+            if (starts_border != 0) {
+                contour_open_border_warp(
+                    image, stride, y, x, is_hole, offsets, offset_capacity,
+                    points, point_capacity, &contour_count, &point_index, &overflow);
+            }
         }
     }
 
-    counts[0] = contour_count;
-    counts[1] = point_index;
-    counts[2] = overflow;
+    if (lane == 0) {
+        counts[0] = contour_count;
+        counts[1] = point_index;
+        counts[2] = overflow;
+    }
 }
 
 // Reverses the discovery-order scratch into the OpenCV order. Each contour is copied by one thread
@@ -3819,7 +3953,7 @@ VF_CUDA_API int vf_find_contours_u8(
         cudaEventRecord(persistent->timing_events[TIMING_AFTER_INPUT], persistent->stream);
 
         if (list_mode) {
-            contour_scan_list_kernel<<<1, 1, 0, persistent->stream>>>(
+            contour_scan_list_kernel<<<1, 32, 0, persistent->stream>>>(
                 persistent->contour_label, label_stride, height,
                 persistent->contour_transitions, persistent->contour_row_start,
                 persistent->contour_offsets, static_cast<int>(persistent->contour_offset_capacity),

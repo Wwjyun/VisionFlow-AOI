@@ -250,6 +250,14 @@ class ContourSourceContractTests(unittest.TestCase):
         # cv2.RETR_EXTERNAL == 0 and cv2.RETR_LIST == 1, which is why the bridge reuses them.
         self.assertEqual(CONTOUR_MODES, {"list": 1, "external": 0})
 
+    def test_retr_list_trace_uses_a_warp_for_neighbour_search(self):
+        source = (ROOT / "gpu" / "visionflow_cuda.cu").read_text(encoding="utf-8")
+        self.assertIn("contour_fetch_warp(", source)
+        self.assertIn("__ballot_sync(warp_mask, occupied)", source)
+        self.assertIn("contour_scan_list_kernel<<<1, 32", source)
+        # Lane zero remains the sole writer; the optimization must not make contour marking race.
+        self.assertIn("Lane zero remains the sole writer", source)
+
 
 if __name__ == "__main__":
     unittest.main()
