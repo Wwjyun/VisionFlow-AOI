@@ -39,7 +39,7 @@ plan，tile metadata 以 `cpu_crossover` 路線與 `preprocess_routes` 標示。
 以 RTX 3090 完成等價量測後才可接入產線；未接入者在 `execution.gpu.device_host_split` 中
 一律回報為 cpu。**接入與否以本節與 `Todo.md` 為準，不以 export 存在為準。**
 
-- `vf_match_template_gray_u8`（Template Anchor Grid 定位）：**已接入**完整 pipeline（`main`，
+- `vf_match_template_gray_u8`（Template Anchor Grid 定位）：**已接入**完整 pipeline（v1.6.1 起，
   v1.6.0 之後修正；v1.6.0 發行檔因 resident 模式 Tiler 拿不到 runtime 而實際走 CPU，詳見
   〈v1.6.0 後：anchor 接線修正〉）。正式尺寸 pipeline 內 median 3.29 ms（CPU 參考 6.95 ms）。
   Tiler 層級量測：與 `cv2.matchTemplate` 的定位座標在 9 個場景 9/9 相同、分數差 ≤ 4.2e-7、
@@ -334,7 +334,7 @@ flowchart TB
 
 灰色為 CPU／host、綠色為 GPU／device、黃色為 PCIe 上傳；虛線是下載回 host 的資料。
 
-**GPU anchor 在 resident 模式沒有接上，且 `device_host_split` 誤報（v1.6.0 的問題；已於下一節修正，未包含在 v1.6.0 發行檔）**：
+**GPU anchor 在 resident 模式沒有接上，且 `device_host_split` 誤報（v1.6.0 的問題；已於下一節修正，v1.6.1 起包含）**：
 同一份 JSON 的 `device_host_split.anchor_localization` 是 `device`，但 GPU 呼叫統計只有上表三個
 export，沒有 `vf_match_template_gray_u8`，anchor 時間也與 CPU 相同。這不是形狀界限造成的：
 基準的搜尋區 512×512、template 64×64，都在 `gpu_anchor_shapes_supported` 界限內。查證後有兩個問題：
@@ -353,7 +353,7 @@ v1.6.0 發行檔仍有此問題；判斷 v1.6.0 的 anchor 位置請以 `gpu_met
 
 ### 2026-09-15 v1.6.0 後：anchor 接線修正、GPU 切圖陷阱與預熱
 
-以下改動在 `main`，尚未包含在任何發行檔。
+以下改動包含於 v1.6.1（2026-09-15 發行）。
 
 **1. Anchor 接線與回報（P0 觀測正確性）**
 
