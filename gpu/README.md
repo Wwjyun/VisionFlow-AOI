@@ -430,7 +430,7 @@ Recipe 在 Designer 儲存後 session 仍會依 mtime 重建，需要重新預�
 
 ### 2026-09-15 CCL＋ring CNR 留在 device（`vf_cnr_candidates_u8_roi`）
 
-使用者排定的新 GPU mode 第 1 優先。以下改動在 `main`，尚未包含在任何發行檔（v1.6.1 之後）。
+使用者排定的新 GPU mode 第 1 優先。以下改動包含於 v1.6.2。
 
 **做了什麼**
 
@@ -637,7 +637,7 @@ candidate extraction、geometry/statistics 在 device；最終 PASS/NG aggregati
 `production_provenance_release_final.json`。這輪沒有修改 `.cu`、CUDA header 或 ABI，因此不需要重編 DLL；量測使用
 前一輪已為 RTX 3090／`sm_86` 重編並驗證的 DLL。
 
-### 2026-09-15 BMP file-order 直讀與 resident upload
+### 2026-09-15 BMP file-order 直讀與 resident upload（v1.6.2）
 
 平行 BMP reader 原本在每段讀完時直接翻成 top-down rows；這會在 CPU 觸碰並重排完整 639 MB 影像，之後才整張
 上傳。GPU grid/resident 模式現在讓 24-bit BMP 保留磁碟列序：bottom-up BMP 回傳負 row stride 的 logical
@@ -684,6 +684,18 @@ provenance 冷路徑也由兩個 Git subprocess 合併成一次 `git status --po
 `outputs_validation/cuda_file_order_validation.json`。本輪修改 `.cu` 與 header，DLL 已以 CUDA 13.3、`sm_86`
 重編；C++ native smoke、完整 CUDA validator、ROI batch、resize pipeline、crossover、morphology 與
 10/100/1000 次 stress 均通過。
+
+### v1.6.2 CUDA-enabled 發行範圍
+
+v1.6.2 收錄本頁「CCL＋ring CNR 留在 device」、「ring 統計平行化」、「BMP 平行 reader」、profiler／
+provenance 校正與「BMP file-order resident upload」的全部改動。發行 DLL 已在上述 CUDA 改動完成後以
+CUDA 13.3、MSVC x64、`sm_86` 重編並完成 RTX 3090 驗證；其後的 v1.6.2 版本與文件提交未再修改 CUDA
+source/header，依使用者指示不重複編譯。DLL SHA-256 為
+`4AB9A614239F8CA76051D9BC7D5E3BE82A1EABBCACED6600D48D9DDFD889B11A`；optional exports 保持 ABI v1
+舊 DLL 相容。正式尺寸基準為 CPU
+5453.3 ms、GPU 397.7 ms（13.71×），每張 8 次 native calls、一次 638,976,000-byte H2D、22,340-byte
+D2H，3/3 輪判定欄位相同。發行包、SHA-256 與 GitHub Release 驗證結果記錄於 `Todo.md` 和
+`docs/release-notes/visionflow-aoi-v1.6.2.md`。
 
 ## 檔案
 
