@@ -176,6 +176,91 @@ class GpuExecutionSessionTests(unittest.TestCase):
         first_session.close.assert_called_once_with()
         second_session.close.assert_called_once_with()
 
+    def _warm_up_with(self, session, image_path=None, pipeline=None):
+        with tempfile.TemporaryDirectory(prefix="visionflow_warmup_cache_") as temporary:
+            recipe_path = Path(temporary) / "recipe.yaml"
+            recipe_path.write_text("name: warm\n", encoding="utf-8")
+            cache = GpuExecutionSessionCache()
+            progress = []
+            with patch.object(GpuExecutionSession, "from_recipe_path", return_value=session) as factory, \
+                    patch("core.pipeline.AOIPipeline", return_value=pipeline) as pipeline_type:
+                summary = cache.warm_up(recipe_path, image_path, progress_callback=lambda *args: progress.append(args))
+                reused = cache.session_for(recipe_path)
+        return summary, factory, pipeline_type, reused, progress
+
+    def test_warm_up_runs_the_pipeline_once_through_the_cached_session_without_outputs(self):
+        runtime = _ResidentRuntime()
+        runtime.performance_stats = lambda: {
+            "functions": {}, "persistent_context": {"active": True, "reserved_bytes": 855238144, "allocation_count": 22},
+        }
+        session = GpuExecutionSession(runtime, requested=True, config={"dll_path": "fake_resident.dll"})
+        pipeline = Mock()
+        pipeline.run.return_value = {"execution": {"gpu": {
+            "resident_image": {"active": True},
+            "device_host_split": {"anchor_localization": "device"},
+            "detectors": {"202-CS-SN-1": {"requested": True, "active": True, "fallback_reason": ""}},
+        }}}
+
+        summary, factory, pipeline_type, reused, progress = self._warm_up_with(
+            session, Path("input.bmp"), pipeline
+        )
+
+        self.assertEqual(summary["status"], "warmed")
+        self.assertTrue(summary["image_used"])
+        self.assertTrue(summary["resident_upload"])
+        self.assertEqual(summary["reserved_bytes"], 855238144)
+        self.assertEqual(factory.call_count, 1)
+        self.assertIs(reused, session)
+        pipeline.run.assert_called_once_with(Path("input.bmp"))
+        kwargs = pipeline_type.call_args.kwargs
+        self.assertIs(kwargs["gpu_session"], session)
+        self.assertEqual(
+            kwargs["output_overrides"],
+            {key: False for key in (
+                "save_overlay", "save_ng_tiles", "save_csv", "save_matrix_csv", "save_json", "save_debug_images",
+            )},
+        )
+        # The warm-up output directory is a temporary folder removed after the run.
+        self.assertFalse(Path(pipeline_type.call_args.args[1]).exists())
+        self.assertEqual(progress[-1], (100, "GPU 預熱完成"))
+        self.assertFalse(session._closed)
+        session.close()
+
+    def test_warm_up_without_image_only_creates_the_context(self):
+        runtime = _ResidentRuntime()
+        session = GpuExecutionSession(runtime, requested=True, config={"dll_path": "fake_resident.dll"})
+        summary, _, pipeline_type, reused, _ = self._warm_up_with(session)
+        self.assertEqual(summary["status"], "context_only")
+        self.assertFalse(summary["image_used"])
+        pipeline_type.assert_not_called()
+        self.assertIs(reused, session)
+        session.close()
+
+    def test_warm_up_reports_cpu_recipes_unavailable_cuda_and_detector_fallback(self):
+        cpu_session = GpuExecutionSession(_ResidentRuntime(), requested=False, config={})
+        summary, _, pipeline_type, _, _ = self._warm_up_with(cpu_session, Path("input.bmp"))
+        self.assertEqual(summary["status"], "not_requested")
+        pipeline_type.assert_not_called()
+        cpu_session.close()
+
+        missing = _ResidentRuntime()
+        missing.available = False
+        missing.unavailable_reason = "CUDA DLL not found"
+        missing_session = GpuExecutionSession(missing, requested=True, config={"dll_path": "fake_resident.dll"})
+        summary, _, pipeline_type, _, _ = self._warm_up_with(missing_session, Path("input.bmp"))
+        self.assertEqual((summary["status"], summary["reason"]), ("unavailable", "CUDA DLL not found"))
+        pipeline_type.assert_not_called()
+        missing_session.close()
+
+        fallback_session = GpuExecutionSession(_ResidentRuntime(), requested=True, config={"dll_path": "fake_resident.dll"})
+        pipeline = Mock()
+        pipeline.run.return_value = {"execution": {"gpu": {"detectors": {
+            "202-CS-SN-1": {"requested": True, "active": False, "fallback_reason": "kernel error"},
+        }}}}
+        summary, _, _, _, _ = self._warm_up_with(fallback_session, Path("input.bmp"), pipeline)
+        self.assertEqual((summary["status"], summary["reason"]), ("fallback", "kernel error"))
+        fallback_session.close()
+
     def test_gui_session_cache_explicit_invalidation_closes_once(self):
         fake_session = Mock()
         with tempfile.TemporaryDirectory(prefix="visionflow_gui_session_close_") as temporary:
@@ -239,6 +324,151 @@ class GpuExecutionSessionTests(unittest.TestCase):
                 (roi.x, roi.y, roi.width, roi.height),
                 (tile["tile"]["x"], tile["tile"]["y"], tile["tile"]["width"], tile["tile"]["height"]),
             )
+
+    def test_pipeline_localizes_the_anchor_on_the_resident_runtime_with_cpu_coordinates(self):
+        """Pipeline-level wiring: v1.6.0 handed the resident tiler ``gpu_runtime=None`` and never
+        called the device localization export. The fake export answers with OpenCV on the uploaded
+        pixels, so this pins the routing, the tile coordinates and the reported split."""
+
+        class _AnchorRuntime(_ResidentRuntime):
+            supports_template_match = True
+
+            def __init__(self):
+                super().__init__()
+                self.match_calls = []
+                self.uploaded = None
+
+            def upload_image(self, image):
+                self.uploaded = image.copy()
+                return super().upload_image(image)
+
+            def match_template_gray(self, resident, search_rect, template_gray):
+                self.match_calls.append((resident.generation, tuple(search_rect)))
+                x, y, width, height = search_rect
+                gray = cv2.cvtColor(self.uploaded[y:y + height, x:x + width], cv2.COLOR_BGR2GRAY)
+                _, score, _, location = cv2.minMaxLoc(
+                    cv2.matchTemplate(gray, template_gray, cv2.TM_CCOEFF_NORMED)
+                )
+                return {
+                    "x": x + location[0], "y": y + location[1],
+                    "width": template_gray.shape[1], "height": template_gray.shape[0],
+                    "score": float(score),
+                }
+
+        recipe_path = ROOT / "recipes" / "PRODUCT_A_NEGATIVE_401_AOI_01.yaml"
+        base = deepcopy(AOIPipeline(recipe_path, ROOT / "outputs").recipe_manager.load(recipe_path))
+        for config in base["detectors"].values():
+            config["enabled"] = False
+        base["detectors"]["401-AS-SN-1"]["enabled"] = True
+        output_overrides = {
+            key: False for key in ("save_overlay", "save_ng_tiles", "save_csv", "save_matrix_csv", "save_json")
+        }
+        rng = np.random.default_rng(11)
+        image = rng.integers(0, 256, size=(700, 800, 3), dtype=np.uint8)
+
+        def run(use_gpu, temporary, template_path):
+            recipe = deepcopy(base)
+            recipe["tile"] = {
+                "mode": "grid", "template_path": str(template_path),
+                "search_x": 0, "search_y": 0, "search_w": 512, "search_h": 512,
+                "match_threshold": 0.99, "offset_x": 40, "offset_y": 30,
+                "rows": 2, "cols": 2, "roi_w": 200, "roi_h": 150, "gap_x": 20, "gap_y": 10,
+            }
+            recipe["gpu"] = {
+                "mode": "cuda" if use_gpu else "cpu", "dll_path": "fake_resident.dll",
+                "fallback_to_cpu": False, "tiling": use_gpu,
+            }
+            recipe["detectors"]["401-AS-SN-1"]["use_gpu"] = use_gpu
+            runtime = _AnchorRuntime() if use_gpu else None
+            session = (
+                GpuExecutionSession(runtime, requested=True, config=recipe["gpu"]) if use_gpu else None
+            )
+            pipeline = AOIPipeline(
+                recipe_path, Path(temporary), output_overrides=output_overrides, gpu_session=session
+            )
+            pipeline.recipe_manager.load = Mock(return_value=recipe)
+            detector = _RoiCapturingDetector()
+            detector.use_gpu = detector.gpu_active = use_gpu
+            pipeline.detector_manager.create_enabled = Mock(return_value=[detector])
+            return pipeline.run(image_path), runtime
+
+        with tempfile.TemporaryDirectory(prefix="visionflow_resident_anchor_") as temporary:
+            image_path = Path(temporary) / "input.png"
+            template_path = Path(temporary) / "anchor.png"
+            self.assertTrue(cv2.imwrite(str(image_path), image))
+            self.assertTrue(cv2.imwrite(str(template_path), image[120:184, 90:154]))
+            gpu_result, runtime = run(True, temporary, template_path)
+            cpu_result, _ = run(False, temporary, template_path)
+
+        self.assertEqual(runtime.upload_calls, 1)
+        self.assertEqual(runtime.match_calls, [(1, (0, 0, 512, 512))])
+        geometry = lambda result: [
+            (tile["tile"]["tile_id"], tile["tile"]["x"], tile["tile"]["y"],
+             tile["tile"]["width"], tile["tile"]["height"], tile["tile"]["metadata"]["match_bbox"])
+            for tile in result["tiles"]
+        ]
+        self.assertEqual(geometry(gpu_result), geometry(cpu_result))
+        self.assertEqual(gpu_result["tiles"][0]["tile"]["metadata"]["match_bbox"], [90, 120, 64, 64])
+        self.assertTrue(all(
+            tile["tile"]["metadata"]["grid_anchor_backend"] == "cuda_dll" for tile in gpu_result["tiles"]
+        ))
+        split = gpu_result["execution"]["gpu"]["device_host_split"]
+        self.assertEqual(split["anchor_localization"], "device")
+        self.assertEqual(
+            cpu_result["execution"]["gpu"]["device_host_split"]["anchor_localization"], "cpu"
+        )
+
+    def test_gpu_tiling_without_resident_image_uses_cpu_crop_unless_cuda_is_strict(self):
+        """A GUI-reachable trap: GPU mode and "切小圖使用 GPU" on while no Detector uses CUDA. The
+        tiler then re-uploaded the whole image for every tile, making GPU mode slower than CPU."""
+
+        class _CropCountingRuntime(_ResidentRuntime):
+            def __init__(self, fallback_to_cpu):
+                super().__init__()
+                self.fallback_to_cpu = fallback_to_cpu
+                self.crop_calls = 0
+
+            def crop(self, image, x, y, width, height):
+                self.crop_calls += 1
+                return image[y:y + height, x:x + width].copy()
+
+        recipe_path = ROOT / "recipes" / "PRODUCT_A_NEGATIVE_401_AOI_01.yaml"
+        base = deepcopy(AOIPipeline(recipe_path, ROOT / "outputs").recipe_manager.load(recipe_path))
+        for config in base["detectors"].values():
+            config["enabled"] = False
+        base["detectors"]["401-AS-SN-1"]["enabled"] = True
+        base["detectors"]["401-AS-SN-1"]["use_gpu"] = False
+        output_overrides = {
+            key: False for key in ("save_overlay", "save_ng_tiles", "save_csv", "save_matrix_csv", "save_json")
+        }
+        results = {}
+        with tempfile.TemporaryDirectory(prefix="visionflow_tiling_trap_") as temporary:
+            image_path = Path(temporary) / "input.png"
+            self.assertTrue(cv2.imwrite(str(image_path), np.zeros((1300, 1200, 3), dtype=np.uint8)))
+            for label, mode, fallback in (("auto", "auto", True), ("strict", "cuda", False)):
+                recipe = deepcopy(base)
+                recipe["gpu"] = {"mode": mode, "dll_path": "fake_resident.dll", "fallback_to_cpu": fallback, "tiling": True}
+                runtime = _CropCountingRuntime(fallback)
+                session = GpuExecutionSession(runtime, requested=True, config=recipe["gpu"])
+                pipeline = AOIPipeline(recipe_path, Path(temporary), output_overrides=output_overrides, gpu_session=session)
+                pipeline.recipe_manager.load = Mock(return_value=recipe)
+                detector = _RoiCapturingDetector()
+                detector.use_gpu = detector.gpu_active = False
+                pipeline.detector_manager.create_enabled = Mock(return_value=[detector])
+                results[label] = (pipeline.run(image_path), runtime)
+
+        auto_result, auto_runtime = results["auto"]
+        self.assertEqual(auto_runtime.upload_calls, 0)
+        self.assertEqual(auto_runtime.crop_calls, 0)
+        tiling = auto_result["execution"]["gpu"]["tiling"]
+        self.assertTrue(tiling["requested"])
+        self.assertFalse(tiling["active"])
+        self.assertIn("已改用 CPU 切小圖", tiling["reason"])
+        self.assertEqual(auto_result["summary"]["tile_count"], 9)
+
+        strict_result, strict_runtime = results["strict"]
+        self.assertEqual(strict_runtime.crop_calls, strict_result["summary"]["tile_count"])
+        self.assertTrue(strict_result["execution"]["gpu"]["tiling"]["active"])
 
     def test_session_run_scope_clears_previous_recoverable_gpu_error(self):
         runtime = GpuRuntime("missing_fault_scope.dll", enabled=False)

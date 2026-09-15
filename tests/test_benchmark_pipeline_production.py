@@ -47,6 +47,22 @@ class ProductionBenchmarkContractTests(unittest.TestCase):
             ),
         )
 
+    def test_comparison_rejects_a_shifted_anchor_and_reports_score_as_drift(self):
+        from tools.benchmark_pipeline_production import _compare
+
+        def result(x, score):
+            return {"tiles": [{
+                "tile": {"tile_id": "r0000_c0000", "x": x, "y": 30, "width": 20, "height": 10,
+                         "metadata": {"match_bbox": [x - 5, 25, 8, 8], "score": score,
+                                      "grid_anchor_backend": "cpu"}},
+                "detectors": [],
+            }]}
+
+        same_place = _compare(result(40, 0.9999), result(40, 0.99989))
+        self.assertTrue(same_place["decision_equal"])
+        self.assertEqual(same_place["drift_counts"], {"anchor_score": 1})
+        self.assertFalse(_compare(result(40, 0.9999), result(41, 0.9999))["decision_equal"])
+
     def test_timing_summary_uses_median_and_nearest_rank_p95(self):
         summary = _timing_summary([5.0, 1.0, 4.0, 2.0, 3.0])
         self.assertEqual(summary["median_ms"], 3.0)

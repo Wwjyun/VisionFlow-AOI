@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
+import tempfile
 import threading
+import time
 from pathlib import Path
 
 from core.ai_runtime import AiModelSessionManager
@@ -127,6 +129,108 @@ class GpuExecutionSessionCache:
             self._session = session
             self._key = key
             return session
+
+    # Every artifact a pipeline run can write; a warm-up must leave nothing on disk.
+    _WARM_UP_OUTPUT_OVERRIDES = {
+        "save_overlay": False,
+        "save_ng_tiles": False,
+        "save_csv": False,
+        "save_matrix_csv": False,
+        "save_json": False,
+        "save_debug_images": False,
+    }
+
+    def warm_up(self, recipe_path: Path, image_path: Path | None = None, progress_callback=None) -> dict:
+        """Pay the first-inspection cost before the operator's first real image.
+
+        The session for ``recipe_path`` is created (DLL load and CUDA context). With an image, the
+        real pipeline then runs once through that same session with every output disabled, so the
+        resident upload and detector buffers are allocated at the production image size and the
+        next inspection starts warm. The result is discarded: a warm-up is not an inspection and
+        never writes overlays, CSV, JSON, NG tiles or debug images.
+
+        RTX 3090 measurement (16384x13000, six 12000x2000 ROIs, ``202-CS-SN-1``): session creation
+        ~107 ms and a first run ~140 ms slower than later runs, with every device buffer allocated
+        during that first run.
+        """
+        from core.pipeline import AOIPipeline
+
+        def report(percent: int, message: str) -> None:
+            if progress_callback is not None:
+                progress_callback(int(percent), message)
+
+        report(0, "正在建立 GPU session")
+        started = time.perf_counter()
+        session = self.session_for(Path(recipe_path))
+        session_ms = (time.perf_counter() - started) * 1000.0
+        runtime = session.runtime
+        summary = {
+            "status": "",
+            "session_ms": round(session_ms, 1),
+            "pipeline_ms": 0.0,
+            "image_used": False,
+            "device_name": "",
+            "reason": "",
+        }
+        if not session.requested:
+            summary.update(status="not_requested", reason="此 Recipe 未啟用 CUDA，不需要預熱")
+            return summary
+        if not getattr(runtime, "available", False):
+            summary.update(
+                status="unavailable",
+                reason=str(getattr(runtime, "unavailable_reason", "") or "CUDA 不可用"),
+            )
+            return summary
+        summary["device_name"] = str(getattr(runtime, "device_name", "") or "")
+        if image_path is None:
+            summary.update(status="context_only", reason="未載入影像，只建立 CUDA context")
+            summary.update(self._context_summary(runtime))
+            return summary
+
+        report(20, "正在以目前影像試跑（不輸出檔案）")
+        with tempfile.TemporaryDirectory(prefix="visionflow_gpu_warmup_") as temporary:
+            pipeline = AOIPipeline(
+                Path(recipe_path),
+                Path(temporary),
+                progress_callback=lambda percent, _message: report(20 + int(percent) * 3 // 4, "GPU 預熱試跑中"),
+                output_overrides=dict(self._WARM_UP_OUTPUT_OVERRIDES),
+                gpu_session=session,
+            )
+            started = time.perf_counter()
+            result = pipeline.run(Path(image_path))
+            summary["pipeline_ms"] = round((time.perf_counter() - started) * 1000.0, 1)
+        gpu = (result.get("execution", {}) or {}).get("gpu", {}) or {}
+        detectors = gpu.get("detectors", {}) or {}
+        fallback_reasons = [
+            str(status.get("fallback_reason") or "")
+            for status in detectors.values()
+            if status.get("requested") and status.get("fallback_reason")
+        ]
+        summary["image_used"] = True
+        summary["resident_upload"] = bool((gpu.get("resident_image", {}) or {}).get("active", False))
+        summary["device_host_split"] = dict(gpu.get("device_host_split", {}) or {})
+        summary.update(self._context_summary(runtime))
+        if fallback_reasons:
+            summary.update(status="fallback", reason=fallback_reasons[0])
+        else:
+            summary["status"] = "warmed"
+        report(100, "GPU 預熱完成")
+        return summary
+
+    @staticmethod
+    def _context_summary(runtime) -> dict:
+        stats = getattr(runtime, "performance_stats", None)
+        context = {}
+        if callable(stats):
+            try:
+                context = stats().get("persistent_context", {}) or {}
+            except Exception:  # metrics are informative only and must not fail a warm-up
+                context = {}
+        return {
+            "context_active": bool(context.get("active", False)),
+            "reserved_bytes": int(context.get("reserved_bytes", 0) or 0),
+            "allocation_count": int(context.get("allocation_count", 0) or 0),
+        }
 
     def invalidate(self) -> None:
         with self._lock:

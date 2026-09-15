@@ -353,41 +353,71 @@ class DesignerScreen(QWidget):
 
     def _build_gpu_panel(self) -> Panel:
         panel = GpuSettingsPanel(self._refresh_gpu_status, self._refresh_active_detector_status)
-        self.gpu_mode_combo = panel.mode_combo
+        self.gpu_panel = panel
         self.gpu_tiling_toggle = panel.tiling_toggle
         self.gpu_display_toggle = panel.display_toggle
-        self.gpu_fallback_toggle = panel.fallback_toggle
         self.gpu_dll_path_edit = panel.dll_path_edit
         self.gpu_status_label = panel.status_label
+        panel.policy_changed.connect(self._mark_dirty)
         self._refresh_gpu_status()
         return panel
 
+    def _probe_cuda(self, dll_path: str) -> tuple[bool, str, str]:
+        """Load the DLL once per path; Detector switches refresh the status without reloading it."""
+        cached = getattr(self, "_cuda_probe", None)
+        if cached is not None and cached[0] == dll_path:
+            return cached[1]
+        with GpuRuntime(dll_path) as runtime:
+            probe = (bool(runtime.available), str(runtime.device_name or ""), str(runtime.unavailable_reason or ""))
+        self._cuda_probe = (dll_path, probe)
+        return probe
+
+    def _gpu_detector_count(self) -> int:
+        enabled = getattr(self, "_enabled", {}) or {}
+        return sum(
+            1 for detector_id, use_gpu in (getattr(self, "_gpu_enabled", {}) or {}).items()
+            if use_gpu and enabled.get(detector_id, False)
+        )
+
     def _refresh_gpu_status(self) -> None:
-        mode = str(self.gpu_mode_combo.currentData() or "auto")
-        self.gpu_fallback_toggle.setEnabled(mode != "cuda")
+        panel = self.gpu_panel
+        policy = panel.policy()
         self._refresh_active_detector_status()
+        lines = [f"目前：{panel.POLICY_TITLES[policy]}"]
+        legacy = panel.legacy_note()
+        if legacy:
+            lines.append(legacy)
         yolox_status = self._yolox_cuda_provider_status()
-        if mode == "cpu":
-            self.gpu_status_label.setText(
-                "CPU mode · 不載入 CUDA DLL"
-                + (f"\n{yolox_status}" if yolox_status else "")
+        color = COLORS["text_3"]
+        if policy == panel.POLICY_CPU:
+            lines.append("不載入 CUDA DLL，Detector 的 GPU 開關不會生效。")
+        else:
+            available, device_name, reason = self._probe_cuda(
+                self.gpu_dll_path_edit.text().strip() or GpuRuntime.DEFAULT_DLL
             )
-            self.gpu_status_label.setStyleSheet(f"color: {COLORS['text_3']}; font-size: 11px;")
-            return
-        with GpuRuntime(self.gpu_dll_path_edit.text().strip() or GpuRuntime.DEFAULT_DLL) as runtime:
-            if runtime.available:
-                self.gpu_status_label.setText(
-                    f"CUDA DLL 可用 · {runtime.device_name} · mode={mode}"
-                    + (f"\n{yolox_status}" if yolox_status else "")
-                )
-                self.gpu_status_label.setStyleSheet(f"color: {COLORS['accent_text']}; font-size: 11px;")
+            if available:
+                lines.append(f"CUDA 可用 · {device_name}")
+                color = COLORS["accent_text"]
+            elif policy == panel.POLICY_GPU_FALLBACK:
+                lines.append(f"CUDA 不可用，執行時會改用 CPU · {reason}")
             else:
-                suffix = "將回退 CPU" if mode == "auto" else "執行時將明確失敗"
-                self.gpu_status_label.setText(
-                    f"CUDA DLL 不可用 · {suffix} · {runtime.unavailable_reason}"
-                    + (f"\n{yolox_status}" if yolox_status else "")
-                )
-                self.gpu_status_label.setStyleSheet(f"color: {COLORS['text_3']}; font-size: 11px;")
+                lines.append(f"CUDA 不可用，執行時會直接報錯 · {reason}")
+                color = COLORS["ng"]
+            gpu_detectors = self._gpu_detector_count()
+            if gpu_detectors:
+                lines.append(f"{gpu_detectors} 個啟用中的 Detector 已開啟 GPU。")
+            else:
+                lines.append("尚無啟用中的 Detector 開啟 GPU，檢測實際仍全部在 CPU 執行。")
+                if self.gpu_tiling_toggle.isChecked():
+                    lines.append(
+                        "「切小圖使用 GPU」需搭配 Detector 開啟 GPU 才會生效：GPU 優先時改用 CPU 切圖；"
+                        "僅 GPU 時會逐張重傳整張原圖，明顯變慢。"
+                    )
+                    color = COLORS["ng"] if policy == panel.POLICY_GPU_STRICT else color
+        if yolox_status:
+            lines.append(yolox_status)
+        self.gpu_status_label.setText("\n".join(lines))
+        self.gpu_status_label.setStyleSheet(f"color: {color}; font-size: 11px;")
 
     def _yolox_cuda_provider_status(self) -> str:
         if not self._gpu_enabled.get("yolox", False):
@@ -575,14 +605,14 @@ class DesignerScreen(QWidget):
 
             self._set_tile_config(recipe.get("tile", {}), recipe.get("assets", {}))
             gpu = recipe.get("gpu", {}) or {}
-            mode_index = self.gpu_mode_combo.findData(str(gpu.get("mode", "auto")).lower())
-            self.gpu_mode_combo.setCurrentIndex(max(0, mode_index))
+            self.gpu_panel.set_gpu_values(
+                str(gpu.get("mode", "auto")), bool(gpu.get("fallback_to_cpu", True))
+            )
             self.gpu_tiling_toggle.setChecked(bool(gpu.get("tiling", False)))
             self.gpu_display_toggle.setChecked(bool(gpu.get("display", False)))
-            self.gpu_fallback_toggle.setChecked(bool(gpu.get("fallback_to_cpu", True)))
             self.gpu_dll_path_edit.setText(str(gpu.get("dll_path", GpuRuntime.DEFAULT_DLL)))
-            self._refresh_gpu_status()
             self._set_detector_config(recipe.get("detectors", {}))
+            self._refresh_gpu_status()
         finally:
             self._loading_recipe = False
         self._set_dirty(False)
@@ -900,10 +930,12 @@ class DesignerScreen(QWidget):
         self._refresh_enabled_count()
         if detector_id == "yolox":
             self._refresh_active_detector_status()
+        if not self._loading_recipe:
+            self._refresh_gpu_status()
 
     def _on_detector_gpu_toggled(self, detector_id: str, checked: bool) -> None:
         self._gpu_enabled[detector_id] = checked
-        if detector_id == "yolox":
+        if not self._loading_recipe:
             self._refresh_gpu_status()
 
     def _select_detector(self, detector_id: str) -> None:
@@ -1108,8 +1140,8 @@ class DesignerScreen(QWidget):
                     "yolox",
                     self._params_for_detector("yolox"),
                     use_gpu=self._gpu_enabled.get("yolox", False),
-                    gpu_mode=str(self.gpu_mode_combo.currentData() or "auto"),
-                    fallback_to_cpu=bool(self.gpu_fallback_toggle.isChecked()),
+                    gpu_mode=self.gpu_panel.gpu_values()[0],
+                    fallback_to_cpu=self.gpu_panel.gpu_values()[1],
                 )
             except (RuntimeError, TypeError, ValueError) as exc:
                 error = str(exc)
@@ -1274,12 +1306,13 @@ class DesignerScreen(QWidget):
         return value
 
     def build_gpu_config(self) -> dict:
+        mode, fallback_to_cpu = self.gpu_panel.gpu_values()
         return {
-            "mode": str(self.gpu_mode_combo.currentData() or "auto"),
+            "mode": mode,
             "tiling": bool(self.gpu_tiling_toggle.isChecked()),
             "display": bool(self.gpu_display_toggle.isChecked()),
             "dll_path": self.gpu_dll_path_edit.text().strip() or GpuRuntime.DEFAULT_DLL,
-            "fallback_to_cpu": bool(self.gpu_fallback_toggle.isChecked()),
+            "fallback_to_cpu": fallback_to_cpu,
         }
 
     def _active_template_path(self) -> str:

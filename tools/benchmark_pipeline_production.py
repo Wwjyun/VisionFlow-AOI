@@ -251,10 +251,22 @@ def _split_defects(result: dict):
     drifting = []
     worst = 0.0
     for tile_result in result.get("tiles", []):
+        tile = tile_result.get("tile", {}) or {}
+        tile_metadata = tile.get("metadata", {}) or {}
+        # Tile placement comes from the anchor, which may run on the device; the defect bboxes are
+        # tile-local, so without this a shifted anchor would still compare as identical.
+        decision.append(
+            (
+                tile.get("tile_id"), tile.get("x"), tile.get("y"), tile.get("width"),
+                tile.get("height"), tuple(tile_metadata.get("match_bbox") or ()),
+            )
+        )
+        if isinstance(tile_metadata.get("score"), (int, float)):
+            drifting.append(("anchor_score", float(tile_metadata["score"])))
         for detector_result in tile_result.get("detectors", []):
             decision.append(
                 (
-                    tile_result.get("tile", {}).get("tile_id"),
+                    tile.get("tile_id"),
                     detector_result.get("detector_id"),
                     detector_result.get("pass"),
                     detector_result.get("defect_count"),

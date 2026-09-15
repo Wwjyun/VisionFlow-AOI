@@ -11,6 +11,7 @@ from typing import Iterator
 import cv2
 import numpy as np
 
+from core.gpu_runtime import GpuRuntimeError
 from core.image_loader import ImageLoader
 
 
@@ -658,11 +659,10 @@ class Tiler:
         if not template_path:
             raise ValueError("Grid template_path is required for anchored grid mode.")
 
-        image_gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY) if image.ndim == 3 else image.copy()
         template = self.image_loader.load_bgr(template_path)
         template_gray = cv2.cvtColor(template, cv2.COLOR_BGR2GRAY) if template.ndim == 3 else template.copy()
         template_height, template_width = template_gray.shape[:2]
-        image_height, image_width = image_gray.shape[:2]
+        image_height, image_width = image.shape[:2]
 
         search_x = max(0, int(config.search_x))
         search_y = max(0, int(config.search_y))
@@ -672,14 +672,19 @@ class Tiler:
         search_y2 = min(image_height, search_y + search_h)
         if search_x2 <= search_x or search_y2 <= search_y:
             raise ValueError("Grid search ROI is outside the input image.")
-
-        search_roi = image_gray[search_y:search_y2, search_x:search_x2]
-        if template_width > search_roi.shape[1] or template_height > search_roi.shape[0]:
+        if template_width > search_x2 - search_x or template_height > search_y2 - search_y:
             raise ValueError("Grid template is larger than the search ROI.")
 
         search_rect = [int(search_x), int(search_y), int(search_x2 - search_x), int(search_y2 - search_y)]
         anchor = self._find_grid_anchor_on_device(image, search_rect, template_gray)
         if anchor is None:
+            # BGR->gray is a per-pixel operation, so converting only the search window gives the
+            # same pixels as slicing a whole-image conversion without touching the full canvas.
+            search_source = image[search_y:search_y2, search_x:search_x2]
+            search_roi = (
+                cv2.cvtColor(search_source, cv2.COLOR_BGR2GRAY)
+                if search_source.ndim == 3 else search_source
+            )
             if float(np.std(template_gray)) <= 1e-6:
                 result = cv2.matchTemplate(search_roi, template_gray, cv2.TM_SQDIFF_NORMED)
                 min_score, _, min_loc, _ = cv2.minMaxLoc(result)
@@ -724,18 +729,32 @@ class Tiler:
         """
         if not self.gpu_anchor_enabled:
             return None
-        runtime = self.gpu_runtime
         resident = self.resident_image
-        if runtime is None or resident is None or not getattr(runtime, "supports_template_match", False):
+        if resident is None:
+            return None
+        # The resident image belongs to the runtime that uploaded it. The pipeline withholds
+        # `gpu_runtime` from a resident tiler so tiles are never re-cropped through CUDA, so the
+        # anchor must reach that owning runtime through the resident image itself.
+        runtime = getattr(resident, "runtime", None) or self.gpu_runtime
+        if runtime is None or not getattr(runtime, "supports_template_match", False):
             return None
         if not self.gpu_anchor_shapes_supported(search_rect, template_gray.shape):
             return None
         try:
             match = runtime.match_template_gray(resident, tuple(search_rect), template_gray)
+            if int(match["width"]) != int(template_gray.shape[1]) or int(match["height"]) != int(template_gray.shape[0]):
+                raise GpuRuntimeError(
+                    f"vf_match_template_gray_u8 returned {match['width']}x{match['height']} for a "
+                    f"{template_gray.shape[1]}x{template_gray.shape[0]} template"
+                )
         except Exception:
-            # A failed GPU step falls back to the CPU reference, which is the correctness baseline.
-            return None
-        if int(match["width"]) != int(template_gray.shape[1]) or int(match["height"]) != int(template_gray.shape[0]):
+            # With fallback enabled the CPU reference, which is the correctness baseline, restarts
+            # localization; strict CUDA mode must surface the failure instead of hiding it. The
+            # runtime's `last_error` is deliberately left alone: it disables every optional GPU step
+            # for the rest of the run, and an anchor-only miss (such as a flat template) must not
+            # push the detectors onto the CPU.
+            if not getattr(runtime, "fallback_to_cpu", True):
+                raise
             return None
         return {
             "x": int(match["x"]),

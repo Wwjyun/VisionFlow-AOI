@@ -124,9 +124,15 @@ class AOIPipeline(LogMixin):
                     resident_image = gpu_runtime.upload_image(image)
                 except Exception as exc:
                     gpu_runtime.fallback_or_raise(exc)
+            # Without a resident image the tilers can only use CUDA through per-tile `vf_crop_u8`, and
+            # every such call uploads the whole decoded source again (RTX 3090, 16384x13000 with six
+            # ROIs: tiling 85 ms on CPU versus 872 ms through CUDA). With fallback allowed the CPU
+            # crop is the measured faster route; strict CUDA keeps the explicitly requested path.
+            per_tile_cuda_crop = tiling_gpu_requested and resident_image is None
+            tiling_cuda_crop_skipped = per_tile_cuda_crop and bool(getattr(gpu_runtime, "fallback_to_cpu", True))
             tiler = create_tiler(
                 tile_config,
-                gpu_runtime=(gpu_runtime if tiling_gpu_requested and resident_image is None else None),
+                gpu_runtime=(gpu_runtime if per_tile_cuda_crop and not tiling_cuda_crop_skipped else None),
                 resident_image=resident_image,
                 crop_workers=(recipe.get("performance", {}) or {}).get(
                     "crop_workers", os.getenv("AOI_CROP_WORKERS", "auto")
@@ -221,6 +227,7 @@ class AOIPipeline(LogMixin):
             gpu_runtime=gpu_runtime,
             gpu_mode=gpu_mode,
             tiling_gpu_requested=tiling_gpu_requested,
+            tiling_cuda_crop_skipped=tiling_cuda_crop_skipped,
             display_requested=self.recipe_manager.gpu_feature_requested(gpu_config, "display"),
             resident_image=resident_image,
             resident_upload_memory=resident_upload_memory,

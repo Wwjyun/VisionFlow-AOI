@@ -177,6 +177,92 @@ class TilerAnchorBackendTests(unittest.TestCase):
         self.assertEqual(metadata["match_bbox"], [250, 150, 80, 50])
         self.assertAlmostEqual(metadata["score"], 1.0, places=5)
 
+    def test_resident_tiler_without_gpu_runtime_uses_the_resident_owner(self):
+        """The pipeline builds a resident tiler with ``gpu_runtime=None`` so tiles are never
+        re-cropped through CUDA. v1.6.0 then skipped device localization entirely; the anchor must
+        reach the runtime that owns the resident image."""
+        import tempfile
+        from pathlib import Path
+
+        image = _pattern_image()
+        with tempfile.TemporaryDirectory() as temporary:
+            template_path = self._template_file(Path(temporary), image)
+            dll = _FakeTemplateMatchDll()
+            runtime = _runtime(dll)
+            resident = _resident(runtime, image)
+            tiler = self._tiler(None, resident, template_path=str(template_path))
+            tiles = list(tiler.iter_tiles(image))
+
+        self.assertEqual(dll.calls, 1)
+        self.assertEqual(tiles[0].metadata["grid_anchor_backend"], "cuda_dll")
+        self.assertEqual(tiles[0].metadata["match_bbox"], [250, 150, 80, 50])
+        self.assertIsNotNone(tiles[0].device_roi)
+
+    def test_strict_cuda_surfaces_a_device_anchor_failure_instead_of_using_the_cpu(self):
+        import tempfile
+        from pathlib import Path
+
+        from core.gpu_runtime import GpuRuntimeError
+
+        image = _pattern_image()
+        with tempfile.TemporaryDirectory() as temporary:
+            template_path = self._template_file(Path(temporary), image)
+            dll = _FakeTemplateMatchDll(result=1001)
+            runtime = _runtime(dll)
+            runtime.fallback_to_cpu = False
+            resident = _resident(runtime, image)
+            tiler = self._tiler(None, resident, template_path=str(template_path))
+            with self.assertRaises(GpuRuntimeError):
+                list(tiler.iter_tiles(image))
+
+        self.assertEqual(dll.calls, 1)
+
+    def test_recovered_anchor_failure_does_not_disable_later_gpu_steps(self):
+        import tempfile
+        from pathlib import Path
+
+        image = _pattern_image()
+        with tempfile.TemporaryDirectory() as temporary:
+            template_path = self._template_file(Path(temporary), image)
+            runtime = _runtime(_FakeTemplateMatchDll(result=1001))
+            resident = _resident(runtime, image)
+            tiler = self._tiler(None, resident, template_path=str(template_path))
+            tiles = list(tiler.iter_tiles(image))
+
+        self.assertEqual(tiles[0].metadata["grid_anchor_backend"], "cpu")
+        self.assertEqual(runtime.last_error, "")
+
+    def test_cpu_reference_converts_only_the_search_window_with_identical_results(self):
+        """Gray conversion is per pixel, so a search-window conversion must pick the same anchor
+        and score as matching inside a whole-image conversion."""
+        import tempfile
+        from pathlib import Path
+
+        rng = np.random.default_rng(7)
+        # A textured template (the pattern image's block at this spot is flat and would take the
+        # SQDIFF branch instead of the TM_CCOEFF_NORMED reference compared below).
+        image = rng.integers(0, 256, size=(400, 600, 3), dtype=np.uint8)
+        search = (180, 90, 260, 180)
+        with tempfile.TemporaryDirectory() as temporary:
+            template_path = self._template_file(Path(temporary), image)
+            template_gray = cv2.cvtColor(image[150:200, 250:330], cv2.COLOR_BGR2GRAY)
+            tiler = self._tiler(
+                None, None, template_path=str(template_path),
+                search_x=search[0], search_y=search[1], search_w=search[2], search_h=search[3],
+            )
+            tiles = list(tiler.iter_tiles(image))
+
+        full_gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+        window = full_gray[search[1]:search[1] + search[3], search[0]:search[0] + search[2]]
+        scores = cv2.matchTemplate(window, template_gray, cv2.TM_CCOEFF_NORMED)
+        _, best, _, location = cv2.minMaxLoc(scores)
+        metadata = tiles[0].metadata
+        self.assertEqual(metadata["grid_anchor_backend"], "cpu")
+        self.assertEqual(
+            metadata["match_bbox"], [search[0] + location[0], search[1] + location[1], 80, 50]
+        )
+        self.assertEqual(metadata["score"], float(best))
+
     def test_no_resident_image_keeps_the_cpu_reference(self):
         import tempfile
         from pathlib import Path

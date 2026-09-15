@@ -40,12 +40,20 @@ from gui.widgets.rail import NavRail
 from gui.widgets.topbar import TopBar
 from gui.workflow_controllers import (
     BatchWorkflowController,
+    GpuWarmupWorkflowController,
     InspectionWorkflowController,
     MonitorWorkflowController,
     PreviewWorkflowController,
     TilePreviewWorkflowController,
 )
-from gui.workers import BatchInspectionWorker, FolderMonitorWorker, ImagePreviewWorker, InspectionWorker, TilePreviewWorker
+from gui.workers import (
+    BatchInspectionWorker,
+    FolderMonitorWorker,
+    GpuWarmupWorker,
+    ImagePreviewWorker,
+    InspectionWorker,
+    TilePreviewWorker,
+)
 
 # ============================================================
 # AOI Console — main window shell (rail + topbar + screens + status bar)
@@ -193,6 +201,8 @@ class MainWindow(QMainWindow, LogMixin):
         self._batch_controller = BatchWorkflowController(self)
         self._monitor_controller = MonitorWorkflowController(self)
         self._tile_preview_controller = TilePreviewWorkflowController(self)
+        self._warmup_controller = GpuWarmupWorkflowController(self)
+        self.warming_up = False
 
         self._preview_thread: QThread | None = None
         self._preview_worker: ImagePreviewWorker | None = None
@@ -424,6 +434,7 @@ class MainWindow(QMainWindow, LogMixin):
         self.topbar.mode_changed.connect(self._on_mode_changed)
 
         self.run_screen.start_requested.connect(self._run_inspection)
+        self.run_screen.warmup_requested.connect(self._run_gpu_warmup)
         self.run_screen.open_recipe_requested.connect(self._choose_recipe)
         self.run_screen.view_results_requested.connect(lambda: self._set_screen("results"))
         self.run_screen.image_viewer.defect_clicked.connect(self._on_defect_selected)
@@ -955,6 +966,7 @@ class MainWindow(QMainWindow, LogMixin):
         has_recipe = self.recipe_path is not None
         ready = has_image and has_recipe
         self.run_screen.run_control_panel.set_ready(ready, has_image, has_recipe, False)
+        self.run_screen.run_control_panel.set_warmup_state(has_recipe, False, False)
         self.run_screen.op_panel.set_state(ready, False, 0, "", self.result)
         self._update_batch_ready()
 
@@ -964,6 +976,9 @@ class MainWindow(QMainWindow, LogMixin):
             return
         if not self.recipe_path:
             self._notice("請先載入 Recipe。", "warning")
+            return
+        if self.warming_up:
+            self._notice("GPU 預熱中，請稍候。")
             return
         if self._inspection_thread and self._inspection_thread.isRunning():
             self._notice("檢測執行中，請稍候。")
@@ -1063,6 +1078,87 @@ class MainWindow(QMainWindow, LogMixin):
         has_recipe = self.recipe_path is not None
         ready = has_image and has_recipe and not running
         self.run_screen.run_control_panel.set_ready(ready, has_image, has_recipe, running)
+        self.run_screen.run_control_panel.set_warmup_state(has_recipe, running, False)
+
+    # ------------------------------------------------------------------
+    # GPU warm-up
+    # ------------------------------------------------------------------
+    def _run_gpu_warmup(self) -> None:
+        if not self.recipe_path:
+            self._notice("請先載入 Recipe。", "warning")
+            return
+        if self.running or self._warmup_controller.is_running:
+            self._notice("請先等待目前檢測或預熱完成。", "warning")
+            return
+        self._set_warmup_running(True)
+        self.statusBar().showMessage("GPU 預熱中...")
+        worker = GpuWarmupWorker(
+            recipe_path=self.recipe_path,
+            gpu_session_cache=self._inspection_gpu_sessions,
+            image_path=self.image_path,
+        )
+        self._warmup_controller.start(
+            worker,
+            signal_handlers=(
+                (worker.progress, self._on_gpu_warmup_progress),
+                (worker.finished, self._on_gpu_warmup_finished),
+                (worker.failed, self._on_gpu_warmup_failed),
+            ),
+            terminal_signals=(worker.finished, worker.failed),
+            on_thread_finished=self._on_gpu_warmup_thread_finished,
+        )
+
+    def _set_warmup_running(self, warming: bool) -> None:
+        # Warm-up owns the shared single-image GPU session, so `running` also blocks the image,
+        # Recipe and inspection actions that would replace or close that session mid-run.
+        self.warming_up = warming
+        self.running = warming
+        self.topbar.set_running(warming, 0)
+        has_image = self.image_path is not None
+        has_recipe = self.recipe_path is not None
+        panel = self.run_screen.run_control_panel
+        panel.set_ready(has_image and has_recipe and not warming, has_image, has_recipe, False)
+        panel.set_warmup_state(has_recipe, warming, warming)
+        self.run_screen.op_panel.set_state(has_image and has_recipe and not warming, False, 0, "", self.result)
+
+    def _on_gpu_warmup_progress(self, percent: int, message: str) -> None:
+        percent = max(0, min(100, int(percent)))
+        self.topbar.set_running(True, percent)
+        self.run_screen.run_control_panel.set_progress(True, self.result is not None, percent, message)
+        self.statusBar().showMessage("GPU 預熱中")
+
+    def _on_gpu_warmup_finished(self, summary: dict) -> None:
+        status = summary.get("status", "")
+        reason = str(summary.get("reason", "") or "")
+        reserved_mb = int(summary.get("reserved_bytes", 0) or 0) / (1024 * 1024)
+        if status == "warmed":
+            device = summary.get("device_name") or "CUDA"
+            self._notice(
+                f"GPU 預熱完成（{device}）：CUDA context 已建立，並以目前影像試跑一次"
+                f"（{summary.get('pipeline_ms', 0):.0f} ms，未輸出檔案），已配置 {reserved_mb:.0f} MB 裝置記憶體。",
+                "success",
+            )
+        elif status == "context_only":
+            self._notice(
+                f"已建立 CUDA context（{summary.get('session_ms', 0):.0f} ms）。載入影像後再預熱，"
+                "可一併依影像尺寸配置裝置記憶體。",
+                "info",
+            )
+        elif status == "fallback":
+            self._notice(f"GPU 預熱時 Detector 改用 CPU fallback：{reason}", "warning")
+        elif status == "unavailable":
+            self._notice(f"無法預熱：CUDA 不可用（{reason}）", "warning")
+        else:
+            self._notice(reason or "此 Recipe 未啟用 CUDA，不需要預熱。", "info")
+
+    def _on_gpu_warmup_failed(self, message: str) -> None:
+        self._notice(f"GPU 預熱失敗：{message}", "error")
+
+    def _on_gpu_warmup_thread_finished(self) -> None:
+        self._warmup_controller.clear()
+        self._set_warmup_running(False)
+        self.run_screen.run_control_panel.set_progress(False, self.result is not None, 0, "")
+        self._update_run_ready()
 
     # ------------------------------------------------------------------
     # tile preview (Recipe designer)
@@ -1117,6 +1213,10 @@ class MainWindow(QMainWindow, LogMixin):
     def closeEvent(self, event) -> None:
         if self._inspection_thread and self._inspection_thread.isRunning():
             QMessageBox.information(self, "背景作業", "檢測仍在執行中，請等待完成後再關閉。")
+            event.ignore()
+            return
+        if self._warmup_controller.is_running:
+            QMessageBox.information(self, "背景作業", "GPU 預熱仍在執行中，請等待完成後再關閉。")
             event.ignore()
             return
         if self._preview_thread and self._preview_thread.isRunning():

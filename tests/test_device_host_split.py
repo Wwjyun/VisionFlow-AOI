@@ -53,12 +53,13 @@ class _CountingRuntime(_Runtime):
 
 
 class DeviceHostSplitTests(unittest.TestCase):
-    def _split(self, detectors, resident=True, tiling=False, runtime=None):
+    def _split(self, detectors, resident=True, tiling=False, runtime=None, anchor_on_device=False):
         return InspectionResultAssembler._device_host_split(
             gpu_runtime=runtime if runtime is not None else _Runtime(),
             detectors=detectors,
             resident_image=object() if resident else None,
             tiling_gpu_requested=tiling,
+            anchor_on_device=anchor_on_device,
         )
 
     def test_cpu_only_run_reports_every_step_as_host(self):
@@ -72,7 +73,7 @@ class DeviceHostSplitTests(unittest.TestCase):
 
     def test_resident_device_run_reports_device_steps_and_keeps_candidate_extraction_on_host(self):
         detector = _Detector(routes={"cuda": 6})
-        split = self._split([detector], resident=True)
+        split = self._split([detector], resident=True, anchor_on_device=True)
         self.assertEqual(split["image_decode"], "cpu")
         self.assertEqual(split["resident_upload"], "device")
         self.assertEqual(split["anchor_localization"], "device")
@@ -134,6 +135,40 @@ class DeviceHostSplitTests(unittest.TestCase):
         split = self._split([detector], resident=True)
         self.assertEqual(split["preprocessing"], "cpu")
         self.assertEqual(split["candidate_extraction"], "cpu")
+
+    def test_resident_upload_alone_does_not_report_device_anchor_localization(self):
+        """v1.6.0 reported ``device`` whenever the image was resident, even though the anchor ran
+        on the CPU reference. Only the backend recorded on the tiles may claim device work."""
+        split = self._split([_Detector(routes={"cuda": 6})], resident=True, anchor_on_device=False)
+        self.assertEqual(split["resident_upload"], "device")
+        self.assertEqual(split["anchor_localization"], "cpu")
+
+    def test_assembled_result_reads_the_anchor_backend_from_tile_metadata(self):
+        from core.performance import PipelineProfiler
+
+        class _Manager:
+            @staticmethod
+            def ai_performance_stats():
+                return {}
+
+        class _StatusRuntime(_Runtime):
+            @staticmethod
+            def performance_stats():
+                return {"functions": {}}
+
+        def assemble(backend):
+            tile = {"tile": {"tile_id": "r0000_c0000", "metadata": {"grid_anchor_backend": backend}}}
+            return InspectionResultAssembler.build(
+                image_path=Path("input.png"), started=0.0,
+                recipe={"recipe_name": "r", "machine_id": "m", "product_id": "p", "version": "1"},
+                provenance={}, aggregate={"final_result": "PASS", "summary": {}},
+                tile_results=[tile], detector_manager=_Manager(), detectors=[],
+                gpu_runtime=_StatusRuntime(), gpu_mode="auto", tiling_gpu_requested=False,
+                display_requested=False, resident_image=None, profiler=PipelineProfiler(),
+            )["execution"]["gpu"]["device_host_split"]["anchor_localization"]
+
+        self.assertEqual(assemble("cuda_dll"), "device")
+        self.assertEqual(assemble("cpu"), "cpu")
 
     def test_tiling_is_device_only_while_a_resident_image_exists(self):
         self.assertEqual(self._split([_Detector()], resident=True, tiling=True)["tiling_roi"], "device")

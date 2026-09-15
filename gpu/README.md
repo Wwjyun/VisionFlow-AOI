@@ -39,9 +39,9 @@ plan，tile metadata 以 `cpu_crossover` 路線與 `preprocess_routes` 標示。
 以 RTX 3090 完成等價量測後才可接入產線；未接入者在 `execution.gpu.device_host_split` 中
 一律回報為 cpu。**接入與否以本節與 `Todo.md` 為準，不以 export 存在為準。**
 
-- `vf_match_template_gray_u8`（Template Anchor Grid 定位）：`core/tiler.py` 已有路由，但**完整
-  pipeline 中實際未生效**（2026-09-15 查證）：`core/pipeline.py` 在 resident 模式傳給 Tiler 的
-  `gpu_runtime` 是 `None`，anchor 一律走 CPU，詳見〈v1.6.0 發行版〉一節末與 `Todo.md` P0。
+- `vf_match_template_gray_u8`（Template Anchor Grid 定位）：**已接入**完整 pipeline（`main`，
+  v1.6.0 之後修正；v1.6.0 發行檔因 resident 模式 Tiler 拿不到 runtime 而實際走 CPU，詳見
+  〈v1.6.0 後：anchor 接線修正〉）。正式尺寸 pipeline 內 median 3.29 ms（CPU 參考 6.95 ms）。
   Tiler 層級量測：與 `cv2.matchTemplate` 的定位座標在 9 個場景 9/9 相同、分數差 ≤ 4.2e-7、
   逐次執行決定性；形狀界線內（template 每邊 ≤ 128 px 且搜尋面積 ≥ 256×256）比 CPU 快
   1.6～3.9 倍，界線外或失敗時回 CPU 參考；界線見 `core/tiler.py` 的 `gpu_anchor_shapes_supported`。
@@ -334,7 +334,7 @@ flowchart TB
 
 灰色為 CPU／host、綠色為 GPU／device、黃色為 PCIe 上傳；虛線是下載回 host 的資料。
 
-**GPU anchor 在 resident 模式沒有接上，且 `device_host_split` 誤報（尚未修正，已列入 `Todo.md` P0）**：
+**GPU anchor 在 resident 模式沒有接上，且 `device_host_split` 誤報（v1.6.0 的問題；已於下一節修正，未包含在 v1.6.0 發行檔）**：
 同一份 JSON 的 `device_host_split.anchor_localization` 是 `device`，但 GPU 呼叫統計只有上表三個
 export，沒有 `vf_match_template_gray_u8`，anchor 時間也與 CPU 相同。這不是形狀界限造成的：
 基準的搜尋區 512×512、template 64×64，都在 `gpu_anchor_shapes_supported` 界限內。查證後有兩個問題：
@@ -349,9 +349,80 @@ export，沒有 `vf_match_template_gray_u8`，anchor 時間也與 CPU 相同。�
 2. **回報錯誤**：`core/pipeline_stages.py` 只要 `resident_image is not None` 就把 anchor 標成 device，
    沒有依本次實際呼叫的 export 判斷，因此把上面的問題遮住了。
 
-修正時需讓 resident 模式的 Tiler 取得同一個 runtime（不可因此多做 H2D），補 pipeline 層級測試證明
-`vf_match_template_gray_u8` 真的被呼叫、座標與 CPU 相同，並用本節命令重量 `template_match`。
-修正前，接手者判斷 anchor 位置請以 `gpu_metrics.functions` 為準。
+v1.6.0 發行檔仍有此問題；判斷 v1.6.0 的 anchor 位置請以 `gpu_metrics.functions` 為準。
+
+### 2026-09-15 v1.6.0 後：anchor 接線修正、GPU 切圖陷阱與預熱
+
+以下改動在 `main`，尚未包含在任何發行檔。
+
+**1. Anchor 接線與回報（P0 觀測正確性）**
+
+- `core/tiler.py`：resident 模式的 anchor 改用 resident image 所屬的 runtime（`resident.runtime`），
+  不再依賴 pipeline 刻意不傳的 `gpu_runtime`，因此不會啟用逐 tile CUDA 裁切，也沒有新增像素 H2D
+  （每輪只傳 64×64 template 4,096 bytes）。strict CUDA（不允許回退）時 anchor 失敗會直接拋出；允許回退時
+  改走 CPU 參考，且**不寫入 `runtime.last_error`**，避免單純 anchor 失敗（例如純色 template）讓同一輪
+  Detector 的 GPU 步驟全部停用。
+- CPU 參考只把搜尋區轉灰階，不再先轉整張 16384×13000。灰階轉換是逐像素運算，結果與整張轉換後切片
+  完全相同（測試逐欄比對 bbox 與分數）；這讓 CPU 與 GPU 兩種 mode 的 anchor 都變快。
+- `core/pipeline_stages.py`：`device_host_split.anchor_localization` 改依本輪 tile metadata 的
+  `grid_anchor_backend` 判定，不再只看是否有 resident 上傳。
+- `tools/benchmark_pipeline_production.py` 的判定比對新增 tile 座標與 `match_bbox`，anchor 分數列為
+  診斷漂移；原本只比 tile-local defect，anchor 位移不會被發現。
+- 測試：`tests/test_gpu_session.py` 新增 pipeline 層級測試（resident 模式確實呼叫定位 export、tile 座標
+  與 CPU 相同、split 回報 device）；`tests/test_tiler_anchor_backend.py` 補無 `gpu_runtime` 的 resident
+  tiler、strict 失敗、回退不污染 `last_error`、搜尋區灰階等價；`tests/test_device_host_split.py` 補
+  「只有 resident 上傳不得回報 device anchor」。
+
+RTX 3090、同一正式尺寸基準（16384×13000、6 ROI、`202-CS-SN-1`，warm-up 1＋量測 3 輪）：
+
+| 階段 | v1.6.0 CPU | 修正後 CPU | v1.6.0 GPU | 修正後 GPU |
+|---|---:|---:|---:|---:|
+| Anchor 定位 `template_match` median | 58.8 ms | **6.95 ms** | 58.7 ms（實為 CPU） | **3.29 ms**（GPU） |
+| Tiling 合計 median | 135.6 ms | 90.2 ms | 58.9 ms | **3.44 ms** |
+| 端到端 median／P95 | 6792.8／7174.1 ms | 6315.7／6524.9 ms | 2011.1／2023.4 ms | **1957.5／2112.7 ms** |
+| 端到端倍數 | | | 3.38× | 3.23× |
+
+倍數略降是因為 CPU 也吃到搜尋區灰階的改善；GPU 端到端本身快了約 54 ms。3/3 輪 PASS/NG、defect、
+tile 座標與 `match_bbox` 完全相同；只有 anchor 分數有 6.6e-7 的浮點漂移（先前 Tiler 層級量測記錄為
+≤ 4.2e-7，這張圖為 6.6e-7），`match_threshold` 0.999 下不影響判定。GPU 呼叫統計每輪多一次
+`vf_match_template_gray_u8`。JSON：`outputs_validation/anchor_fix/production_anchor_fix.json`。
+
+**2. GUI 可觸發的 GPU 變慢陷阱：無 resident 時的逐 tile CUDA 裁切**
+
+`gpu.tiling`（GUI「切小圖使用 GPU」）在沒有整圖 resident 上傳時（Detector 未開 GPU、切圖模式非 grid、
+或 crossover 略過上傳），v1.6.0 會對每張 tile 呼叫 `vf_crop_u8`，而每次呼叫都重傳整張原圖。實測同圖同 Recipe：
+
+| 設定 | 端到端 median | Tiling median | 每張圖 CUDA 傳輸 |
+|---|---:|---:|---:|
+| 僅 CPU | 6426.0 ms | 85.4 ms | 0 |
+| GPU mode＋切小圖 GPU＋Detector GPU 關（v1.6.0） | **6862.4 ms** | **871.7 ms** | 6 次 `vf_crop_u8`，約 3.8 GB H2D |
+| 同上（修正後） | 6166.3 ms | 84.9 ms | 0 |
+| GPU mode＋切小圖 GPU＋Detector GPU 開 | 1910.3 ms | 5.5 ms | 單次整圖上傳 |
+
+修正：允許回退（`auto`）時 pipeline 不再把 runtime 交給切圖器，改用 CPU 切圖，並在
+`execution.gpu.tiling` 回報 `requested=true`、`active=false` 與原因，GUI TopBar 會顯示 CPU FALLBACK 與
+tooltip 原因，不再誤顯示 CUDA；strict `cuda` 維持明確要求的 CUDA 裁切。使用者回報 v1.6.0 在另一台電腦
+「同參數、同一張實際照片 GPU 比 CPU 慢約 1 秒」，此陷阱是可重現且量級吻合的原因之一，但尚未取得
+該電腦的 log 確認。
+
+**3. GPU 預熱**
+
+`GpuExecutionSessionCache.warm_up(recipe_path, image_path)`：建立 session（DLL 載入與 CUDA context），
+有影像時以同一 session 對目前影像完整跑一次 pipeline（所有輸出關閉、暫存目錄事後刪除），讓 resident
+上傳與 Detector buffers 依正式尺寸配置。GUI「檢測控制」面板新增「GPU 預熱」按鈕（背景執行，期間鎖住
+檢測、換圖、換 Recipe 與關窗）。批次與監控使用各自的 throughput session，不受這個按鈕影響。
+
+每種情境各 3 輪，每輪都是全新 process（未預熱的時間包含建立 session）：
+
+| | 第 1 輪 | 第 2 輪 | 第 3 輪 | median |
+|---|---:|---:|---:|---:|
+| 未預熱的第一張 | 2112.7 ms | 2075.5 ms | 1993.3 ms | **2075.5 ms** |
+| 預熱後的第一張 | 1859.2 ms | 1908.2 ms | 1814.2 ms | **1859.2 ms** |
+| 預熱本身 | 1993.1 ms | 2053.4 ms | 2026.9 ms | 2026.9 ms |
+
+預熱讓第一張快約 216 ms（-10.4%）；第一輪就配置完 22 個 device buffer（855 MB），之後不再增加。
+Recipe 在 Designer 儲存後 session 仍會依 mtime 重建，需要重新預熱；只在 GPU 相關設定變更才重建的
+改善仍列在 `Todo.md`。
 
 ## 檔案
 

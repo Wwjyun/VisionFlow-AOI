@@ -184,6 +184,7 @@ class RecipeInfoPanel(QWidget):
 class RunControlPanel(Panel):
     start_requested = Signal()
     view_results_requested = Signal()
+    warmup_requested = Signal()
 
     def __init__(self, parent=None):
         super().__init__(title="檢測控制", parent=parent)
@@ -195,6 +196,17 @@ class RunControlPanel(Panel):
         self.start_button.setEnabled(False)
         self.start_button.clicked.connect(self.start_requested.emit)
         self.add_widget(self.start_button)
+
+        self.warmup_button = QPushButton("GPU 預熱")
+        self.warmup_button.setProperty("variant", "secondary")
+        self.warmup_button.setToolTip(
+            "建立 CUDA context，並以目前影像試跑一次（不輸出任何檔案），"
+            "讓第一張檢測不承擔 GPU 初始化與記憶體配置成本。\n"
+            "未載入影像時只建立 CUDA context；Recipe 未啟用 CUDA 時不需要預熱。"
+        )
+        self.warmup_button.setEnabled(False)
+        self.warmup_button.clicked.connect(self.warmup_requested.emit)
+        self.add_widget(self.warmup_button)
 
         self.hint_label = QLabel("請先載入影像與 Recipe")
         self.hint_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -290,6 +302,11 @@ class RunControlPanel(Panel):
             self.hint_label.setText("請先載入影像與 Recipe")
         elif not has_recipe:
             self.hint_label.setText("請先載入影像與 Recipe")
+
+    def set_warmup_state(self, has_recipe: bool, busy: bool, warming: bool) -> None:
+        """Warm-up needs only a Recipe; it is blocked while any single-image work is running."""
+        self.warmup_button.setEnabled(has_recipe and not busy)
+        self.warmup_button.setText("GPU 預熱中…" if warming else "GPU 預熱")
 
     def set_progress(self, running: bool, has_result: bool, pct: int, message: str) -> None:
         self._progress_row.setVisible(running or has_result)
@@ -583,6 +600,7 @@ class RunScreen(QWidget):
     view_results_requested = Signal()
     choose_batch_folder_requested = Signal()
     start_batch_requested = Signal()
+    warmup_requested = Signal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -630,6 +648,7 @@ class RunScreen(QWidget):
         self.run_control_panel.start_requested.connect(self.start_requested.emit)
         self.op_panel.start_requested.connect(self.start_requested.emit)
         self.run_control_panel.view_results_requested.connect(self.view_results_requested.emit)
+        self.run_control_panel.warmup_requested.connect(self.warmup_requested.emit)
         self.recipe_info_panel.open_recipe_requested.connect(self.open_recipe_requested.emit)
         self.batch_folder_panel.choose_folder_requested.connect(self.choose_batch_folder_requested.emit)
         self.batch_folder_panel.start_batch_requested.connect(self.start_batch_requested.emit)

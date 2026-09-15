@@ -132,6 +132,39 @@ class InspectionWorker(QObject, LogMixin):
         self.finished.emit(result)
 
 
+class GpuWarmupWorker(QObject, LogMixin):
+    """Warm the shared single-image GPU session off the UI thread."""
+
+    finished = Signal(dict)
+    failed = Signal(str)
+    progress = Signal(int, str)
+
+    def __init__(
+        self,
+        recipe_path: Path,
+        gpu_session_cache: GpuExecutionSessionCache,
+        image_path: Path | None = None,
+    ):
+        super().__init__()
+        self.recipe_path = Path(recipe_path)
+        self.image_path = Path(image_path) if image_path is not None else None
+        self.gpu_session_cache = gpu_session_cache
+
+    @Slot()
+    def run(self) -> None:
+        try:
+            self.logger.info("GPU warm-up started: recipe=%s image=%s", self.recipe_path, self.image_path)
+            summary = self.gpu_session_cache.warm_up(
+                self.recipe_path, self.image_path, progress_callback=self.progress.emit
+            )
+        except Exception as exc:
+            self.logger.exception("GPU warm-up failed: recipe=%s image=%s", self.recipe_path, self.image_path)
+            self.failed.emit(str(exc))
+            return
+        self.logger.info("GPU warm-up completed: %s", summary)
+        self.finished.emit(summary)
+
+
 class BatchInspectionWorker(QObject, LogMixin):
     finished = Signal(dict)
     failed = Signal(str)

@@ -183,8 +183,13 @@ class InspectionResultAssembler:
         detectors,
         resident_image,
         tiling_gpu_requested: bool,
+        anchor_on_device: bool = False,
     ) -> dict:
         """Report which pipeline steps ran on the device and which stayed on the host.
+
+        ``anchor_on_device`` comes from the anchor backend recorded on this run's tiles, not from
+        the resident upload: a resident image only makes device localization possible, while the
+        shape bound, a missing export or a recovered failure can still keep the CPU reference.
 
         AGENT.md requires the actual split to be reported from runtime metadata rather than
         describing the flow as fully GPU. Only steps whose device status is known from this run are
@@ -219,8 +224,9 @@ class InspectionResultAssembler:
             if executed
         }
         note = (
-            "anchor_localization 僅在形狀界線內走 device（見 core/tiler.py "
-            "gpu_anchor_shapes_supported）；candidate_extraction、geometry_and_statistics 與 "
+            "anchor_localization 依本次 tile metadata 的 grid_anchor_backend 判定，只有 resident "
+            "影像存在、DLL 具定位 export 且在形狀界線內（見 core/tiler.py "
+            "gpu_anchor_shapes_supported）時才走 device；candidate_extraction、geometry_and_statistics 與 "
             "pass_ng_decision 只在該次執行真的呼叫到對應 device export 時才回報 device，"
             "因此「device」代表該步驟部分在 device、其餘仍在 host。"
         )
@@ -231,7 +237,7 @@ class InspectionResultAssembler:
         return {
             "image_decode": "cpu",
             "resident_upload": "device" if resident_image is not None else "cpu",
-            "anchor_localization": "device" if resident_image is not None else "cpu",
+            "anchor_localization": "device" if anchor_on_device else "cpu",
             "tiling_roi": "device" if tiling_gpu_requested and resident_image is not None else "cpu",
             "preprocessing": "device" if plan_on_device else "cpu",
             "automatic_cnr_mask": step_sides["automatic_cnr_mask"],
@@ -262,7 +268,15 @@ class InspectionResultAssembler:
         profiler,
         resident_upload_memory: dict | None = None,
         resident_skipped_by_crossover: bool = False,
+        tiling_cuda_crop_skipped: bool = False,
     ) -> dict:
+        tiling_status = gpu_runtime.status(tiling_gpu_requested and not tiling_cuda_crop_skipped)
+        if tiling_cuda_crop_skipped:
+            tiling_status["requested"] = True
+            tiling_status["reason"] = (
+                "未整圖上傳 GPU（沒有 Detector 使用 CUDA、切圖模式非 grid 或 crossover 略過），"
+                "逐張 CUDA 裁切會每張重傳整張原圖而較慢，已改用 CPU 切小圖"
+            )
         return {
             "image_name": Path(image_path).name,
             "recipe_name": recipe["recipe_name"],
@@ -289,13 +303,19 @@ class InspectionResultAssembler:
                         "device_memory_before_upload": dict(resident_upload_memory or {}),
                         "skipped_by_crossover": bool(resident_skipped_by_crossover),
                     },
-                    "tiling": gpu_runtime.status(tiling_gpu_requested),
+                    "tiling": tiling_status,
                     "display_requested": bool(display_requested),
                     "device_host_split": InspectionResultAssembler._device_host_split(
                         gpu_runtime=gpu_runtime,
                         detectors=detectors,
                         resident_image=resident_image,
                         tiling_gpu_requested=tiling_gpu_requested,
+                        anchor_on_device=any(
+                            (tile_result.get("tile", {}).get("metadata") or {}).get(
+                                "grid_anchor_backend"
+                            ) == "cuda_dll"
+                            for tile_result in tile_results
+                        ),
                     ),
                     "detectors": {
                         detector.detector_id: InspectionResultAssembler._detector_gpu_status(

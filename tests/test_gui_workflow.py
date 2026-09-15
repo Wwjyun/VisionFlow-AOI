@@ -191,6 +191,70 @@ class GuiWorkflowTests(unittest.TestCase):
         self.assertIs(pipeline_type.call_args.kwargs["gpu_session"], session)
         pipeline.run.assert_called_once_with(Path("input.png"))
 
+    def test_gpu_warmup_worker_uses_the_shared_cache_and_reports_failures(self):
+        from gui.workers import GpuWarmupWorker
+
+        cache = Mock()
+        cache.warm_up.return_value = {"status": "warmed"}
+        worker = GpuWarmupWorker(Path("recipe.yaml"), cache, Path("input.bmp"))
+        finished, failed = [], []
+        worker.finished.connect(finished.append)
+        worker.failed.connect(failed.append)
+        worker.run()
+        self.assertEqual(cache.warm_up.call_args.args, (Path("recipe.yaml"), Path("input.bmp")))
+        self.assertEqual(finished, [{"status": "warmed"}])
+
+        cache.warm_up.side_effect = RuntimeError("strict CUDA failed")
+        worker.run()
+        self.assertEqual(failed, ["strict CUDA failed"])
+
+    def test_gpu_warmup_button_follows_recipe_and_blocks_inspection_while_warming(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            settings = QSettings(str(Path(temp_dir) / "warmup.ini"), QSettings.Format.IniFormat)
+            window = MainWindow(settings=settings)
+            panel = window.run_screen.run_control_panel
+            try:
+                self.assertFalse(panel.warmup_button.isEnabled())
+                window._load_recipe(Path("recipes/PRODUCT_A_AOI_01.yaml"))
+                window._update_run_ready()
+                self.assertTrue(panel.warmup_button.isEnabled())
+                self.assertEqual(panel.warmup_button.text(), "GPU 預熱")
+
+                window._warmup_controller.start = Mock()
+                window._run_gpu_warmup()
+                started = window._warmup_controller.start.call_args
+                worker = started.args[0]
+                self.assertIs(worker.gpu_session_cache, window._inspection_gpu_sessions)
+                self.assertEqual(worker.recipe_path, Path("recipes/PRODUCT_A_AOI_01.yaml"))
+                self.assertTrue(window.warming_up)
+                self.assertFalse(panel.warmup_button.isEnabled())
+                self.assertFalse(panel.start_button.isEnabled())
+                self.assertEqual(panel.warmup_button.text(), "GPU 預熱中…")
+
+                window.image_path = Path("input.bmp")
+                with patch("gui.main_window.InspectionWorker") as inspection_worker:
+                    window._run_inspection()
+                inspection_worker.assert_not_called()
+                self.assertIn("GPU 預熱中", window.notice_bar.label.text())
+
+                window._on_gpu_warmup_finished({
+                    "status": "warmed", "device_name": "RTX 3090", "pipeline_ms": 1937.0,
+                    "reserved_bytes": 855238144,
+                })
+                self.assertIn("GPU 預熱完成", window.notice_bar.label.text())
+                self.assertIn("未輸出檔案", window.notice_bar.label.text())
+                window.image_path = None
+                window._on_gpu_warmup_thread_finished()
+                self.assertFalse(window.warming_up)
+                self.assertFalse(window.running)
+                self.assertTrue(panel.warmup_button.isEnabled())
+
+                window._on_gpu_warmup_finished({"status": "not_requested", "reason": "此 Recipe 未啟用 CUDA，不需要預熱"})
+                self.assertIn("不需要預熱", window.notice_bar.label.text())
+            finally:
+                window._inspection_gpu_sessions.close()
+                window.deleteLater()
+
     def test_results_keyboard_navigation_and_focus_signal(self):
         screen = ResultsScreen()
         image = QImage(160, 120, QImage.Format.Format_RGB888)
@@ -286,6 +350,70 @@ class GuiWorkflowTests(unittest.TestCase):
         screen._enabled = {key: False for key in screen._enabled}
         screen._save_recipe()
         self.assertIn("驗證失敗", screen.editor_state_badge.text())
+
+    def test_designer_gpu_policy_maps_every_mode_and_fallback_pair_without_rewriting(self):
+        from gui.designer_panels import GpuSettingsPanel as Panel
+
+        base = RecipeManager().load(Path("recipes/PRODUCT_A_AOI_01.yaml"))
+        cases = (
+            ("cpu", True, Panel.POLICY_CPU),
+            ("cpu", False, Panel.POLICY_CPU),
+            ("auto", True, Panel.POLICY_GPU_FALLBACK),
+            ("auto", False, Panel.POLICY_GPU_STRICT),
+            ("cuda", False, Panel.POLICY_GPU_STRICT),
+            ("cuda", True, Panel.POLICY_GPU_STRICT),
+        )
+        for mode, fallback, policy in cases:
+            with self.subTest(mode=mode, fallback=fallback):
+                screen = DesignerScreen()
+                recipe = deepcopy(base)
+                recipe["gpu"] = {**recipe.get("gpu", {}), "mode": mode, "fallback_to_cpu": fallback}
+                screen.set_recipe(recipe)
+                panel = screen.gpu_panel
+                self.assertEqual(panel.policy(), policy)
+                self.assertTrue(panel.policy_cards[policy].radio.isChecked())
+                self.assertFalse(screen.is_dirty())
+                # An untouched policy saves the Recipe's exact values, including legacy pairs.
+                config = screen.build_gpu_config()
+                self.assertEqual((config["mode"], config["fallback_to_cpu"]), (mode, fallback))
+                self.assertEqual(panel.tiling_toggle.isEnabled(), policy != Panel.POLICY_CPU)
+                if (mode, fallback) == ("auto", False):
+                    self.assertIn("行為等同「僅 GPU（嚴格）」", screen.gpu_status_label.text())
+
+    def test_designer_gpu_policy_change_is_dirty_canonical_and_explains_detector_switches(self):
+        from gui.designer_panels import GpuSettingsPanel as Panel
+
+        screen = DesignerScreen()
+        recipe = RecipeManager().load(Path("recipes/PRODUCT_A_AOI_01.yaml"))
+        recipe["gpu"] = {**recipe.get("gpu", {}), "mode": "auto", "fallback_to_cpu": True}
+        for config in recipe["detectors"].values():
+            config["use_gpu"] = False
+        with patch.object(DesignerScreen, "_probe_cuda", return_value=(True, "RTX 3090", "")):
+            screen.set_recipe(recipe)
+            panel = screen.gpu_panel
+            self.assertIn("尚無啟用中的 Detector 開啟 GPU", screen.gpu_status_label.text())
+
+            panel.policy_cards[Panel.POLICY_GPU_STRICT].radio.click()
+            self.assertTrue(screen.is_dirty())
+            config = screen.build_gpu_config()
+            self.assertEqual((config["mode"], config["fallback_to_cpu"]), ("cuda", False))
+            self.assertIn("僅 GPU（嚴格）", screen.gpu_status_label.text())
+
+            panel.policy_cards[Panel.POLICY_CPU].radio.click()
+            config = screen.build_gpu_config()
+            self.assertEqual(config["mode"], "cpu")
+            self.assertFalse(panel.tiling_toggle.isEnabled())
+            self.assertFalse(panel.dll_path_edit.isEnabled())
+            self.assertIn("Detector 的 GPU 開關不會生效", screen.gpu_status_label.text())
+
+            panel.policy_cards[Panel.POLICY_GPU_FALLBACK].radio.click()
+            enabled_detector = next(did for did, on in screen._enabled.items() if on)
+            screen._on_detector_gpu_toggled(enabled_detector, True)
+            self.assertIn("1 個啟用中的 Detector 已開啟 GPU", screen.gpu_status_label.text())
+            self.assertEqual(
+                (screen.build_gpu_config()["mode"], screen.build_gpu_config()["fallback_to_cpu"]),
+                ("auto", True),
+            )
 
     def test_designer_round_trips_optional_pixel_size(self):
         screen = DesignerScreen()

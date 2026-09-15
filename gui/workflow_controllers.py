@@ -66,3 +66,7 @@ class InspectionWorkflowController(WorkerWorkflowController):
 
 class TilePreviewWorkflowController(WorkerWorkflowController):
     pass
+
+
+class GpuWarmupWorkflowController(WorkerWorkflowController):
+    pass

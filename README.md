@@ -631,9 +631,10 @@ GUI 每次啟動都會先進入 OP 模式。切換至 Engineer 或 Admin 時必�
 1. 載入影像。
 2. 載入配方。
 3. 在設定抽屜確認輸出項目。
-4. 執行檢測。
-5. 查看 PASS／NG、Tile、NG 及缺陷數量與耗時。
-6. 檢查 Overlay、缺陷表格與輸出檔案。
+4. 使用 GPU 的配方可先按「GPU 預熱」（選用），讓第一張檢測不承擔 CUDA 初始化。
+5. 執行檢測。
+6. 查看 PASS／NG、Tile、NG 及缺陷數量與耗時。
+7. 檢查 Overlay、缺陷表格與輸出檔案。
 
 ### 批次資料夾
 
@@ -749,10 +750,13 @@ detectors:
 - Grid／Template Anchor Grid 啟用原生 GPU Detector 且 DLL 支援 resident ROI 時，圖片先在 CPU 讀檔並解碼為 BGR，再整張上傳 GPU 一次。Tile 以 device ROI 座標交給 CUDA plan，CPU 原圖僅保留不複製的 ROI view 供形狀檢查、GPU 失敗後的 CPU fallback 與 NG tile 輸出；混用 CPU Detector 時才按需建立獨立 CPU tile 副本。GPU plan 不會為非連續 CPU view 額外建立連續副本。部分 Detector 仍需下載 binary mask 在 CPU 執行 contours／幾何判定；CPU-only、舊 DLL 與非 grid 模式維持原有路徑。
 - 在 `gpu.mode: auto` 且啟用 CPU fallback 時，若該 Recipe 與該影像尺寸上每個支援 CUDA 的 Detector plan 都在本機實測 CPU 較快，之後相同 Recipe 與尺寸的圖片會整張略過 resident 上傳（完全不發生像素 H2D），直接執行已量測的 CPU 路徑；結果 JSON 以 `execution.gpu.resident_image.skipped_by_crossover` 回報。strict `gpu.mode: cuda` 永不走此路徑。
 - 舊版 DLL 缺少新 exports 時仍保留既有路徑或 CPU fallback。
-- Template Anchor Grid 定位在形狀界線內由 GPU 執行：template 每邊不超過 128 px 且搜尋面積達 256×256 時，走 resident image 上的 CUDA 定位（RTX 3090 實測比 CPU 快 1.6～3.9 倍，座標與 `matchTemplate` 相符、分數差 ≤ 4.2e-7）；界外或不支援時一律回 CPU 參考實作。**已知問題（v1.6.0）**：`core/pipeline.py` 在整圖已 resident 上傳時傳給 Tiler 的 `gpu_runtime` 為 `None`，使 GPU anchor 在 pipeline 中實際不會執行，一律走 CPU 參考實作（結果正確，只是未加速）；同時 `execution.gpu.device_host_split.anchor_localization` 仍會回報 `device`。兩者皆列於 `Todo.md` P0，修正前請以 `execution.gpu` 呼叫統計是否含 `vf_match_template_gray_u8` 判斷。
+- Template Anchor Grid 定位在形狀界線內由 GPU 執行：template 每邊不超過 128 px 且搜尋面積達 256×256 時，走 resident image 上的 CUDA 定位（RTX 3090 實測比 CPU 快 1.6～3.9 倍，座標與 `matchTemplate` 相符、分數差 ≤ 4.2e-7）；界外或不支援時一律回 CPU 參考實作；strict CUDA 下定位失敗會直接報錯。CPU 參考只轉換搜尋區灰階。`execution.gpu.device_host_split.anchor_localization` 依本次 tile 的 `grid_anchor_backend` 回報。**v1.6.0 發行檔的已知問題**：整圖已上傳時 GPU anchor 實際不會執行（改用 CPU，結果正確）且 split 仍回報 `device`；`main` 已修正，詳見 [`gpu/README.md`](gpu/README.md)。
+- 「切小圖使用 GPU」（`gpu.tiling`）只有在整圖已上傳 GPU 時才有效益。若沒有 Detector 開啟 GPU、切圖模式非 grid 或 crossover 略過上傳，逐張 CUDA 裁切會每張重傳整張原圖（正式尺寸實測切圖 85 → 872 ms）；`gpu.mode: auto` 時會改用 CPU 切圖並在 `execution.gpu.tiling.reason` 說明，strict `cuda` 維持 CUDA 裁切。v1.6.0 發行檔尚未包含此修正。
 - 202-CS-SN-1 有 resident ROI 且未開啟 debug 影像時，優先使用 `vf_cnr_mask_u8_roi`：直接讀取已上傳的原圖 ROI，在 GPU 完成 BGR→gray、float32 Gaussian、residual、median／MAD、門檻與候選遮罩，只下載遮罩與三個診斷純量，metadata 標示為 `cuda_resident_fused`。它與既有 GPU chain 逐位元相同（15/15），候選遮罩與 CPU 相同（15/15）；舊 DLL、缺少 export、呼叫失敗或 debug 模式會改走下述既有路徑。connected components 與 ring CNR 仍在 CPU（GPU CCL 原型端到端僅快 0.4% 且傳輸量更大，已撤回）。
 - 202-CS-SN-1 的既有 CUDA 路徑中，CNR 背景 Gaussian 與 residual 統計（兩個 median／MAD、門檻、候選遮罩）由 GPU 執行。**median 與 `np.median` 逐位元相同**；residual 統計（`vf_cnr_mask_f32`）的 median／MAD／門檻／遮罩也**全部精確相同**（623 個案例零不符），因此不再需要把 `residual` 與其絕對偏差各自上傳一次。**Gaussian 背景為數學等價、非逐位元相同**（device 加法順序不同），因此 `mad`、`residual_median`、`residual_threshold`、`robust_noise_sigma` 這四個診斷值會有約 1e-5 的尾位差異，其餘 metadata 與 PASS/NG、缺陷數、bbox、area、confidence 全部相同，候選遮罩亦逐位元相同（47 個場景 47/47）。每次執行的缺陷 metadata 會以 `background_backend`（`opencv_cpu`／`cuda_f32`）、`residual_backend`（`numpy_cpu`／`cuda_f32`）與 `background_precision_note` 明確標示該次用的是哪條路徑；需要逐位元可重現時請用 `gpu.mode: cpu`。
 - GPU mode 統一為 `auto`、`cpu`、`cuda`：`auto` 依設定嘗試並可回退，`cpu` 不載入 CUDA，`cuda` 禁止隱性 CPU fallback；執行結果與 GUI 顯示的是實際 backend。
+- Recipe Designer 的「運算後端 GPU / CPU」以三個選項直接表達行為：「僅 CPU」（`mode: cpu`）、「GPU 優先，失敗改用 CPU」（`mode: auto`、`fallback_to_cpu: true`）、「僅 GPU（嚴格）」（`mode: cuda`）。舊 Recipe 的 `mode: auto` 搭配 `fallback_to_cpu: false` 行為等同嚴格模式，畫面會標示此情況，未變更選項時原值保存。狀態列會顯示 CUDA 是否可用、有幾個啟用中的 Detector 開啟 GPU，以及「切小圖使用 GPU」無效的組合。
+- GUI「檢測控制」面板的「GPU 預熱」會建立 CUDA context，並以目前影像試跑一次（不輸出任何檔案），讓第一張檢測不承擔初始化成本；RTX 3090 正式尺寸實測第一張由 2075.5 ms 降為 1859.2 ms。
 
 目前 CUDA 原始碼包含 separable Gaussian、constant weights、64-bit integral Adaptive Mean Threshold、persistent context 與 grow-only buffers。這些功能仍需在目標 RTX 3090（`sm_86`）完成正式編譯、五份配方等價、效能、VRAM 與壓力驗收後，才能視為 production-ready 或預設啟用。
 
@@ -768,7 +772,7 @@ detectors:
 |---|---:|---:|---:|---|
 | **端到端** | **6792.8／7174.1** | **2011.1／2023.4** | **3.38×** | 混合 |
 | 讀檔與解碼 | 767.5／857.1 | 767.9／794.9 | 1.00× | CPU |
-| Anchor 定位 | 58.8／59.5 | 58.7／61.6 | 1.00× | CPU（resident 模式未接上 GPU anchor，見上方已知問題） |
+| Anchor 定位 | 58.8／59.5 | 58.7／61.6 | 1.00× | CPU（v1.6.0 未接上 GPU anchor；`main` 修正後 CPU 6.95 ms、GPU 3.29 ms） |
 | 6 個 ROI 產生 | 77.3／89.1 | 0.17／0.24 | 444× | GPU |
 | Detector 合計 | 5649.7／6183.5 | 859.2／942.8 | 6.58× | 混合 |
 | └ Gray 前處理 | 28.5／28.9 | 38.2／44.2 | 0.75× | GPU |
