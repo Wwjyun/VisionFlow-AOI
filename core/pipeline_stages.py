@@ -126,16 +126,19 @@ class InspectionResultAssembler:
         "automatic_cnr_mask": (
             "vf_cnr_mask_f32",
             "vf_cnr_mask_u8_roi",
+            "vf_cnr_candidates_u8_roi",
         ),
         "candidate_extraction": (
             "vf_median_f32",
             "vf_find_contours_u8",
             "vf_find_contours_download",
             "vf_connected_components_u8",
+            "vf_cnr_candidates_u8_roi",
         ),
         "geometry_and_statistics": (
             "vf_component_stats_u8",
             "vf_ring_statistics_f32",
+            "vf_cnr_candidates_u8_roi",
         ),
     }
 

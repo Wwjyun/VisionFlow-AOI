@@ -206,6 +206,32 @@ int main() {
             &resident_cnr_median, &resident_cnr_mad, &resident_cnr_threshold,
             resident_cnr_mask.data(), static_cast<long long>(resident_cnr_mask.size()));
     }
+    std::vector<int32_t> candidate_ints(1024 * 7, 0);
+    std::vector<float> candidate_floats(1024 * 3, 0.0f);
+    int candidate_count = -1;
+    int candidate_components = -1;
+    int candidate_status = -1;
+    if (result == VF_CUDA_OK) {
+        const int32_t candidate_int_params[22] = {
+            3, 255, VF_MORPH_OPEN, 3, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 8, 1, 0, 0, 0, 1, 4, 0};
+        const double candidate_real_params[6] = {0.0, 3.0, 8.0, 0.000001, 1.4826, 1.5};
+        float candidate_median = 0.0f;
+        float candidate_mad = 0.0f;
+        double candidate_threshold = 0.0;
+        result = vf_cnr_candidates_u8_roi(
+            context, resident_generation, 0, 0, width, height,
+            candidate_int_params, 22, candidate_real_params, 6,
+            &candidate_median, &candidate_mad, &candidate_threshold,
+            candidate_ints.data(), candidate_floats.data(), 1024,
+            &candidate_count, &candidate_components, &candidate_status);
+        if (result == VF_CUDA_OK && (candidate_count < 0 || candidate_status != 0 ||
+                                     candidate_median != resident_cnr_median ||
+                                     candidate_mad != resident_cnr_mad ||
+                                     candidate_threshold != resident_cnr_threshold)) {
+            std::cerr << "resident CNR candidates disagree with the resident CNR mask chain\n";
+            return 10;
+        }
+    }
     // A real device OOM must not leave a stale error for the next ROI batch.
     const int oom_side = 4096;
     std::vector<uint8_t> oom_source(static_cast<size_t>(oom_side) * oom_side, 7);

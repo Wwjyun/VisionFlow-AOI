@@ -86,7 +86,11 @@ plan，tile metadata 以 `cpu_crossover` 路線與 `preprocess_routes` 標示。
   **效能**：單獨呼叫沒有收益（4000×2000 ksize=51 為 13.5 vs 13.8 ms，H2D＋D2H 佔 96%），
   但 **kernel 本體只有 0.606 ms**；接線後 202 的 `automatic_cnr_mask` 836.6 → 438.8 ms，
   產線形狀端到端 1337 → 1019 ms（**1.31×**）。真正的大幅收益需把 residual 留在 device。
-- **connected components 與 ring CNR 統計**：**尚未 GPU 化**。`tools/connected_components_reference.py`
+- `vf_cnr_candidates_u8_roi`（202 候選抽取：morphology、排除區、connected components、面積／邊界過濾與
+  ring CNR 統計）：**已接入** `detectors/detector_202_1.py` 的 `_device_candidates`（ROI 面積 ≥ 1024×1024）。
+  71/71 案例與既有 resident mask＋OpenCV 路徑逐欄相同，mean/std 依 NumPy float32 pairwise 順序逐位元重現；
+  詳見〈CCL＋ring CNR 留在 device〉一節。以下為接入前的背景紀錄。
+- **connected components 與 ring CNR 統計（接入前紀錄）**：`tools/connected_components_reference.py`
   與 `cv2.connectedComponentsWithStats` 在 **4 連通完全等價**（含標籤編號；10 種形狀 × 3 密度 × 3 seed
   共 90 個案例逐位元斷言相等），8 連通則**只差標籤編號**（component 集合與 stats 在所有案例相同）。
   **原本這使 GPU CCL 無法替換**，因為 `Detector202_1` 的候選排序在 CNR 完全相同時會沿用標籤順序；
@@ -423,6 +427,97 @@ tooltip 原因，不再誤顯示 CUDA；strict `cuda` 維持明確要求的 CUDA
 預熱讓第一張快約 216 ms（-10.4%）；第一輪就配置完 22 個 device buffer（855 MB），之後不再增加。
 Recipe 在 Designer 儲存後 session 仍會依 mtime 重建，需要重新預熱；只在 GPU 相關設定變更才重建的
 改善仍列在 `Todo.md`。
+
+### 2026-09-15 CCL＋ring CNR 留在 device（`vf_cnr_candidates_u8_roi`）
+
+使用者排定的新 GPU mode 第 1 優先。以下改動在 `main`，尚未包含在任何發行檔（v1.6.1 之後）。
+
+**做了什麼**
+
+新增 optional ABI-v1 export `vf_cnr_candidates_u8_roi`。它先執行與 `vf_cnr_mask_u8_roi` 相同的 resident CNR
+鏈（兩者共用抽出的 `resident_cnr_mask_device`，原 export 行為不變），接著在 device 上完成 Detector202_1
+候選階段剩下的全部步驟，只下載三個 residual 純量與每個存活 component 一筆紀錄（7 個 int32＋3 個 float32，
+共 40 bytes）：
+
+1. **Morphology**：沿用既有 `launch_morph_pass`（與 OpenCV 邊界語意相同）；只接受奇數 kernel ≥ 3 與
+   iterations ≥ 1，其餘回傳 `VF_CUDA_UNSUPPORTED`。
+2. **排除區**：center 矩形與四邊 inset 由 host 以 `Detector202._exclusion_geometry` 算好後傳入；host 的
+   `_apply_exclusion_masks` 也改用同一個 helper，兩邊不可能算出不同矩形。
+3. **Connected components**：資料平行 hook-and-compress union-find。每個 parent 只會被寫成比自己小的
+   index，所以並行寫入不會形成環；遺失的寫入只會多跑一輪，直到某一輪完全沒有相鄰的不同 root 為止。
+   component 以最小 raster index 為 root。
+4. **Stats 與分組**：`cub::DeviceSelect::Flagged` 取出前景像素，以 root 為 key 做穩定的
+   `cub::DeviceRadixSort::SortPairs`（同一 component 內保留 raster 順序），`DeviceRunLengthEncode` 得到
+   area，per-component kernel 算 bbox 並套用與 host 相同的面積／border margin 過濾。
+5. **Ring CNR**：每個候選在 device 上依 raster 順序收集 component 像素與 window 背景（label 不同且未被排除），
+   以 **NumPy float32 pairwise 加總順序**（<8 從 -0.0 循序、≤128 八線、否則在 n/2 取 8 的倍數處切開）
+   計算總和，`mean = float32(float64(sum) / float64(n))`、`std = sqrt(float32(float64(Σ(v-mean)²) / float64(n)))`。
+   這些是查 NumPy 2.5.1 `_methods._mean/_var` 與 `pairwise_sum` 後確認的實際公式，Python 探針在 632 種長度
+   與 boolean-mask gather 上與 `np.sum/np.mean/np.std` 逐位元相同。contrast、CNR 與排序仍由 host 以原本的
+   Python 表達式計算。
+6. **退回條件**：ring 背景少於 `min_background_pixels`（host 會改用整張 included 影像）、紀錄容量不足
+   （runtime 會自動以正確容量重試一次）、ring window 總量超過 2^28 個 float，都回傳 `VF_CUDA_UNSUPPORTED`
+   並以 `out_status` 說明；Detector 對任何例外都整段改走既有 resident mask＋OpenCV 路徑，結果不變。
+
+Detector 端：`Detector202_1.detect` 在有 resident ROI、runtime 具此 export、非 debug 影像、ROI 面積
+≥ `DEVICE_CANDIDATES_MIN_PIXELS`（1024×1024）時直接取得候選，完全不跑 host gray、mask 與 label。
+缺陷 metadata 新增 `component_backend`（`opencv_cpu`／`cuda_resident`）。`device_host_split` 會把
+`automatic_cnr_mask`、`candidate_extraction`、`geometry_and_statistics` 標為 device。
+
+**等價驗證**（`tools/cnr_candidates_u8_roi_equivalence.py`，RTX 3090）
+
+- 71/71 案例：device 與既有 resident mask＋OpenCV 路徑所有缺陷欄位完全相同；與 CPU 參考除了已知漂移的
+  4 個 residual 診斷值與來源標籤外完全相同。每個案例都必須有缺陷，空清單會判定失敗。
+- 涵蓋：1／3 通道、兩組 seed、4／8 連通、open／close（k5 i2）／dilate／erode／無 morphology、
+  production 遮罩、自訂 center＋全 inset、偏移 center、緊／寬 padding、border margin 0、小面積上限、
+  candidate value 1、`min_background_pixels` 0、900 缺陷密集場景、108 個完全相同缺陷的 CNR 平手陣列、
+  三次 12000×2000 正式尺寸（89 缺陷）。
+- 退回：偶數 morphology kernel 與需要整張背景的案例都有缺陷，且確實走 `opencv_cpu`、結果與 CPU 相同；
+  低於尺寸界線的 ROI 確實留在 host。
+- Component 數量：13/13 與 `cv2.connectedComponentsWithStats` 相同。
+- 穩定性：12000×2000 連續 1000 次、3 張影像輪替，結果逐位元決定性；median 25.4 ms、P95 28.5 ms；
+  device allocation 由 36 增長到 47 後不再增加。
+- 正式 Recipe manifest：12/12 CPU/GPU 等價（202 的 manifest 影像為 512×512，依尺寸界線走 host）。
+- 完整 CUDA validator、native smoke（新增：與 `vf_cnr_mask_u8_roi` 的 median/MAD/threshold 逐位元比對）通過。
+
+**ROI 尺寸界線的依據**（單一 ROI detector 時間，device／既有路徑，每格 5 次取後 4 次 median）
+
+| ROI | 預設 padding（上限 50） | 倍數 | padding 上限 8 | 倍數 |
+|---|---:|---:|---:|---:|
+| 256×256 | 6.84／3.10 ms | **0.45×** | 2.90／3.04 ms | 1.05× |
+| 512×512 | 21.54／10.21 ms | **0.47×** | 4.95／6.44 ms | 1.30× |
+| 1024×1024 | 26.69／25.59 ms | 0.96× | 7.08／23.60 ms | 3.33× |
+| 2000×2000 | 29.53／69.63 ms | 2.36× | 10.99／57.35 ms | 5.22× |
+| 4000×2000 | 39.54／112.52 ms | 2.85× | 14.46／89.41 ms | 6.18× |
+| 12000×2000 | 45.96／240.56 ms | **5.23×** | 24.47／211.87 ms | 8.66× |
+
+時間主要跟著 ring window 大小走：每個候選在一個 device thread 內循序掃描自己的 window 並做 pairwise
+加總，小 ROI 攤不掉這個成本。因此暫以 1024×1024 為界；**下一步優化**是把 window 收集改成跨像素平行、
+pairwise 樹的 leaf 跨候選平行，只保留 leaf 合併在 thread 內循序（合併順序決定 float32 結果，不能改）。
+
+**完整 pipeline**（`tools/benchmark_pipeline_production.py --profile production`，warm-up 1＋量測 3 輪）
+
+| 階段 | CPU median／P95 | v1.6.1 GPU | 本次 GPU median／P95 | CPU/GPU 倍數 |
+|---|---:|---:|---:|---:|
+| **端到端** | 6725.5／6905.7 ms | 1957.5 ms | **1467.7／1488.2 ms** | **4.58×** |
+| Detector 合計 | 5648.1／5761.1 ms | 900.9 ms | **334.4／349.5 ms** | 16.89× |
+| Tiling 合計 | 109.8／125.9 ms | 3.4 ms | 6.5／10.2 ms | 16.96× |
+| 讀檔與解碼 | 806.2／856.9 ms | 796.0 ms | 829.4／864.7 ms | 0.97× |
+| 初始化（含整圖上傳） | 0.1 ms | 174.9 ms | 153.5／157.2 ms | — |
+| Recipe 設定 | 107.3 ms | 90.9 ms | 108.0 ms | 0.99× |
+
+| 每輪 GPU 傳輸 | v1.6.1 | 本次 |
+|---|---:|---:|
+| native calls | 14 | **8**（整圖上傳 1、anchor 1、候選 6） |
+| H2D | 638.98 MB | 638.98 MB（整圖）＋ 4 KB（template） |
+| D2H | 288 MB（gray＋mask） | **0.022 MB**（候選紀錄） |
+
+3/3 輪 PASS/NG、defect、bbox、area、confidence 與 metadata（來源標籤除外）完全相同；另以同圖單次對照確認
+558 個缺陷只有 `background_backend`／`residual_backend`／`component_backend` 三個來源標籤不同。
+GPU 端到端 1467.7 ms 的組成：解碼 829 ms（57%）、Detector 334 ms（23%）、初始化 153 ms（10%）、
+Recipe 108 ms（7%）。**剩下最大的一段是影像解碼**（使用者優先順序第 2 項）。
+JSON：`outputs_validation/cnr_candidates/production_candidates.json`、
+`outputs_validation/cnr_candidates/cnr_candidates_u8_roi_equivalence.json`。
 
 ## 檔案
 

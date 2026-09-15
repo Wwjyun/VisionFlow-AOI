@@ -536,6 +536,53 @@ VF_CUDA_API int vf_cnr_mask_u8_roi(
     unsigned char* out_mask,
     long long out_mask_capacity);
 
+/*
+ * Resident-image 202-CS-SN-1 candidate extraction. Runs the vf_cnr_mask_u8_roi chain on one ROI of
+ * the current resident image and then keeps the rest of Detector202_1's candidate stage on the
+ * device: the rectangular morphology pass, the center/edge exclusion AND, connected components with
+ * stats, the area and border-margin filters, and the ring CNR statistics. Neither the gray image,
+ * the mask nor a label map crosses PCIe; only the three residual scalars and one record per surviving
+ * component are copied back.
+ *
+ * int_params (exactly 22): [0] Gaussian kernel size, [1] candidate value 0..255, [2] morphology
+ * operation (-1 none, otherwise VfMorphologyOperation), [3] odd kernel size >= 3, [4] iterations >= 1,
+ * [5] center exclusion enabled, [6..9] center x0, y0, x1, y1 (half-open, already clamped),
+ * [10..13] edge insets top, bottom, left, right, [14] connectivity 4 or 8, [15] minimum area,
+ * [16] maximum area, [17] maximum area enabled, [18] border margin, [19] padding minimum,
+ * [20] padding maximum, [21] minimum background pixels.
+ * real_params (exactly 6): [0] Gaussian sigma, [1] sigma multiplier, [2] threshold floor,
+ * [3] absolute floor, [4] MAD scale, [5] padding scale.
+ *
+ * Each surviving component writes 7 int32 values to out_candidate_ints (x, y, width, height, area,
+ * background pixel count, status) and 3 float32 values to out_candidate_floats (defect mean,
+ * background mean, background std), ordered by the component's first raster pixel. The means and
+ * standard deviation reproduce np.mean/np.std on the host's boolean-mask gathers bit-exactly: values
+ * are visited in raster order, summed with NumPy's float32 pairwise order, divided in float64 and
+ * narrowed to float32. The caller computes contrast, CNR and the final ordering.
+ *
+ * out_status and VF_CUDA_UNSUPPORTED report cases the host must handle on its existing path:
+ * 1 = a component's ring has fewer than minimum background pixels (the host then uses the whole
+ * included image), 2 = more surviving components than candidate_capacity (out_candidate_count holds
+ * the required capacity), 3 = the ring windows exceed the device gather limit. An even kernel,
+ * non-positive iterations, a connectivity other than 4 or 8, or a NaN padding scale is also
+ * VF_CUDA_UNSUPPORTED. This is an additive ABI-v1 export; callers must probe for it.
+ */
+VF_CUDA_API int vf_cnr_candidates_u8_roi(
+    void* context,
+    uint64_t generation,
+    int x, int y, int width, int height,
+    const int32_t* int_params, int int_param_count,
+    const double* real_params, int real_param_count,
+    float* out_residual_median,
+    float* out_mad,
+    double* out_threshold,
+    int32_t* out_candidate_ints,
+    float* out_candidate_floats,
+    int candidate_capacity,
+    int* out_candidate_count,
+    int* out_component_count,
+    int* out_status);
+
 #ifdef __cplusplus
 }
 #endif

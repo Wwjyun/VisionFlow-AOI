@@ -17,7 +17,7 @@
 ## 目前狀態摘要
 
 - [ ] **2026-09-15 使用者排定的新 GPU mode 下一步優先順序**（依序執行；P0 anchor 接線與 split 誤報已完成）：
-  1. CCL＋ring CNR 留在 device：可省約 279 ms CPU 時間，並把 144 MB gray D2H＋144 MB mask D2H 歸零（每輪只剩 639 MB 整圖上傳），是剩下最大的單一缺口；啟用條件見 `gpu/README.md`〈GPU connected components 實驗〉。
+  1. ~~CCL＋ring CNR 留在 device~~ **已完成（2026-09-15，見完成紀錄）**：`vf_cnr_candidates_u8_roi` 接入，正式尺寸 GPU 端到端 1957.5 → 1467.7 ms（4.58×），每輪 D2H 288 MB → 0.022 MB。剩餘子項：小 ROI（< 1024×1024）仍較慢而維持既有路徑，需把 ring window 收集與 pairwise leaf 改為跨像素／跨候選平行後再放寬尺寸界線。
   2. 影像解碼約 768 ms（GPU mode 端到端 38%）：評估 nvJPEG／平行解碼，需保持 PNG/BMP/JPEG 解碼結果與 OpenCV 逐像素相同。
   3. 初始化預熱：預熱按鈕已完成（第一張 2075.5 → 1859.2 ms）；剩 session 重建條件與自動預熱（見 P6）。
   4. findContours／鏈間並行：等 CCL 重做時順路處理，不單獨投入。
@@ -807,6 +807,8 @@ vs 原本 `[255,255,20,20]`）。因此「標籤編號順序」對 202 的最終
 - [ ] 加速不得犧牲 GUI 回應、打包啟動、結果追溯、錯誤訊息或 CPU fallback。
 
 ## 完成紀錄
+
+- [x] 2026-09-15：**202-CS-SN-1 的 CCL＋ring CNR 留在 device（使用者優先順序第 1 項）。** 新增 optional ABI-v1 export `vf_cnr_candidates_u8_roi`：共用抽出的 `resident_cnr_mask_device`（`vf_cnr_mask_u8_roi` 行為不變）後，在 device 完成 morphology、排除區、hook-and-compress union-find connected components、CUB 前景選取／穩定 radix 分組／run-length stats、面積與 border margin 過濾，以及依 NumPy float32 pairwise 順序與 float64 除法逐位元重現的 ring mean/std，只下載三個 residual 純量與每候選 40 bytes 紀錄。Host 端：`Detector202._exclusion_geometry` 供 CPU 遮罩與 device 參數共用；`Detector202_1._device_candidates` 於 resident ROI、非 debug、ROI ≥ 1024×1024 時使用並以 host 原式計算 contrast/CNR/排序，任何例外或 `VF_CUDA_UNSUPPORTED`（ring 背景不足、容量、gather 上限、偶數 kernel 等）整段回既有路徑；metadata 新增 `component_backend`；`device_host_split` 認得新 export；benchmark 將 `component_backend` 列為來源標籤。RTX 3090 驗證：CUDA 13.3 `sm_86` 重編、native smoke（新增與 resident mask 鏈 median/MAD/threshold 逐位元比對）、完整 CUDA validator；`tools/cnr_candidates_u8_roi_equivalence.py` 71/71 與既有路徑逐欄相同且與 CPU 僅差 4 個已知漂移診斷值與來源標籤（每案例皆有缺陷，含 4/8 連通、各 morphology、遮罩變體、padding、108 缺陷 CNR 平手陣列、900 缺陷密集、正式尺寸），退回案例確實走 host，component 數 13/13 與 OpenCV 相同；12000×2000 連續 1000 次決定性、median 25.4 ms、allocation 穩定於 47；正式 Recipe manifest 12/12 等價。尺寸界線依據：預設 padding 下 512×512 為 0.47×、1024×1024 0.96×、2000×2000 2.36×、12000×2000 5.23×。完整 pipeline：CPU 6725.5/6905.7 ms、GPU 1467.7/1488.2 ms（4.58×；v1.6.1 GPU 1957.5 ms），Detector 合計 5648.1 → 334.4 ms，native calls 14 → 8，D2H 288 MB → 0.022 MB，3/3 判定相同。完整 460 tests、compileall、preflight、`git diff --check`、GUI offscreen、CLI 合成圖 smoke 通過。數據與設計記於 `gpu/README.md`〈CCL＋ring CNR 留在 device〉。
 
 - [x] 2026-09-15：正式發布 VisionFlow AOI `v1.6.1` CUDA-enabled Windows x64（`gh release create`）；annotated tag 指向 release commit `e988a48` 且位於 `origin/main`。DLL 與 v1.6.0 同一份（CUDA 原始碼無差異，SHA-256 `E8437444361C72C7CDAA89FAABADC3013D910F0ED7312A05758BB4BE590478B5`）；發布前完整 451 tests 通過，PyInstaller 打包後 packaged `--smoke-test` 與獨立解壓 smoke 均 exit 0。GitHub Release 為非草稿、非 prerelease、latest，僅含 `VisionFlow-AOI-v1.6.1-windows-x64.zip`；ZIP 118,763,433 bytes、SHA-256 `84B90D16489320C8D91AAE7404EBE3349E8DB673C25E4795BEB258131EEF7661`，內含 6 份 Recipe（含 1 份 example）與 1 份 CUDA DLL，GitHub digest 與重新下載後的獨立驗證一致。使用者已在另一台電腦確認 v1.6.0「GPU 比 CPU 慢」是 Detector GPU 開關未開啟，開啟後約為 1/3 時間。非 RTX 3090 GPU 與無 GPU 電腦的打包實機矩陣仍待跨機驗證。
 

@@ -3,6 +3,7 @@ from __future__ import annotations
 from copy import deepcopy
 from pathlib import Path
 import unittest
+from unittest.mock import patch
 
 import cv2
 import numpy as np
@@ -898,6 +899,155 @@ class Detector2021ResidentCnrRoutingTests(unittest.TestCase):
         detector._automatic_cnr_mask(gray)
         self.assertEqual(runtime.resident_calls, [])
         self.assertIn("202-1_residual_abs", detector.debug_images)
+
+
+class _PlanResidentRoi(_ResidentRoi):
+    """Resident ROI whose gray plan runs on the host when the detector falls back."""
+
+    def roi(self, *_args):
+        return None
+
+
+class _CandidateRuntime(_ResidentFusedRuntime):
+    """Offers the resident candidate export; records come from the CPU reference in reverse order."""
+
+    supports_cnr_candidates_u8_roi = True
+
+    def __init__(self, gray, params, fail_candidates=False):
+        super().__init__(gray)
+        self.params = dict(params)
+        self.fail_candidates = fail_candidates
+        self.candidate_calls = []
+
+    def cnr_candidates_u8_roi(self, device_roi, int_params, real_params):
+        self.candidate_calls.append((device_roi, list(int_params), list(real_params)))
+        if self.fail_candidates:
+            raise RuntimeError("injected candidate export failure")
+        reference = Detector202_1(params=self.params)
+        analysis = reference._automatic_cnr_mask(self.gray)
+        candidates = reference._collect_candidates(
+            analysis["image_float"], analysis["candidate_mask"], analysis["inclusion_mask"]
+        )[::-1]
+        records = np.array(
+            [[*candidate.bbox, candidate.area, candidate.background_area, 0] for candidate in candidates],
+            dtype=np.int32,
+        ).reshape(-1, 7)
+        stats = np.array(
+            [[candidate.defect_mean, candidate.background_mean, candidate.background_std] for candidate in candidates],
+            dtype=np.float32,
+        ).reshape(-1, 3)
+        return {
+            "residual_median": np.float32(analysis["residual_median"]),
+            "mad": np.float32(analysis["mad"]),
+            "threshold": float(analysis["residual_threshold"]),
+            "records": records,
+            "stats": stats,
+            "component_count": len(candidates),
+        }
+
+
+class Detector2021DeviceCandidateRoutingTests(unittest.TestCase):
+    PROVENANCE = {"background_backend", "residual_backend", "background_precision_note", "component_backend"}
+
+    @staticmethod
+    def _gray():
+        rng = np.random.default_rng(909)
+        gray = np.full((200, 260), 150, dtype=np.float64)
+        gray += rng.normal(0.0, 2.0, gray.shape)
+        for top, left in ((40, 40), (40, 180), (120, 60), (130, 200)):
+            gray[top : top + 8, left : left + 12] = 60.0
+        return np.clip(gray, 0, 255).astype(np.uint8)
+
+    @staticmethod
+    def _params(**overrides):
+        params = {"center_mask_enabled": False, "edge_mask_enabled": False}
+        params.update(overrides)
+        return params
+
+    def _strip(self, defects):
+        return [
+            {**defect, "metadata": {k: v for k, v in defect["metadata"].items() if k not in self.PROVENANCE}}
+            for defect in defects
+        ]
+
+    def _device_detector(self, gray, params, **runtime_options):
+        runtime = _CandidateRuntime(gray, params, **runtime_options)
+        detector = Detector202_1(params=params, use_gpu=True, gpu_runtime=runtime)
+        detector._active_device_roi = _PlanResidentRoi(gray.shape[1], gray.shape[0])
+        return detector, runtime
+
+    def test_device_candidates_replace_mask_components_and_ring_on_the_host(self):
+        gray = self._gray()
+        params = self._params()
+        detector, runtime = self._device_detector(gray, params)
+        with patch.object(Detector202_1, "DEVICE_CANDIDATES_MIN_PIXELS", 0):
+            defects = detector.detect(gray)
+        expected = Detector202_1(params=params).detect(gray)
+        self.assertEqual(len(runtime.candidate_calls), 1)
+        self.assertEqual(runtime.resident_calls, [])
+        self.assertEqual(runtime.gaussian_calls, [])
+        self.assertGreaterEqual(len(expected), 4)
+        self.assertEqual(self._strip(defects), self._strip(expected))
+        self.assertEqual({d["metadata"]["component_backend"] for d in defects}, {"cuda_resident"})
+        self.assertEqual({d["metadata"]["component_backend"] for d in expected}, {"opencv_cpu"})
+        self.assertIn("device_cnr_candidates", detector._detection_stage_durations)
+
+    def test_parameters_follow_the_documented_export_layout(self):
+        gray = self._gray()
+        params = self._params(
+            morph_operation="close", morph_kernel=5, morph_iterations=2, connectivity=4,
+            center_mask_enabled=True, center_mask_use_image_center=False, center_mask_x=100,
+            center_mask_y=90, center_mask_width=20, center_mask_height=10, edge_mask_enabled=True,
+            edge_inset_all=7, component_border_margin_px=3, background_padding_min_px=4,
+            background_padding_max_px=30, background_padding_scale=2.25, min_background_pixels=11,
+            candidate_max_value=200, gaussian_sigma=1.5,
+        )
+        detector, runtime = self._device_detector(gray, params)
+        with patch.object(Detector202_1, "DEVICE_CANDIDATES_MIN_PIXELS", 0):
+            detector.detect(gray)
+        _roi, ints, reals = runtime.candidate_calls[0]
+        height, width = gray.shape
+        minimum_area, maximum_area = detector._effective_component_area_limits(height, width)
+        insets = detector._effective_edge_insets(width, height)
+        self.assertEqual(len(ints), 22)
+        self.assertEqual(len(reals), 6)
+        self.assertEqual(ints[0], detector._background_kernel(height, width))
+        self.assertEqual(ints[1:5], [200, 1, 5, 2])
+        self.assertEqual(ints[5:10], [1, 80, 80, 120, 100])
+        self.assertEqual(ints[10:14], [insets["top"], insets["bottom"], insets["left"], insets["right"]])
+        self.assertEqual(ints[14:22], [4, minimum_area, maximum_area, 1, 3, 4, 30, 11])
+        self.assertEqual(reals, [1.5, 3.0, 8.0, 0.000001, 1.4826, 2.25])
+
+        disabled = self._params(morph_iterations=0)
+        self.assertEqual(Detector202_1(params=disabled)._device_candidate_parameters(height, width)[0][2], -1)
+        unknown = self._params(morph_operation="gradient")
+        self.assertEqual(Detector202_1(params=unknown)._device_candidate_parameters(height, width)[0][2], -1)
+
+    def test_candidate_export_failure_keeps_the_resident_mask_and_host_components(self):
+        gray = self._gray()
+        params = self._params()
+        detector, runtime = self._device_detector(gray, params, fail_candidates=True)
+        with patch.object(Detector202_1, "DEVICE_CANDIDATES_MIN_PIXELS", 0):
+            defects = detector.detect(gray)
+        self.assertEqual(len(runtime.candidate_calls), 1)
+        self.assertEqual(len(runtime.resident_calls), 1)
+        self.assertEqual({d["metadata"]["component_backend"] for d in defects}, {"opencv_cpu"})
+        self.assertEqual(self._strip(defects), self._strip(Detector202_1(params=params).detect(gray)))
+
+    def test_small_rois_and_debug_exports_keep_the_host_route(self):
+        gray = self._gray()
+        params = self._params()
+        detector, runtime = self._device_detector(gray, params)
+        self.assertLess(gray.size, Detector202_1.DEVICE_CANDIDATES_MIN_PIXELS)
+        detector.detect(gray)
+        self.assertEqual(runtime.candidate_calls, [])
+
+        debug_detector, debug_runtime = self._device_detector(gray, params)
+        debug_detector.export_debug_images = True
+        with patch.object(Detector202_1, "DEVICE_CANDIDATES_MIN_PIXELS", 0):
+            debug_detector.detect(gray)
+        self.assertEqual(debug_runtime.candidate_calls, [])
+        self.assertIn("202-1_candidate_mask", debug_detector.debug_images)
 
 
 if __name__ == "__main__":

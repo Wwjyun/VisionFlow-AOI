@@ -241,6 +241,7 @@ _BACKEND_PROVENANCE = {
     "background_backend",
     "residual_backend",
     "background_precision_note",
+    "component_backend",
 }
 
 

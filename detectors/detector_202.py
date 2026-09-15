@@ -300,10 +300,13 @@ class Detector202(BaseDetector):
         self._record_debug_image("202_masked_binary", masked)
         return masked
 
-    def _apply_exclusion_masks(self, binary: np.ndarray) -> np.ndarray:
-        height, width = binary.shape[:2]
-        masked = binary.copy()
+    def _exclusion_geometry(self, width: int, height: int) -> dict:
+        """The zeroed center rectangle and edge insets, shared by the host mask and device routes.
 
+        ``center`` is ``(x_start, y_start, x_stop, y_stop)`` half-open, or ``None`` when disabled or
+        empty; ``insets`` holds the clamped top/bottom/left/right widths (all zero when disabled).
+        """
+        center = None
         if bool(self.params.get("center_mask_enabled", True)):
             if bool(self.params.get("center_mask_use_image_center", True)):
                 center_x = width // 2
@@ -319,22 +322,34 @@ class Detector202(BaseDetector):
             y_start = max(0, center_y - half_y)
             y_stop = min(height, center_y + half_y)
             if x_stop > x_start and y_stop > y_start:
-                masked[y_start:y_stop, x_start:x_stop] = 0
+                center = (x_start, y_start, x_stop, y_stop)
 
         if bool(self.params.get("edge_mask_enabled", True)):
             insets = self._effective_edge_insets(width, height)
-            left = insets["left"]
-            right = insets["right"]
-            top = insets["top"]
-            bottom = insets["bottom"]
-            if top > 0:
-                masked[:top, :] = 0
-            if bottom > 0:
-                masked[height - bottom :, :] = 0
-            if left > 0:
-                masked[:, :left] = 0
-            if right > 0:
-                masked[:, width - right :] = 0
+        else:
+            insets = {"left": 0, "right": 0, "top": 0, "bottom": 0}
+        return {"center": center, "insets": insets}
+
+    def _apply_exclusion_masks(self, binary: np.ndarray) -> np.ndarray:
+        height, width = binary.shape[:2]
+        masked = binary.copy()
+        geometry = self._exclusion_geometry(width, height)
+        if geometry["center"] is not None:
+            x_start, y_start, x_stop, y_stop = geometry["center"]
+            masked[y_start:y_stop, x_start:x_stop] = 0
+        insets = geometry["insets"]
+        left = insets["left"]
+        right = insets["right"]
+        top = insets["top"]
+        bottom = insets["bottom"]
+        if top > 0:
+            masked[:top, :] = 0
+        if bottom > 0:
+            masked[height - bottom :, :] = 0
+        if left > 0:
+            masked[:, :left] = 0
+        if right > 0:
+            masked[:, width - right :] = 0
         return masked
 
     def _effective_edge_insets(self, width: int, height: int) -> dict[str, int]:

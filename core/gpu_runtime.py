@@ -219,6 +219,11 @@ class GpuRuntime:
         """Optional 202 CNR export that reads the current resident uint8 ROI."""
         return self._capabilities.cnr_mask_u8_roi
 
+    @property
+    def supports_cnr_candidates_u8_roi(self) -> bool:
+        """Optional 202 export that also keeps morphology, components and ring CNR on the device."""
+        return self._capabilities.cnr_candidates_u8_roi
+
     def status(self, requested: bool = False) -> dict:
         active = bool(requested and self.available and not self.last_error)
         return {
@@ -244,6 +249,7 @@ class GpuRuntime:
                 "gaussian_blur_f32_sigma": self.supports_gaussian_f32_sigma,
                 "cnr_mask_f32": self.supports_cnr_mask_f32,
                 "cnr_mask_u8_roi": self.supports_cnr_mask_u8_roi,
+                "cnr_candidates_u8_roi": self.supports_cnr_candidates_u8_roi,
             },
             "queue": {
                 "depth": self.queue_depth,
@@ -749,6 +755,99 @@ class GpuRuntime:
             "threshold": float(threshold.value),
             "mask": mask,
         }
+
+    _VF_CUDA_UNSUPPORTED = 8
+    CNR_CANDIDATE_INT_PARAMS = 22
+    CNR_CANDIDATE_REAL_PARAMS = 6
+    CNR_CANDIDATE_STATUS = {
+        1: "a ring background is below min_background_pixels",
+        2: "more candidates than the record capacity",
+        3: "the ring windows exceed the device gather limit",
+    }
+
+    def cnr_candidates_u8_roi(
+        self,
+        device_roi: GpuDeviceRoi,
+        int_params,
+        real_params,
+        *,
+        candidate_capacity: int = 4096,
+    ) -> dict[str, object]:
+        """Run 202 candidate extraction on a resident ROI and download one record per candidate.
+
+        ``int_params``/``real_params`` follow the layout documented for ``vf_cnr_candidates_u8_roi``
+        in ``gpu/include/visionflow_cuda.h``. A record capacity that turns out too small is retried
+        once with the exact count the export reports. Any other unsupported case raises
+        ``GpuRuntimeError`` carrying ``error_code`` and ``candidate_status`` so the caller keeps its
+        host path for the whole step.
+        """
+        if not self.supports_cnr_candidates_u8_roi:
+            raise GpuRuntimeError(
+                "CUDA DLL has no resident CNR candidate export (vf_cnr_candidates_u8_roi)"
+            )
+        if not isinstance(device_roi, GpuDeviceRoi) or device_roi.image.runtime is not self:
+            raise GpuRuntimeError("vf_cnr_candidates_u8_roi requires an ROI from this runtime")
+        ints = np.ascontiguousarray(int_params, dtype=np.int32)
+        reals = np.ascontiguousarray(real_params, dtype=np.float64)
+        if ints.shape != (self.CNR_CANDIDATE_INT_PARAMS,) or reals.shape != (self.CNR_CANDIDATE_REAL_PARAMS,):
+            raise GpuRuntimeError(
+                "vf_cnr_candidates_u8_roi expects "
+                f"{self.CNR_CANDIDATE_INT_PARAMS} int and {self.CNR_CANDIDATE_REAL_PARAMS} real parameters"
+            )
+        self._require_gaussian_f32_sigma(float(reals[0]))
+        capacity = max(1, int(candidate_capacity))
+        for attempt in range(2):
+            records = np.zeros((capacity, 7), dtype=np.int32)
+            stats = np.zeros((capacity, 3), dtype=np.float32)
+            residual_median = ctypes.c_float(0.0)
+            mad = ctypes.c_float(0.0)
+            threshold = ctypes.c_double(0.0)
+            count = ctypes.c_int(0)
+            components = ctypes.c_int(0)
+            status = ctypes.c_int(0)
+            queued = time.perf_counter()
+            with self._queue_slots, self._lock:
+                lock_acquired = time.perf_counter()
+                result = int(self._dll.vf_cnr_candidates_u8_roi(
+                    self._context,
+                    ctypes.c_uint64(int(device_roi.image.generation)),
+                    int(device_roi.x), int(device_roi.y), int(device_roi.width), int(device_roi.height),
+                    ints.ctypes.data_as(ctypes.POINTER(ctypes.c_int32)), int(ints.size),
+                    reals.ctypes.data_as(ctypes.POINTER(ctypes.c_double)), int(reals.size),
+                    ctypes.byref(residual_median), ctypes.byref(mad), ctypes.byref(threshold),
+                    records.ctypes.data_as(ctypes.POINTER(ctypes.c_int32)),
+                    stats.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+                    capacity,
+                    ctypes.byref(count), ctypes.byref(components), ctypes.byref(status),
+                ))
+                completed = time.perf_counter()
+                # Only candidate records cross PCIe; the parameter arrays are read by the host side.
+                record_bytes = records.itemsize * 7 + stats.itemsize * 3
+                self._record_performance(
+                    "vf_cnr_candidates_u8_roi", 0,
+                    int(min(max(count.value, 0), capacity)) * record_bytes if result == 0 else 0,
+                    completed - lock_acquired, lock_acquired - queued,
+                )
+            if result == self._VF_CUDA_UNSUPPORTED and status.value == 2 and attempt == 0:
+                capacity = max(capacity + 1, int(count.value))
+                continue
+            if result != 0:
+                error = self._native_error("vf_cnr_candidates_u8_roi", result)
+                error.candidate_status = int(status.value)
+                reason = self.CNR_CANDIDATE_STATUS.get(int(status.value))
+                if reason:
+                    error.args = (f"{error.args[0]} ({reason})",)
+                raise error
+            kept = int(count.value)
+            return {
+                "residual_median": np.float32(residual_median.value),
+                "mad": np.float32(mad.value),
+                "threshold": float(threshold.value),
+                "records": records[:kept].copy(),
+                "stats": stats[:kept].copy(),
+                "component_count": int(components.value),
+            }
+        raise GpuRuntimeError("vf_cnr_candidates_u8_roi record capacity retry failed")
 
     @staticmethod
     def _f32_operand(image: np.ndarray, function_name: str) -> np.ndarray:
@@ -1360,6 +1459,7 @@ class GpuRuntime:
         self._load_optional_gaussian_blur_f32()
         self._load_optional_cnr_mask_f32()
         self._load_optional_cnr_mask_u8_roi()
+        self._load_optional_cnr_candidates_u8_roi()
 
     def _load_optional_native_plan(self) -> None:
         query = getattr(self._dll, "vf_plan_query", None)
@@ -1562,6 +1662,22 @@ class GpuRuntime:
             ctypes.POINTER(ctypes.c_uint8), ctypes.c_longlong,
         ]
         mask.restype = ctypes.c_int
+
+    def _load_optional_cnr_candidates_u8_roi(self) -> None:
+        candidates = getattr(self._dll, "vf_cnr_candidates_u8_roi", None)
+        if candidates is None:
+            return
+        candidates.argtypes = [
+            ctypes.c_void_p, ctypes.c_uint64,
+            ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+            ctypes.POINTER(ctypes.c_int32), ctypes.c_int,
+            ctypes.POINTER(ctypes.c_double), ctypes.c_int,
+            ctypes.POINTER(ctypes.c_float), ctypes.POINTER(ctypes.c_float),
+            ctypes.POINTER(ctypes.c_double),
+            ctypes.POINTER(ctypes.c_int32), ctypes.POINTER(ctypes.c_float), ctypes.c_int,
+            ctypes.POINTER(ctypes.c_int), ctypes.POINTER(ctypes.c_int), ctypes.POINTER(ctypes.c_int),
+        ]
+        candidates.restype = ctypes.c_int
 
     @staticmethod
     def _native_plan_descriptor(plan, image: np.ndarray) -> tuple[_VfPlanDescV1, object]:

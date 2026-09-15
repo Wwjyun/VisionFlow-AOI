@@ -207,18 +207,27 @@ class Detector202_1(Detector202):
     }
 
     def detect(self, image) -> list[dict]:
-        with self.measure_detection_stage("preprocess"):
-            gray = self._make_gray(image)
+        height, width = image.shape[:2]
+        device = None
+        if getattr(self, "_active_device_roi", None) is not None:
+            with self.measure_detection_stage("device_cnr_candidates"):
+                device = self._device_candidates(height, width)
 
-        with self.measure_detection_stage("automatic_cnr_mask"):
-            analysis = self._automatic_cnr_mask(gray)
+        if device is not None:
+            candidates, analysis = device
+        else:
+            with self.measure_detection_stage("preprocess"):
+                gray = self._make_gray(image)
 
-        with self.measure_detection_stage("connected_components_and_cnr"):
-            candidates = self._collect_candidates(
-                analysis["image_float"],
-                analysis["candidate_mask"],
-                analysis["inclusion_mask"],
-            )
+            with self.measure_detection_stage("automatic_cnr_mask"):
+                analysis = self._automatic_cnr_mask(gray)
+
+            with self.measure_detection_stage("connected_components_and_cnr"):
+                candidates = self._collect_candidates(
+                    analysis["image_float"],
+                    analysis["candidate_mask"],
+                    analysis["inclusion_mask"],
+                )
 
         geometry_started = time.perf_counter()
         defects = [
@@ -501,7 +510,142 @@ class Detector202_1(Detector202):
             "residual_threshold": residual_threshold,
             "min_area": minimum_area,
             "max_area": maximum_area,
+            "mask_shape": (height, width),
+            "component_backend": "opencv_cpu",
         }
+
+    _DEVICE_MORPHOLOGY_CODES = {"open": 0, "close": 1, "dilate": 2, "erode": 3}
+    # RTX 3090 per-ROI detector time, device candidates vs the resident-mask + OpenCV route, default
+    # ring padding: 256x256 0.45x, 512x512 0.47x, 1024x1024 0.96x, 2000x2000 2.36x, 12000x2000 5.23x.
+    # Each ring window is scanned sequentially inside one device thread, which small ROIs never
+    # amortise, so smaller ROIs keep the host route (see gpu/README.md).
+    DEVICE_CANDIDATES_MIN_PIXELS = 1024 * 1024
+
+    def _device_candidate_parameters(self, height: int, width: int) -> tuple[list[int], list[float]]:
+        """Pack the host candidate semantics in the ``vf_cnr_candidates_u8_roi`` parameter layout."""
+        morph_operation = str(self.params.get("morph_operation", "open")).lower()
+        morph_kernel = int(self.params.get("morph_kernel", 3))
+        morph_iterations = int(self.params.get("morph_iterations", 1))
+        morph_code = self._DEVICE_MORPHOLOGY_CODES.get(morph_operation)
+        if morph_code is None or morph_iterations <= 0 or morph_kernel <= 1:
+            morph_code = -1
+        geometry = self._exclusion_geometry(width, height)
+        center = geometry["center"]
+        insets = geometry["insets"]
+        minimum_area, maximum_area = self._effective_component_area_limits(height, width)
+        maximum_area_enabled = (
+            int(self.params.get("max_component_area_px", 0)) > 0
+            or float(self.params.get("max_component_area_ratio", 0.05)) > 0
+        )
+        int_params = [
+            self._background_kernel(height, width),
+            int(self.params.get("candidate_max_value", 255)),
+            morph_code,
+            morph_kernel,
+            morph_iterations,
+            1 if center is not None else 0,
+            *(center if center is not None else (0, 0, 0, 0)),
+            insets["top"],
+            insets["bottom"],
+            insets["left"],
+            insets["right"],
+            int(self.params.get("connectivity", 8)),
+            minimum_area,
+            maximum_area,
+            1 if maximum_area_enabled else 0,
+            int(self.params.get("component_border_margin_px", 1)),
+            int(self.params.get("background_padding_min_px", 8)),
+            int(self.params.get("background_padding_max_px", 50)),
+            int(self.params.get("min_background_pixels", 20)),
+        ]
+        real_params = [
+            float(self.params.get("gaussian_sigma", 0.0)),
+            float(self.params.get("residual_sigma_multiplier", 3.0)),
+            float(self.params.get("residual_threshold_floor", 8.0)),
+            float(self.params.get("noise_sigma_floor", 0.000001)),
+            float(self.params.get("mad_scale", 1.4826)),
+            float(self.params.get("background_padding_scale", 1.5)),
+        ]
+        return int_params, real_params
+
+    def _device_candidates(self, height: int, width: int):
+        """Candidate extraction kept entirely on the device, or ``None`` to use the host path.
+
+        ``vf_cnr_candidates_u8_roi`` returns the component boxes and the float32 np.mean/np.std
+        values bit-exactly, so contrast, CNR and the ordering below are the host expressions applied
+        to identical inputs. Any missing export, unsupported parameter, ring that needs the whole
+        included image, or device error returns ``None`` and the unchanged host path runs instead.
+        """
+        runtime = getattr(self, "gpu_runtime", None)
+        device_roi = getattr(self, "_active_device_roi", None)
+        if (
+            runtime is None
+            or not getattr(runtime, "available", False)
+            or not getattr(runtime, "supports_cnr_candidates_u8_roi", False)
+            or not self.use_gpu
+            or self.export_debug_images
+            or device_roi is None
+            or (int(device_roi.height), int(device_roi.width)) != (height, width)
+            or height * width < self.DEVICE_CANDIDATES_MIN_PIXELS
+        ):
+            return None
+        int_params, real_params = self._device_candidate_parameters(height, width)
+        try:
+            result = runtime.cnr_candidates_u8_roi(device_roi, int_params, real_params)
+        except Exception:
+            return None
+        records = np.asarray(result["records"], dtype=np.int32)
+        stats = np.asarray(result["stats"], dtype=np.float32)
+        if records.ndim != 2 or records.shape[1] != 7 or stats.shape != (records.shape[0], 3):
+            return None
+        cnr_noise_floor = float(self.params.get("cnr_noise_floor", 0.000001))
+        candidates = []
+        for record, values in zip(records, stats):
+            x, y, component_width, component_height, area, background_area, _status = (
+                int(value) for value in record
+            )
+            defect_mean = float(values[0])
+            background_mean = float(values[1])
+            background_std = float(values[2])
+            contrast = abs(defect_mean - background_mean)
+            cnr = contrast / max(background_std, cnr_noise_floor)
+            candidates.append(
+                _CnrCandidate(
+                    cnr=float(cnr),
+                    contrast=float(contrast),
+                    area=area,
+                    bbox=(x, y, component_width, component_height),
+                    defect_mean=defect_mean,
+                    background_mean=background_mean,
+                    background_std=background_std,
+                    background_area=background_area,
+                )
+            )
+        # Same total order as the host path. Components arrive in first-raster-pixel order; OpenCV
+        # numbers 8-connected components in its own scan order, which only matters for candidates
+        # equal in CNR and in bbox top-left, which the host ordering cannot separate either.
+        candidates.sort(
+            key=lambda candidate: (-candidate.cnr, candidate.bbox[1], candidate.bbox[0])
+        )
+        mad_scale = float(self.params.get("mad_scale", 1.4826))
+        noise_sigma_floor = float(self.params.get("noise_sigma_floor", 0.000001))
+        mad = float(result["mad"])
+        minimum_area, maximum_area = self._effective_component_area_limits(height, width)
+        analysis = {
+            "background_kernel": int_params[0],
+            "background_backend": "cuda_resident_fused",
+            "residual_backend": "cuda_resident_fused",
+            "component_backend": "cuda_resident",
+            "gaussian_sigma": float(self.params.get("gaussian_sigma", 0.0)),
+            "residual_median": float(result["residual_median"]),
+            "mad": mad,
+            "robust_noise_sigma": float(max(mad_scale * mad, noise_sigma_floor)),
+            "residual_threshold": float(result["threshold"]),
+            "min_area": minimum_area,
+            "max_area": maximum_area,
+            "mask_shape": (height, width),
+        }
+        return candidates, analysis
 
     def _collect_candidates(
         self,
@@ -757,9 +901,10 @@ class Detector202_1(Detector202):
                     self.params.get("edge_mask_enabled", True)
                 ),
                 "effective_edge_insets": self._effective_edge_insets(
-                    analysis["candidate_mask"].shape[1],
-                    analysis["candidate_mask"].shape[0],
+                    analysis["mask_shape"][1],
+                    analysis["mask_shape"][0],
                 ),
+                "component_backend": str(analysis["component_backend"]),
                 "mask_order": "automatic_cnr_mask_exclusion_components",
                 "reference_repository": self._REFERENCE_REPOSITORY,
                 "reference_commit": self._REFERENCE_COMMIT,

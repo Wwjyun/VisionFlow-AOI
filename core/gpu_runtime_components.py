@@ -160,6 +160,14 @@ class GpuCapabilities:
             and self.has_exports(("vf_cnr_mask_u8_roi",))
         )
 
+    @property
+    def cnr_candidates_u8_roi(self) -> bool:
+        """202 candidate extraction (mask, components and ring CNR) on a resident uint8 ROI."""
+        return bool(
+            self.cnr_mask_u8_roi
+            and self.has_exports(("vf_cnr_candidates_u8_roi",))
+        )
+
 @dataclass(slots=True)
 class GpuResourceRegistry:
     """Own cached native handles so the façade has one deterministic cleanup path."""

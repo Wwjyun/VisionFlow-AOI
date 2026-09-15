@@ -229,17 +229,57 @@ class CudaSourceContractTests(unittest.TestCase):
         self.assertIn("oom_recovery_result = vf_roi_batch_create(", smoke)
         self.assertIn("std::vector<VfRoiV1> oom_rois(65535", smoke)
 
+    @staticmethod
+    def _function_body(source: str, signature: str) -> str:
+        """Text of one top-level C++ function: from its signature to the first closing brace line."""
+        body = source.split(signature, 1)[1]
+        return body[: body.index("\n}\n") + 3]
+
     def test_resident_cnr_export_has_no_host_input_copy_and_is_in_native_smoke(self):
         root = Path(__file__).resolve().parents[1]
         source = (root / "gpu" / "visionflow_cuda.cu").read_text(encoding="utf-8")
         smoke = (root / "gpu" / "test_cuda_api.cu").read_text(encoding="utf-8")
-        execute = source.split("VF_CUDA_API int vf_cnr_mask_u8_roi(", 1)[1]
+        chain = self._function_body(source, "int resident_cnr_mask_device(")
+        execute = self._function_body(source, "VF_CUDA_API int vf_cnr_mask_u8_roi(")
 
-        self.assertIn("persistent->resident_u8", execute)
-        self.assertIn("resident_gray_f32_kernel<<<", execute)
-        self.assertNotIn("cudaMemcpyHostToDevice", execute)
+        self.assertIn("persistent->resident_u8", chain)
+        self.assertIn("resident_gray_f32_kernel<<<", chain)
+        self.assertNotIn("cudaMemcpyHostToDevice", chain + execute)
+        self.assertNotIn("cudaMemcpyDeviceToHost", chain)
+        self.assertIn("resident_cnr_mask_device(", execute)
         self.assertEqual(execute.count("cudaMemcpyDeviceToHost"), 1)
         self.assertIn("vf_cnr_mask_u8_roi(", smoke)
+
+    def test_resident_cnr_candidates_download_only_records_and_counts(self):
+        """The candidate export must never upload pixels or download the gray image, mask or labels."""
+        root = Path(__file__).resolve().parents[1]
+        source = (root / "gpu" / "visionflow_cuda.cu").read_text(encoding="utf-8")
+        header = (root / "gpu" / "include" / "visionflow_cuda.h").read_text(encoding="utf-8")
+        smoke = (root / "gpu" / "test_cuda_api.cu").read_text(encoding="utf-8")
+        execute = self._function_body(source, "VF_CUDA_API int vf_cnr_candidates_u8_roi(")
+        grouping = self._function_body(source, "int cand_group_components(")
+        read_word = self._function_body(source, "int cand_read_word(")
+        device_side = execute + grouping
+
+        self.assertIn("resident_cnr_mask_device(", execute)
+        self.assertNotIn("cudaMemcpyHostToDevice", device_side + read_word)
+        # Only int32 count words, two gather-size scalars and the candidate records cross PCIe.
+        self.assertEqual(read_word.count("cudaMemcpyDeviceToHost"), 1)
+        self.assertIn("sizeof(int32_t)", read_word)
+        downloads = device_side.count("cudaMemcpyDeviceToHost")
+        self.assertEqual(downloads, 4)
+        self.assertIn("out_candidate_ints, persistent->cand_out_ints", execute)
+        self.assertIn("out_candidate_floats, persistent->cand_out_floats", execute)
+        for forbidden in ("cnr_mask_image, ", "ccl_parent, sizeof", "cnr_mask_mask, sizeof"):
+            self.assertNotIn(forbidden, device_side)
+        # Ring statistics follow NumPy's float32 pairwise order and float64 division.
+        stats = self._function_body(source, "__device__ void cand_mean_std(")
+        self.assertIn("static_cast<double>(total) / static_cast<double>(n)", stats)
+        pairwise = self._function_body(source, "__device__ float cand_pairwise_sum(")
+        self.assertIn("count <= 128", pairwise)
+        self.assertIn("half -= half % 8", pairwise)
+        self.assertIn("VF_CUDA_API int vf_cnr_candidates_u8_roi(", header)
+        self.assertIn("vf_cnr_candidates_u8_roi(", smoke)
 
 
 if __name__ == "__main__":

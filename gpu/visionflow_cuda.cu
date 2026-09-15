@@ -7,6 +7,11 @@
 // gpu/build_cuda_dll.ps1 passes it through -Xcompiler.
 #include <cub/device/device_radix_sort.cuh>
 // which gpu/cuda_project.json now opts into for the whole project.
+// vf_cnr_candidates_u8_roi compacts foreground pixels and components, groups pixels by component
+// with a stable radix sort, and prefix-sums per-component offsets with the same CUB toolkit copy.
+#include <cub/device/device_run_length_encode.cuh>
+#include <cub/device/device_scan.cuh>
+#include <cub/device/device_select.cuh>
 #include <algorithm>
 #include <cfloat>
 #include <climits>
@@ -146,6 +151,52 @@ struct PersistentContext {
     size_t cnr_mask_absdev_capacity = 0;
     unsigned char* cnr_mask_mask = nullptr;
     size_t cnr_mask_mask_capacity = 0;
+    // vf_cnr_candidates_u8_roi scratch, all grow-only: the morphology ping-pong mask, the union-find
+    // parent plane and its change word, the pixel index ramp, the foreground/component compaction
+    // and grouping arrays, per-component boxes and flags, per-candidate windows, the gathered ring
+    // background values, the downloadable candidate records, and one CUB temporary storage block.
+    unsigned char* cand_mask_scratch = nullptr;
+    size_t cand_mask_scratch_capacity = 0;
+    int32_t* ccl_parent = nullptr;
+    size_t ccl_parent_capacity = 0;
+    int32_t* cand_words = nullptr;
+    size_t cand_words_capacity = 0;
+    int32_t* cand_ramp = nullptr;
+    size_t cand_ramp_capacity = 0;
+    int32_t* cand_foreground = nullptr;
+    size_t cand_foreground_capacity = 0;
+    int32_t* cand_keys = nullptr;
+    size_t cand_keys_capacity = 0;
+    int32_t* cand_sorted_keys = nullptr;
+    size_t cand_sorted_keys_capacity = 0;
+    int32_t* cand_sorted_pixels = nullptr;
+    size_t cand_sorted_pixels_capacity = 0;
+    int32_t* cand_roots = nullptr;
+    size_t cand_roots_capacity = 0;
+    int32_t* cand_areas = nullptr;
+    size_t cand_areas_capacity = 0;
+    int32_t* cand_offsets = nullptr;
+    size_t cand_offsets_capacity = 0;
+    int32_t* cand_boxes = nullptr;
+    size_t cand_boxes_capacity = 0;
+    unsigned char* cand_keep = nullptr;
+    size_t cand_keep_capacity = 0;
+    int32_t* cand_kept = nullptr;
+    size_t cand_kept_capacity = 0;
+    int32_t* cand_windows = nullptr;
+    size_t cand_windows_capacity = 0;
+    long long* cand_window_sizes = nullptr;
+    size_t cand_window_sizes_capacity = 0;
+    long long* cand_gather_offsets = nullptr;
+    size_t cand_gather_offsets_capacity = 0;
+    float* cand_gather = nullptr;
+    size_t cand_gather_capacity = 0;
+    int32_t* cand_out_ints = nullptr;
+    size_t cand_out_ints_capacity = 0;
+    float* cand_out_floats = nullptr;
+    size_t cand_out_floats_capacity = 0;
+    uint8_t* cand_cub_scratch = nullptr;
+    size_t cand_cub_scratch_capacity = 0;
     unsigned long long allocation_count = 0;
     cudaStream_t stream = nullptr;
     cudaError_t initialization_error = cudaSuccess;
@@ -199,6 +250,20 @@ struct PersistentContext {
         visionflow_cuda::free_device(cnr_mask_residual);
         visionflow_cuda::free_device(cnr_mask_absdev);
         visionflow_cuda::free_device(cnr_mask_mask);
+        for (void* pointer : {
+                 static_cast<void*>(cand_mask_scratch), static_cast<void*>(ccl_parent),
+                 static_cast<void*>(cand_words), static_cast<void*>(cand_ramp),
+                 static_cast<void*>(cand_foreground), static_cast<void*>(cand_keys),
+                 static_cast<void*>(cand_sorted_keys), static_cast<void*>(cand_sorted_pixels),
+                 static_cast<void*>(cand_roots), static_cast<void*>(cand_areas),
+                 static_cast<void*>(cand_offsets), static_cast<void*>(cand_boxes),
+                 static_cast<void*>(cand_keep), static_cast<void*>(cand_kept),
+                 static_cast<void*>(cand_windows), static_cast<void*>(cand_window_sizes),
+                 static_cast<void*>(cand_gather_offsets), static_cast<void*>(cand_gather),
+                 static_cast<void*>(cand_out_ints), static_cast<void*>(cand_out_floats),
+                 static_cast<void*>(cand_cub_scratch)}) {
+            visionflow_cuda::free_device(pointer);
+        }
         visionflow_cuda::free_device(resident_u8);
         for (cudaEvent_t event : timing_events) {
             if (event != nullptr) cudaEventDestroy(event);
@@ -4549,9 +4614,13 @@ VF_CUDA_API int vf_cnr_mask_f32(
     return VF_CUDA_OK;
 }
 
-VF_CUDA_API int vf_cnr_mask_u8_roi(
-    void* context,
-    uint64_t generation,
+// Resident-ROI 202 CNR chain shared by vf_cnr_mask_u8_roi and vf_cnr_candidates_u8_roi: BGR->gray
+// float32 into cnr_mask_image, float32 Gaussian, residual, both exact medians, the double threshold
+// and the float32-compared candidate mask left in cnr_mask_mask. Nothing crosses PCIe except the
+// median keys run_device_median reads. The caller validated the ROI and parameters, owns the
+// AFTER_KERNEL/AFTER_OUTPUT timing events and decides what to download.
+int resident_cnr_mask_device(
+    PersistentContext* persistent,
     int x, int y, int width, int height,
     int kernel_size, double sigma,
     double sigma_multiplier,
@@ -4561,26 +4630,8 @@ VF_CUDA_API int vf_cnr_mask_u8_roi(
     int candidate_value,
     float* out_residual_median,
     float* out_mad,
-    double* out_threshold,
-    unsigned char* out_mask,
-    long long out_mask_capacity) {
-    PersistentContext* persistent = static_cast<PersistentContext*>(context);
-    if (persistent == nullptr || out_residual_median == nullptr || out_mad == nullptr ||
-        out_threshold == nullptr || out_mask == nullptr || generation == 0 ||
-        generation != persistent->resident_generation || persistent->resident_u8 == nullptr ||
-        (persistent->resident_channels != 1 && persistent->resident_channels != 3) ||
-        width <= 0 || height <= 0 || x < 0 || y < 0 ||
-        x > persistent->resident_width - width || y > persistent->resident_height - height ||
-        candidate_value < 0 || candidate_value > 255) {
-        return VF_CUDA_INVALID_ARGUMENT;
-    }
-    const int kernel_status = gaussian_f32_kernel_request(kernel_size, sigma);
-    if (kernel_status != VF_CUDA_OK) return kernel_status;
-    const long long requested = static_cast<long long>(width) * static_cast<long long>(height);
-    if (requested > static_cast<long long>(INT_MAX)) return VF_CUDA_UNSUPPORTED;
-    if (out_mask_capacity < requested) return VF_CUDA_INVALID_ARGUMENT;
-
-    const int items = static_cast<int>(requested);
+    double* out_threshold) {
+    const int items = width * height;
     const size_t item_count = static_cast<size_t>(items);
     int result = reserve_device(
         &persistent->cnr_mask_image, &persistent->cnr_mask_image_capacity, item_count,
@@ -4651,6 +4702,50 @@ VF_CUDA_API int vf_cnr_mask_u8_roi(
         static_cast<float>(residual_threshold), static_cast<unsigned char>(candidate_value));
     result = visionflow_cuda::kernel_launch_result();
     if (result != VF_CUDA_OK) return result;
+    *out_residual_median = residual_median;
+    *out_mad = mad;
+    *out_threshold = residual_threshold;
+    return VF_CUDA_OK;
+}
+
+VF_CUDA_API int vf_cnr_mask_u8_roi(
+    void* context,
+    uint64_t generation,
+    int x, int y, int width, int height,
+    int kernel_size, double sigma,
+    double sigma_multiplier,
+    double threshold_floor,
+    double absolute_floor,
+    double mad_scale,
+    int candidate_value,
+    float* out_residual_median,
+    float* out_mad,
+    double* out_threshold,
+    unsigned char* out_mask,
+    long long out_mask_capacity) {
+    PersistentContext* persistent = static_cast<PersistentContext*>(context);
+    if (persistent == nullptr || out_residual_median == nullptr || out_mad == nullptr ||
+        out_threshold == nullptr || out_mask == nullptr || generation == 0 ||
+        generation != persistent->resident_generation || persistent->resident_u8 == nullptr ||
+        (persistent->resident_channels != 1 && persistent->resident_channels != 3) ||
+        width <= 0 || height <= 0 || x < 0 || y < 0 ||
+        x > persistent->resident_width - width || y > persistent->resident_height - height ||
+        candidate_value < 0 || candidate_value > 255) {
+        return VF_CUDA_INVALID_ARGUMENT;
+    }
+    const int kernel_status = gaussian_f32_kernel_request(kernel_size, sigma);
+    if (kernel_status != VF_CUDA_OK) return kernel_status;
+    const long long requested = static_cast<long long>(width) * static_cast<long long>(height);
+    if (requested > static_cast<long long>(INT_MAX)) return VF_CUDA_UNSUPPORTED;
+    if (out_mask_capacity < requested) return VF_CUDA_INVALID_ARGUMENT;
+
+    float residual_median = 0.0f;
+    float mad = 0.0f;
+    double residual_threshold = 0.0;
+    int result = resident_cnr_mask_device(
+        persistent, x, y, width, height, kernel_size, sigma, sigma_multiplier, threshold_floor,
+        absolute_floor, mad_scale, candidate_value, &residual_median, &mad, &residual_threshold);
+    if (result != VF_CUDA_OK) return result;
     cudaEventRecord(persistent->timing_events[TIMING_AFTER_KERNEL], persistent->stream);
 
     const size_t mask_row_bytes = static_cast<size_t>(width);
@@ -4665,5 +4760,721 @@ VF_CUDA_API int vf_cnr_mask_u8_roi(
     *out_residual_median = residual_median;
     *out_mad = mad;
     *out_threshold = residual_threshold;
+    return VF_CUDA_OK;
+}
+
+// ---- vf_cnr_candidates_u8_roi: 202-CS-SN-1 candidates without host image, mask or label map ----
+//
+// Detector202_1 finishes the CNR mask on the host with a morphology pass, the center/edge
+// exclusion AND, cv2.connectedComponentsWithStats and a per-component ring CNR computed with
+// np.mean/np.std on boolean-mask gathers. This export keeps that whole tail on the device and
+// downloads only one fixed-size record per surviving component. The full contract is documented in
+// include/visionflow_cuda.h.
+
+constexpr int CAND_INT_PARAMS = 22;
+constexpr int CAND_REAL_PARAMS = 6;
+constexpr int CAND_RECORD_INTS = 7;
+constexpr int CAND_RECORD_FLOATS = 3;
+constexpr int CAND_THREADS = 256;
+constexpr int CCL_MAX_ITERATIONS = 4096;
+// A single ROI whose ring windows together exceed this many float32 samples is left to the host
+// path instead of reserving several GiB of scratch for a pathological mask.
+constexpr long long CAND_MAX_GATHER = 1LL << 28;
+
+enum CandidateStatus {
+    CAND_STATUS_OK = 0,
+    CAND_STATUS_GLOBAL_BACKGROUND = 1,
+    CAND_STATUS_CAPACITY = 2,
+    CAND_STATUS_GATHER_LIMIT = 3,
+};
+
+// The center rectangle and edge insets Detector202._apply_exclusion_masks zeroes, already clamped by
+// the caller exactly as the host computes them.
+struct CandidateGeometry {
+    int width;
+    int height;
+    int center_enabled;
+    int center_x0, center_y0, center_x1, center_y1;
+    int inset_top, inset_bottom, inset_left, inset_right;
+};
+
+__device__ __forceinline__ bool cand_included(const CandidateGeometry& g, int x, int y) {
+    if (g.center_enabled && x >= g.center_x0 && x < g.center_x1 && y >= g.center_y0 && y < g.center_y1) {
+        return false;
+    }
+    if (g.inset_top > 0 && y < g.inset_top) return false;
+    if (g.inset_bottom > 0 && y >= g.height - g.inset_bottom) return false;
+    if (g.inset_left > 0 && x < g.inset_left) return false;
+    if (g.inset_right > 0 && x >= g.width - g.inset_right) return false;
+    return true;
+}
+
+// cv2.bitwise_and(candidate_mask, inclusion_mask) with a 0/255 inclusion mask.
+__global__ void cand_exclusion_kernel(unsigned char* mask, CandidateGeometry geometry) {
+    const int x = blockIdx.x * blockDim.x + threadIdx.x;
+    const int y = blockIdx.y * blockDim.y + threadIdx.y;
+    if (x >= geometry.width || y >= geometry.height) return;
+    if (!cand_included(geometry, x, y)) mask[static_cast<size_t>(y) * geometry.width + x] = 0;
+}
+
+__global__ void ccl_init_kernel(const unsigned char* mask, int32_t* parent, int count) {
+    const int index = blockIdx.x * blockDim.x + threadIdx.x;
+    if (index >= count) return;
+    parent[index] = mask[index] != 0 ? index : -1;
+}
+
+__global__ void cand_ramp_kernel(int32_t* ramp, int count) {
+    const int index = blockIdx.x * blockDim.x + threadIdx.x;
+    if (index >= count) return;
+    ramp[index] = index;
+}
+
+// Every parent points at a smaller or equal index, so following it always reaches a root even while
+// other threads lower entries concurrently.
+__device__ __forceinline__ int32_t ccl_find(const int32_t* parent, int32_t index) {
+    while (parent[index] != index) index = parent[index];
+    return index;
+}
+
+// Hook step of a data-parallel union-find. For each foreground pixel and each backward neighbour of
+// the requested connectivity, the larger root is lowered towards the smaller one. Concurrent writes
+// only ever decrease a parent below its own index, so no cycle can form; a lost write keeps two roots
+// apart for one more iteration, and `changed` forces that iteration. When a full pass observes no
+// differing roots, no thread wrote anything and every adjacent pair already shares its root.
+__global__ void ccl_hook_kernel(int32_t* parent, int width, int height, int connectivity, int32_t* changed) {
+    const int x = blockIdx.x * blockDim.x + threadIdx.x;
+    const int y = blockIdx.y * blockDim.y + threadIdx.y;
+    if (x >= width || y >= height) return;
+    const int32_t index = y * width + x;
+    if (parent[index] < 0) return;
+    const int neighbour_dx[4] = {-1, 0, -1, 1};
+    const int neighbour_dy[4] = {0, -1, -1, -1};
+    const int neighbours = connectivity == 8 ? 4 : 2;
+    for (int n = 0; n < neighbours; ++n) {
+        const int nx = x + neighbour_dx[n];
+        const int ny = y + neighbour_dy[n];
+        if (nx < 0 || nx >= width || ny < 0) continue;
+        const int32_t other = ny * width + nx;
+        if (parent[other] < 0) continue;
+        const int32_t a = ccl_find(parent, index);
+        const int32_t b = ccl_find(parent, other);
+        if (a == b) continue;
+        const int32_t high = a > b ? a : b;
+        const int32_t low = a > b ? b : a;
+        if (parent[high] > low) parent[high] = low;
+        changed[0] = 1;
+    }
+}
+
+__global__ void ccl_compress_kernel(int32_t* parent, int count) {
+    const int index = blockIdx.x * blockDim.x + threadIdx.x;
+    if (index >= count || parent[index] < 0) return;
+    parent[index] = ccl_find(parent, index);
+}
+
+__global__ void cand_key_kernel(const int32_t* foreground, const int32_t* parent, int32_t* keys, int count) {
+    const int index = blockIdx.x * blockDim.x + threadIdx.x;
+    if (index >= count) return;
+    keys[index] = parent[foreground[index]];
+}
+
+// Per component: the bounding box and area cv2.connectedComponentsWithStats reports, then the area
+// and border-margin filters of _collect_candidates_with_labels. Pixels are grouped in raster order,
+// so the first pixel carries the top row.
+__global__ void cand_component_kernel(
+    const int32_t* sorted_pixels, const int32_t* offsets, const int32_t* areas, int count,
+    int width, int height, int min_area, int max_area, int max_area_enabled, int border_margin,
+    int32_t* boxes, unsigned char* keep) {
+    const int component = blockIdx.x * blockDim.x + threadIdx.x;
+    if (component >= count) return;
+    const int32_t start = offsets[component];
+    const int32_t area = areas[component];
+    int min_x = width;
+    int max_x = -1;
+    int max_y = -1;
+    const int min_y = sorted_pixels[start] / width;
+    for (int32_t k = 0; k < area; ++k) {
+        const int32_t pixel = sorted_pixels[start + k];
+        const int px = pixel % width;
+        const int py = pixel / width;
+        if (px < min_x) min_x = px;
+        if (px > max_x) max_x = px;
+        if (py > max_y) max_y = py;
+    }
+    const int box_width = max_x - min_x + 1;
+    const int box_height = max_y - min_y + 1;
+    int32_t* box = boxes + static_cast<size_t>(component) * 5;
+    box[0] = min_x;
+    box[1] = min_y;
+    box[2] = box_width;
+    box[3] = box_height;
+    box[4] = area;
+    bool kept = !(area < min_area || (max_area_enabled && area > max_area));
+    if (kept && (static_cast<long long>(min_x) <= border_margin ||
+                 static_cast<long long>(min_y) <= border_margin ||
+                 static_cast<long long>(min_x) + box_width >= static_cast<long long>(width) - border_margin ||
+                 static_cast<long long>(min_y) + box_height >= static_cast<long long>(height) - border_margin)) {
+        kept = false;
+    }
+    keep[component] = kept ? 1 : 0;
+}
+
+// Python: pad = int(max(padding_min, min(padding_max, max(w, h) * padding_scale))). Python's
+// two-argument min/max return the first argument unless the second is strictly smaller/greater, and
+// int() truncates towards zero. The window is the clamped slice [start, stop) of that padding.
+__global__ void cand_window_kernel(
+    const int32_t* kept, const int32_t* boxes, int count, int width, int height,
+    int padding_min, int padding_max, double padding_scale, int32_t* windows, long long* sizes) {
+    const int candidate = blockIdx.x * blockDim.x + threadIdx.x;
+    if (candidate >= count) return;
+    const int32_t* box = boxes + static_cast<size_t>(kept[candidate]) * 5;
+    const int longest = box[2] > box[3] ? box[2] : box[3];
+    const double product = static_cast<double>(longest) * padding_scale;
+    const double limited = product < static_cast<double>(padding_max) ? product : static_cast<double>(padding_max);
+    const double padded = limited > static_cast<double>(padding_min) ? limited : static_cast<double>(padding_min);
+    const long long pad = static_cast<long long>(padded);
+    long long x_start = static_cast<long long>(box[0]) - pad;
+    long long y_start = static_cast<long long>(box[1]) - pad;
+    long long x_stop = static_cast<long long>(box[0]) + box[2] + pad;
+    long long y_stop = static_cast<long long>(box[1]) + box[3] + pad;
+    if (x_start < 0) x_start = 0;
+    if (y_start < 0) y_start = 0;
+    if (x_stop > width) x_stop = width;
+    if (y_stop > height) y_stop = height;
+    int32_t* window = windows + static_cast<size_t>(candidate) * 4;
+    window[0] = static_cast<int32_t>(x_start);
+    window[1] = static_cast<int32_t>(y_start);
+    window[2] = static_cast<int32_t>(x_stop > x_start ? x_stop : x_start);
+    window[3] = static_cast<int32_t>(y_stop > y_start ? y_stop : y_start);
+    sizes[candidate] = static_cast<long long>(window[2] - window[0]) * (window[3] - window[1]);
+}
+
+// NumPy's float32 add.reduce (pairwise_sum in numpy/_core/src/umath/loops_utils.h.src) over
+// value(start) ... value(start + n - 1): fewer than 8 values accumulate sequentially from -0.0, up to
+// 128 values use eight lanes combined as ((r0+r1)+(r2+r3))+((r4+r5)+(r6+r7)) plus the remainder,
+// and longer runs split at n/2 rounded down to a multiple of 8. The recursion is evaluated with an
+// explicit stack because the combination order, not just the leaves, fixes the float32 result.
+// `indices` selects value(i) = values[indices[i]] (component pixels) instead of values[i]; with
+// `squared`, value(i) = (v - mean) * (v - mean) as np.subtract then np.square produce it.
+__device__ __forceinline__ float cand_value(
+    const float* values, const int32_t* indices, long long i, bool squared, float mean) {
+    float value = indices != nullptr ? values[indices[i]] : values[i];
+    if (squared) {
+        const float deviation = value - mean;
+        value = deviation * deviation;
+    }
+    return value;
+}
+
+__device__ float cand_pairwise_leaf(
+    const float* values, const int32_t* indices, long long start, long long n, bool squared, float mean) {
+    if (n < 8) {
+        float result = -0.0f;
+        for (long long i = 0; i < n; ++i) result += cand_value(values, indices, start + i, squared, mean);
+        return result;
+    }
+    float r[8];
+    for (int lane = 0; lane < 8; ++lane) r[lane] = cand_value(values, indices, start + lane, squared, mean);
+    long long i = 8;
+    for (; i < n - (n % 8); i += 8) {
+        for (int lane = 0; lane < 8; ++lane) r[lane] += cand_value(values, indices, start + i + lane, squared, mean);
+    }
+    float result = ((r[0] + r[1]) + (r[2] + r[3])) + ((r[4] + r[5]) + (r[6] + r[7]));
+    for (; i < n; ++i) result += cand_value(values, indices, start + i, squared, mean);
+    return result;
+}
+
+__device__ float cand_pairwise_sum(
+    const float* values, const int32_t* indices, long long start, long long n, bool squared, float mean) {
+    constexpr int STACK = 64;
+    long long frame_start[STACK];
+    long long frame_n[STACK];
+    int frame_stage[STACK];
+    float partial[STACK];
+    int frames = 1;
+    int partials = 0;
+    frame_start[0] = start;
+    frame_n[0] = n;
+    frame_stage[0] = 0;
+    while (frames > 0) {
+        const int top = frames - 1;
+        const long long count = frame_n[top];
+        if (count <= 128) {
+            partial[partials++] = cand_pairwise_leaf(values, indices, frame_start[top], count, squared, mean);
+            --frames;
+            continue;
+        }
+        long long half = count / 2;
+        half -= half % 8;
+        if (frame_stage[top] == 0) {
+            frame_stage[top] = 1;
+            frame_start[frames] = frame_start[top];
+            frame_n[frames] = half;
+            frame_stage[frames] = 0;
+            ++frames;
+        } else if (frame_stage[top] == 1) {
+            frame_stage[top] = 2;
+            frame_start[frames] = frame_start[top] + half;
+            frame_n[frames] = count - half;
+            frame_stage[frames] = 0;
+            ++frames;
+        } else {
+            const float right = partial[--partials];
+            const float left = partial[--partials];
+            partial[partials++] = left + right;
+            --frames;
+        }
+    }
+    return partial[0];
+}
+
+// np.mean on a float32 array: float32(float64(sum) / float64(count)) because the reduction returns a
+// float32 scalar divided by an np.intp count. np.std follows _var: the same mean, np.subtract and
+// np.square in float32, a second pairwise sum, the same float64 division, then a float32 sqrt.
+__device__ void cand_mean_std(
+    const float* values, const int32_t* indices, long long start, long long n, float* mean, float* std_value) {
+    const float total = cand_pairwise_sum(values, indices, start, n, false, 0.0f);
+    const float average = static_cast<float>(static_cast<double>(total) / static_cast<double>(n));
+    *mean = average;
+    if (std_value != nullptr) {
+        const float squares = cand_pairwise_sum(values, indices, start, n, true, average);
+        const float variance = static_cast<float>(static_cast<double>(squares) / static_cast<double>(n));
+        *std_value = sqrtf(variance);
+    }
+}
+
+// Per surviving component: np.mean of its pixels in raster order, then the ring background of the
+// clamped padded window - every pixel whose label differs from the component's (background label 0
+// included) and that the inclusion mask keeps - gathered in raster order into this candidate's slice.
+__global__ void cand_stats_kernel(
+    const int32_t* kept, const int32_t* boxes, const int32_t* windows, const long long* gather_offsets,
+    const int32_t* offsets, const int32_t* roots, const int32_t* sorted_pixels, const int32_t* parent,
+    const float* gray, float* gather, int count, CandidateGeometry geometry, int min_background_pixels,
+    int32_t* out_ints, float* out_floats) {
+    const int candidate = blockIdx.x * blockDim.x + threadIdx.x;
+    if (candidate >= count) return;
+    const int component = kept[candidate];
+    const int32_t* box = boxes + static_cast<size_t>(component) * 5;
+    const int32_t* window = windows + static_cast<size_t>(candidate) * 4;
+    int32_t* record = out_ints + static_cast<size_t>(candidate) * CAND_RECORD_INTS;
+    float* stats = out_floats + static_cast<size_t>(candidate) * CAND_RECORD_FLOATS;
+    record[0] = box[0];
+    record[1] = box[1];
+    record[2] = box[2];
+    record[3] = box[3];
+    record[4] = box[4];
+    record[5] = 0;
+    record[6] = CAND_STATUS_OK;
+    float defect_mean = 0.0f;
+    cand_mean_std(gray, sorted_pixels, offsets[component], box[4], &defect_mean, nullptr);
+    stats[0] = defect_mean;
+    stats[1] = 0.0f;
+    stats[2] = 0.0f;
+
+    const int32_t root = roots[component];
+    const long long base = gather_offsets[candidate];
+    long long background = 0;
+    for (int yy = window[1]; yy < window[3]; ++yy) {
+        for (int xx = window[0]; xx < window[2]; ++xx) {
+            const int32_t pixel = yy * geometry.width + xx;
+            if (parent[pixel] != root && cand_included(geometry, xx, yy)) {
+                gather[base + background] = gray[pixel];
+                ++background;
+            }
+        }
+    }
+    record[5] = static_cast<int32_t>(background);
+    if (background < min_background_pixels) {
+        record[6] = CAND_STATUS_GLOBAL_BACKGROUND;
+        return;
+    }
+    if (background == 0) return;
+    cand_mean_std(gather, nullptr, base, background, &stats[1], &stats[2]);
+}
+
+int cand_reserve_cub(PersistentContext* persistent, size_t bytes) {
+    return reserve_device(
+        &persistent->cand_cub_scratch, &persistent->cand_cub_scratch_capacity,
+        bytes > 0 ? bytes : static_cast<size_t>(1), &persistent->allocation_count);
+}
+
+unsigned int cand_blocks(long long items) {
+    return static_cast<unsigned int>((items + CAND_THREADS - 1) / CAND_THREADS);
+}
+
+int cand_read_word(PersistentContext* persistent, int32_t* host, const int32_t* device) {
+    cudaError_t error = cudaMemcpyAsync(
+        host, device, sizeof(int32_t), cudaMemcpyDeviceToHost, persistent->stream);
+    if (error != cudaSuccess) return cuda_result(error);
+    return visionflow_cuda::stream_result(persistent->stream);
+}
+
+// Groups foreground pixels by component and fills cand_roots/cand_areas/cand_offsets/cand_boxes and
+// the kept-component list. Returns the component and kept counts through the output pointers.
+int cand_group_components(
+    PersistentContext* persistent, const unsigned char* mask, int items, int width, int height,
+    int min_area, int max_area, int max_area_enabled, int border_margin,
+    int* out_component_count, int* out_kept_count) {
+    *out_component_count = 0;
+    *out_kept_count = 0;
+    size_t cub_bytes = 0;
+    cudaError_t error = cub::DeviceSelect::Flagged(
+        nullptr, cub_bytes, persistent->cand_ramp, mask, persistent->cand_foreground,
+        persistent->cand_words, items, persistent->stream);
+    if (error != cudaSuccess) return cuda_result(error);
+    int result = cand_reserve_cub(persistent, cub_bytes);
+    if (result != VF_CUDA_OK) return result;
+    error = cub::DeviceSelect::Flagged(
+        persistent->cand_cub_scratch, cub_bytes, persistent->cand_ramp, mask, persistent->cand_foreground,
+        persistent->cand_words, items, persistent->stream);
+    if (error != cudaSuccess) return cuda_result(error);
+    int32_t word = 0;
+    result = cand_read_word(persistent, &word, persistent->cand_words);
+    if (result != VF_CUDA_OK) return result;
+    const int foreground = word;
+    if (foreground == 0) return VF_CUDA_OK;
+
+    const size_t foreground_count = static_cast<size_t>(foreground);
+    result = reserve_device(&persistent->cand_keys, &persistent->cand_keys_capacity, foreground_count,
+                            &persistent->allocation_count);
+    if (result == VF_CUDA_OK) result = reserve_device(
+        &persistent->cand_sorted_keys, &persistent->cand_sorted_keys_capacity, foreground_count,
+        &persistent->allocation_count);
+    if (result == VF_CUDA_OK) result = reserve_device(
+        &persistent->cand_sorted_pixels, &persistent->cand_sorted_pixels_capacity, foreground_count,
+        &persistent->allocation_count);
+    if (result == VF_CUDA_OK) result = reserve_device(
+        &persistent->cand_roots, &persistent->cand_roots_capacity, foreground_count,
+        &persistent->allocation_count);
+    if (result == VF_CUDA_OK) result = reserve_device(
+        &persistent->cand_areas, &persistent->cand_areas_capacity, foreground_count,
+        &persistent->allocation_count);
+    if (result != VF_CUDA_OK) return result;
+    cand_key_kernel<<<cand_blocks(foreground), CAND_THREADS, 0, persistent->stream>>>(
+        persistent->cand_foreground, persistent->ccl_parent, persistent->cand_keys, foreground);
+    result = visionflow_cuda::kernel_launch_result();
+    if (result != VF_CUDA_OK) return result;
+    int key_bits = 1;
+    while (key_bits < 31 && (1LL << key_bits) < static_cast<long long>(items)) ++key_bits;
+    cub_bytes = 0;
+    error = cub::DeviceRadixSort::SortPairs(
+        nullptr, cub_bytes, persistent->cand_keys, persistent->cand_sorted_keys,
+        persistent->cand_foreground, persistent->cand_sorted_pixels, foreground, 0, key_bits,
+        persistent->stream);
+    if (error != cudaSuccess) return cuda_result(error);
+    result = cand_reserve_cub(persistent, cub_bytes);
+    if (result != VF_CUDA_OK) return result;
+    error = cub::DeviceRadixSort::SortPairs(
+        persistent->cand_cub_scratch, cub_bytes, persistent->cand_keys, persistent->cand_sorted_keys,
+        persistent->cand_foreground, persistent->cand_sorted_pixels, foreground, 0, key_bits,
+        persistent->stream);
+    if (error != cudaSuccess) return cuda_result(error);
+    cub_bytes = 0;
+    error = cub::DeviceRunLengthEncode::Encode(
+        nullptr, cub_bytes, persistent->cand_sorted_keys, persistent->cand_roots,
+        persistent->cand_areas, persistent->cand_words, foreground, persistent->stream);
+    if (error != cudaSuccess) return cuda_result(error);
+    result = cand_reserve_cub(persistent, cub_bytes);
+    if (result != VF_CUDA_OK) return result;
+    error = cub::DeviceRunLengthEncode::Encode(
+        persistent->cand_cub_scratch, cub_bytes, persistent->cand_sorted_keys, persistent->cand_roots,
+        persistent->cand_areas, persistent->cand_words, foreground, persistent->stream);
+    if (error != cudaSuccess) return cuda_result(error);
+    result = cand_read_word(persistent, &word, persistent->cand_words);
+    if (result != VF_CUDA_OK) return result;
+    const int component_count = word;
+    *out_component_count = component_count;
+    const size_t components = static_cast<size_t>(component_count);
+
+    result = reserve_device(&persistent->cand_offsets, &persistent->cand_offsets_capacity, components,
+                            &persistent->allocation_count);
+    if (result == VF_CUDA_OK) result = reserve_device(
+        &persistent->cand_boxes, &persistent->cand_boxes_capacity, components * 5,
+        &persistent->allocation_count);
+    if (result == VF_CUDA_OK) result = reserve_device(
+        &persistent->cand_keep, &persistent->cand_keep_capacity, components, &persistent->allocation_count);
+    if (result == VF_CUDA_OK) result = reserve_device(
+        &persistent->cand_kept, &persistent->cand_kept_capacity, components, &persistent->allocation_count);
+    if (result != VF_CUDA_OK) return result;
+    cub_bytes = 0;
+    error = cub::DeviceScan::ExclusiveSum(
+        nullptr, cub_bytes, persistent->cand_areas, persistent->cand_offsets, component_count,
+        persistent->stream);
+    if (error != cudaSuccess) return cuda_result(error);
+    result = cand_reserve_cub(persistent, cub_bytes);
+    if (result != VF_CUDA_OK) return result;
+    error = cub::DeviceScan::ExclusiveSum(
+        persistent->cand_cub_scratch, cub_bytes, persistent->cand_areas, persistent->cand_offsets,
+        component_count, persistent->stream);
+    if (error != cudaSuccess) return cuda_result(error);
+    cand_component_kernel<<<cand_blocks(component_count), CAND_THREADS, 0, persistent->stream>>>(
+        persistent->cand_sorted_pixels, persistent->cand_offsets, persistent->cand_areas, component_count,
+        width, height, min_area, max_area, max_area_enabled, border_margin,
+        persistent->cand_boxes, persistent->cand_keep);
+    result = visionflow_cuda::kernel_launch_result();
+    if (result != VF_CUDA_OK) return result;
+    cub_bytes = 0;
+    error = cub::DeviceSelect::Flagged(
+        nullptr, cub_bytes, persistent->cand_ramp, persistent->cand_keep, persistent->cand_kept,
+        persistent->cand_words, component_count, persistent->stream);
+    if (error != cudaSuccess) return cuda_result(error);
+    result = cand_reserve_cub(persistent, cub_bytes);
+    if (result != VF_CUDA_OK) return result;
+    error = cub::DeviceSelect::Flagged(
+        persistent->cand_cub_scratch, cub_bytes, persistent->cand_ramp, persistent->cand_keep,
+        persistent->cand_kept, persistent->cand_words, component_count, persistent->stream);
+    if (error != cudaSuccess) return cuda_result(error);
+    result = cand_read_word(persistent, &word, persistent->cand_words);
+    if (result != VF_CUDA_OK) return result;
+    *out_kept_count = word;
+    return VF_CUDA_OK;
+}
+
+VF_CUDA_API int vf_cnr_candidates_u8_roi(
+    void* context,
+    uint64_t generation,
+    int x, int y, int width, int height,
+    const int32_t* int_params, int int_param_count,
+    const double* real_params, int real_param_count,
+    float* out_residual_median,
+    float* out_mad,
+    double* out_threshold,
+    int32_t* out_candidate_ints,
+    float* out_candidate_floats,
+    int candidate_capacity,
+    int* out_candidate_count,
+    int* out_component_count,
+    int* out_status) {
+    PersistentContext* persistent = static_cast<PersistentContext*>(context);
+    if (persistent == nullptr || int_params == nullptr || real_params == nullptr ||
+        out_residual_median == nullptr || out_mad == nullptr || out_threshold == nullptr ||
+        out_candidate_count == nullptr || out_component_count == nullptr || out_status == nullptr ||
+        candidate_capacity < 0 ||
+        (candidate_capacity > 0 && (out_candidate_ints == nullptr || out_candidate_floats == nullptr)) ||
+        int_param_count != CAND_INT_PARAMS || real_param_count != CAND_REAL_PARAMS ||
+        generation == 0 || generation != persistent->resident_generation ||
+        persistent->resident_u8 == nullptr ||
+        (persistent->resident_channels != 1 && persistent->resident_channels != 3) ||
+        width <= 0 || height <= 0 || x < 0 || y < 0 ||
+        x > persistent->resident_width - width || y > persistent->resident_height - height) {
+        return VF_CUDA_INVALID_ARGUMENT;
+    }
+    *out_candidate_count = 0;
+    *out_component_count = 0;
+    *out_status = CAND_STATUS_OK;
+    const int kernel_size = int_params[0];
+    const int candidate_value = int_params[1];
+    const int morph_operation = int_params[2];
+    const int morph_kernel = int_params[3];
+    const int morph_iterations = int_params[4];
+    CandidateGeometry geometry{};
+    geometry.width = width;
+    geometry.height = height;
+    geometry.center_enabled = int_params[5] != 0 ? 1 : 0;
+    geometry.center_x0 = int_params[6];
+    geometry.center_y0 = int_params[7];
+    geometry.center_x1 = int_params[8];
+    geometry.center_y1 = int_params[9];
+    geometry.inset_top = int_params[10];
+    geometry.inset_bottom = int_params[11];
+    geometry.inset_left = int_params[12];
+    geometry.inset_right = int_params[13];
+    const int connectivity = int_params[14];
+    const int min_area = int_params[15];
+    const int max_area = int_params[16];
+    const int max_area_enabled = int_params[17] != 0 ? 1 : 0;
+    const int border_margin = int_params[18];
+    const int padding_min = int_params[19];
+    const int padding_max = int_params[20];
+    const int min_background_pixels = int_params[21];
+    const double sigma = real_params[0];
+    const double padding_scale = real_params[5];
+    if (candidate_value < 0 || candidate_value > 255 ||
+        morph_operation < -1 || morph_operation > VF_MORPH_ERODE) {
+        return VF_CUDA_INVALID_ARGUMENT;
+    }
+    // Only the semantics verified against OpenCV run here; everything else stays on the host path.
+    if ((morph_operation >= 0 && (morph_kernel < 3 || morph_kernel % 2 == 0 || morph_iterations < 1)) ||
+        (connectivity != 4 && connectivity != 8) || std::isnan(padding_scale)) {
+        return VF_CUDA_UNSUPPORTED;
+    }
+    const int kernel_status = gaussian_f32_kernel_request(kernel_size, sigma);
+    if (kernel_status != VF_CUDA_OK) return kernel_status;
+    const long long requested = static_cast<long long>(width) * static_cast<long long>(height);
+    if (requested > static_cast<long long>(INT_MAX)) return VF_CUDA_UNSUPPORTED;
+    const int items = static_cast<int>(requested);
+    const size_t item_count = static_cast<size_t>(items);
+
+    float residual_median = 0.0f;
+    float mad = 0.0f;
+    double residual_threshold = 0.0;
+    int result = resident_cnr_mask_device(
+        persistent, x, y, width, height, kernel_size, sigma, real_params[1], real_params[2],
+        real_params[3], real_params[4], candidate_value, &residual_median, &mad, &residual_threshold);
+    if (result != VF_CUDA_OK) return result;
+    *out_residual_median = residual_median;
+    *out_mad = mad;
+    *out_threshold = residual_threshold;
+
+    // Morphology on the candidate mask, then the exclusion AND, in the detector's order.
+    unsigned char* mask = persistent->cnr_mask_mask;
+    if (morph_operation >= 0) {
+        result = reserve_device(
+            &persistent->cand_mask_scratch, &persistent->cand_mask_scratch_capacity, item_count,
+            &persistent->allocation_count);
+        if (result != VF_CUDA_OK) return result;
+        unsigned char* source = persistent->cnr_mask_mask;
+        unsigned char* target = persistent->cand_mask_scratch;
+        const int radius = morph_kernel / 2;
+        auto pass = [&](int dilate) {
+            launch_morph_pass(source, target, width, height, 1, radius, dilate, persistent->stream);
+            std::swap(source, target);
+        };
+        if (morph_operation == VF_MORPH_OPEN) {
+            for (int i = 0; i < morph_iterations; ++i) pass(0);
+            for (int i = 0; i < morph_iterations; ++i) pass(1);
+        } else if (morph_operation == VF_MORPH_CLOSE) {
+            for (int i = 0; i < morph_iterations; ++i) pass(1);
+            for (int i = 0; i < morph_iterations; ++i) pass(0);
+        } else {
+            for (int i = 0; i < morph_iterations; ++i) pass(morph_operation == VF_MORPH_DILATE ? 1 : 0);
+        }
+        result = visionflow_cuda::kernel_launch_result();
+        if (result != VF_CUDA_OK) return result;
+        mask = source;
+    }
+    cand_exclusion_kernel<<<grid2d(width, height), dim3(BLOCK_X, BLOCK_Y), 0, persistent->stream>>>(
+        mask, geometry);
+    result = visionflow_cuda::kernel_launch_result();
+    if (result != VF_CUDA_OK) return result;
+
+    // Connected components by hook-and-compress union-find until a pass changes nothing.
+    result = reserve_device(
+        &persistent->ccl_parent, &persistent->ccl_parent_capacity, item_count, &persistent->allocation_count);
+    if (result == VF_CUDA_OK) result = reserve_device(
+        &persistent->cand_words, &persistent->cand_words_capacity, static_cast<size_t>(4),
+        &persistent->allocation_count);
+    if (result == VF_CUDA_OK) result = reserve_device(
+        &persistent->cand_ramp, &persistent->cand_ramp_capacity, item_count, &persistent->allocation_count);
+    if (result == VF_CUDA_OK) result = reserve_device(
+        &persistent->cand_foreground, &persistent->cand_foreground_capacity, item_count,
+        &persistent->allocation_count);
+    if (result != VF_CUDA_OK) return result;
+    const unsigned int pixel_blocks = cand_blocks(items);
+    ccl_init_kernel<<<pixel_blocks, CAND_THREADS, 0, persistent->stream>>>(mask, persistent->ccl_parent, items);
+    cand_ramp_kernel<<<pixel_blocks, CAND_THREADS, 0, persistent->stream>>>(persistent->cand_ramp, items);
+    result = visionflow_cuda::kernel_launch_result();
+    if (result != VF_CUDA_OK) return result;
+    int32_t changed = 0;
+    for (int iteration = 0;; ++iteration) {
+        if (iteration >= CCL_MAX_ITERATIONS) return VF_CUDA_INTERNAL_ERROR;
+        cudaError_t error = cudaMemsetAsync(persistent->cand_words, 0, sizeof(int32_t), persistent->stream);
+        if (error != cudaSuccess) return cuda_result(error);
+        ccl_hook_kernel<<<grid2d(width, height), dim3(BLOCK_X, BLOCK_Y), 0, persistent->stream>>>(
+            persistent->ccl_parent, width, height, connectivity, persistent->cand_words);
+        ccl_compress_kernel<<<pixel_blocks, CAND_THREADS, 0, persistent->stream>>>(
+            persistent->ccl_parent, items);
+        result = visionflow_cuda::kernel_launch_result();
+        if (result != VF_CUDA_OK) return result;
+        result = cand_read_word(persistent, &changed, persistent->cand_words);
+        if (result != VF_CUDA_OK) return result;
+        if (changed == 0) break;
+    }
+
+    int component_count = 0;
+    int kept_count = 0;
+    result = cand_group_components(
+        persistent, mask, items, width, height, min_area, max_area, max_area_enabled, border_margin,
+        &component_count, &kept_count);
+    if (result != VF_CUDA_OK) return result;
+    *out_component_count = component_count;
+    *out_candidate_count = kept_count;
+    if (kept_count > candidate_capacity) {
+        *out_status = CAND_STATUS_CAPACITY;
+        return VF_CUDA_UNSUPPORTED;
+    }
+
+    if (kept_count > 0) {
+        const size_t kept = static_cast<size_t>(kept_count);
+        result = reserve_device(&persistent->cand_windows, &persistent->cand_windows_capacity, kept * 4,
+                                &persistent->allocation_count);
+        if (result == VF_CUDA_OK) result = reserve_device(
+            &persistent->cand_window_sizes, &persistent->cand_window_sizes_capacity, kept,
+            &persistent->allocation_count);
+        if (result == VF_CUDA_OK) result = reserve_device(
+            &persistent->cand_gather_offsets, &persistent->cand_gather_offsets_capacity, kept,
+            &persistent->allocation_count);
+        if (result == VF_CUDA_OK) result = reserve_device(
+            &persistent->cand_out_ints, &persistent->cand_out_ints_capacity, kept * CAND_RECORD_INTS,
+            &persistent->allocation_count);
+        if (result == VF_CUDA_OK) result = reserve_device(
+            &persistent->cand_out_floats, &persistent->cand_out_floats_capacity, kept * CAND_RECORD_FLOATS,
+            &persistent->allocation_count);
+        if (result != VF_CUDA_OK) return result;
+        cand_window_kernel<<<cand_blocks(kept_count), CAND_THREADS, 0, persistent->stream>>>(
+            persistent->cand_kept, persistent->cand_boxes, kept_count, width, height, padding_min, padding_max,
+            padding_scale, persistent->cand_windows, persistent->cand_window_sizes);
+        result = visionflow_cuda::kernel_launch_result();
+        if (result != VF_CUDA_OK) return result;
+        size_t cub_bytes = 0;
+        cudaError_t error = cub::DeviceScan::ExclusiveSum(
+            nullptr, cub_bytes, persistent->cand_window_sizes, persistent->cand_gather_offsets, kept_count,
+            persistent->stream);
+        if (error != cudaSuccess) return cuda_result(error);
+        result = cand_reserve_cub(persistent, cub_bytes);
+        if (result != VF_CUDA_OK) return result;
+        error = cub::DeviceScan::ExclusiveSum(
+            persistent->cand_cub_scratch, cub_bytes, persistent->cand_window_sizes,
+            persistent->cand_gather_offsets, kept_count, persistent->stream);
+        if (error != cudaSuccess) return cuda_result(error);
+        long long last_offset = 0;
+        long long last_size = 0;
+        error = cudaMemcpyAsync(
+            &last_offset, persistent->cand_gather_offsets + (kept - 1), sizeof(long long),
+            cudaMemcpyDeviceToHost, persistent->stream);
+        if (error == cudaSuccess) error = cudaMemcpyAsync(
+            &last_size, persistent->cand_window_sizes + (kept - 1), sizeof(long long),
+            cudaMemcpyDeviceToHost, persistent->stream);
+        if (error != cudaSuccess) return cuda_result(error);
+        result = visionflow_cuda::stream_result(persistent->stream);
+        if (result != VF_CUDA_OK) return result;
+        const long long gather_total = last_offset + last_size;
+        if (gather_total > CAND_MAX_GATHER) {
+            *out_status = CAND_STATUS_GATHER_LIMIT;
+            return VF_CUDA_UNSUPPORTED;
+        }
+        result = reserve_device(
+            &persistent->cand_gather, &persistent->cand_gather_capacity,
+            static_cast<size_t>(gather_total > 0 ? gather_total : 1), &persistent->allocation_count);
+        if (result != VF_CUDA_OK) return result;
+        cand_stats_kernel<<<cand_blocks(kept_count), CAND_THREADS, 0, persistent->stream>>>(
+            persistent->cand_kept, persistent->cand_boxes, persistent->cand_windows,
+            persistent->cand_gather_offsets, persistent->cand_offsets, persistent->cand_roots,
+            persistent->cand_sorted_pixels, persistent->ccl_parent, persistent->cnr_mask_image,
+            persistent->cand_gather, kept_count, geometry, min_background_pixels,
+            persistent->cand_out_ints, persistent->cand_out_floats);
+        result = visionflow_cuda::kernel_launch_result();
+        if (result != VF_CUDA_OK) return result;
+        cudaEventRecord(persistent->timing_events[TIMING_AFTER_KERNEL], persistent->stream);
+        error = cudaMemcpyAsync(
+            out_candidate_ints, persistent->cand_out_ints, sizeof(int32_t) * kept * CAND_RECORD_INTS,
+            cudaMemcpyDeviceToHost, persistent->stream);
+        if (error == cudaSuccess) error = cudaMemcpyAsync(
+            out_candidate_floats, persistent->cand_out_floats, sizeof(float) * kept * CAND_RECORD_FLOATS,
+            cudaMemcpyDeviceToHost, persistent->stream);
+        if (error != cudaSuccess) return cuda_result(error);
+    } else {
+        cudaEventRecord(persistent->timing_events[TIMING_AFTER_KERNEL], persistent->stream);
+    }
+    cudaEventRecord(persistent->timing_events[TIMING_AFTER_OUTPUT], persistent->stream);
+    result = visionflow_cuda::stream_result(persistent->stream);
+    if (result != VF_CUDA_OK) return result;
+    finalize_timing(persistent);
+    for (int candidate = 0; candidate < kept_count; ++candidate) {
+        if (out_candidate_ints[static_cast<size_t>(candidate) * CAND_RECORD_INTS + 6] != CAND_STATUS_OK) {
+            *out_status = CAND_STATUS_GLOBAL_BACKGROUND;
+            return VF_CUDA_UNSUPPORTED;
+        }
+    }
     return VF_CUDA_OK;
 }
