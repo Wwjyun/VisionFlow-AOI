@@ -146,13 +146,14 @@ class Detector2021CnrOrderTests(unittest.TestCase):
         cnrs = [candidate.cnr for candidate in candidates]
         self.assertEqual(cnrs, sorted(cnrs, reverse=True))
 
-    def test_cnr_ties_follow_ascending_component_label_order(self):
-        """Exact CNR ties are broken by the component label visit order.
+    def test_cnr_ties_follow_bounding_box_raster_order(self):
+        """Exact CNR ties are broken geometrically, not by component label order.
 
-        The scene below contains three byte-identical defects placed in a
-        constant background, so their ring statistics are identical and the
-        stable ``list.sort`` must leave them in ascending label order, i.e. in
-        increasing raster order of their bounding boxes.
+        The scene below contains three byte-identical defects placed in a constant
+        background, so their ring statistics are identical and the CNRs tie exactly.  The
+        order must come from the bounding boxes, because that is what makes the defect
+        list independent of how a connected-components implementation numbers its
+        components.
         """
 
         height = width = 200
@@ -177,8 +178,61 @@ class Detector2021CnrOrderTests(unittest.TestCase):
         self.assertEqual(
             boxes,
             sorted(boxes, key=lambda box: (box[1], box[0])),
-            "equal-CNR candidates must stay in ascending component label order",
+            "equal-CNR candidates must be in bounding-box raster order",
         )
+
+    def test_output_is_independent_of_the_component_label_numbering(self):
+        """Any numbering of the same components must give the same defect list.
+
+        This is the property that lets a connected-components implementation be replaced:
+        the component set and stats have to match, the numbering does not.
+        """
+
+        gray = _cnr_scene(31)
+        detector = _detector()
+        analysis = detector._automatic_cnr_mask(gray)
+        mask = analysis["candidate_mask"]
+        count, labels, stats, _ = cv2.connectedComponentsWithStats(
+            mask, connectivity=int(detector.params.get("connectivity", 8))
+        )
+
+        def payload(component_labels, component_stats):
+            candidates = detector._collect_candidates_with_labels(
+                analysis["image_float"],
+                mask,
+                analysis["inclusion_mask"],
+                component_labels,
+                component_stats,
+                count,
+            )
+            return [
+                (
+                    candidate.bbox,
+                    candidate.area,
+                    round(candidate.cnr, 12),
+                    round(candidate.background_mean, 12),
+                )
+                for candidate in candidates
+            ]
+
+        baseline = payload(np.asarray(labels), stats)
+        rng = np.random.default_rng(4242)
+        component_labels = list(range(1, count))
+        for _ in range(50):
+            order = rng.permutation(component_labels)
+            remap = np.zeros(count, dtype=np.int32)
+            permuted_stats = np.zeros_like(stats)
+            # Both the label map and the stats table are indexed by label, so a
+            # relabelling has to permute the stats too.
+            permuted_stats[0] = stats[0]
+            for new_index, original in enumerate(order):
+                remap[original] = new_index + 1
+                permuted_stats[new_index + 1] = stats[original]
+            self.assertEqual(
+                payload(remap[labels], permuted_stats),
+                baseline,
+                "a different component numbering changed the defect list",
+            )
 
     def test_defect_list_order_matches_candidate_order(self):
         gray = _cnr_scene(23)

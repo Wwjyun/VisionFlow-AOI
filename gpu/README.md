@@ -83,11 +83,14 @@ plan，tile metadata 以 `cpu_crossover` 路線與 `preprocess_routes` 標示。
   但 **kernel 本體只有 0.606 ms**；接線後 202 的 `automatic_cnr_mask` 836.6 → 438.8 ms，
   產線形狀端到端 1337 → 1019 ms（**1.31×**）。真正的大幅收益需把 residual 留在 device。
 - **connected components 與 ring CNR 統計**：**尚未 GPU 化**。`tools/connected_components_reference.py`
-  已可與 `cv2.connectedComponentsWithStats` 在結構化遮罩上完全一致（含 label 0 描述背景像素、
-  無像素標籤的 sentinel／NaN centroid 語意），但**隨機遮罩的標籤編號順序仍不同**；
-  在該缺口修正前，此參考不得作為 GPU 化的黃金標準（細節與已排除的假設見 `Todo.md`）。
-  ring CNR 的背景 mean/std 目前以 NumPy 在 host 計算，會與 GPU 化後的加法順序有
-  ULP 級差異，判定邊界案例必須另外量測。
+  與 `cv2.connectedComponentsWithStats` 在 **4 連通完全等價**（含標籤編號；10 種形狀 × 3 密度 × 3 seed
+  共 90 個案例逐位元斷言相等），8 連通則**只差標籤編號**（component 集合與 stats 在所有案例相同）。
+  **原本這使 GPU CCL 無法替換**，因為 `Detector202_1` 的候選排序在 CNR 完全相同時會沿用標籤順序；
+  **該依賴已移除**：候選現在以 `(-cnr, bbox.y, bbox.x)` 排序，輸出的缺陷順序與 CCL 編號無關
+  （`tools/cnr_label_order_impact.py` 以 100 次隨機標籤置換驗證 100/100 相同）。
+  量測顯示產線形狀的雜訊表面 **0/121** 個候選會落在平手群，因此此改變在產線上無影響。
+  **所以 GPU CCL 只需與 OpenCV 一致到「component 集合＋每個 component 的 stats」**，
+  不再需要重現 OpenCV 的編號。ring CNR 的背景 mean/std 目前仍以 NumPy 在 host 計算。
 
 `vf_match_template_debug_*` 與 `vf_find_contours_*` 的下載介面只供等價驗證與診斷使用，
 不屬於產線路徑。

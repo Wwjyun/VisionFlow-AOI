@@ -1,23 +1,21 @@
-"""Does the component label order actually change 202-CS-SN-1's final output?
+"""Does the component label order change 202-CS-SN-1's final output?
 
-``Detector202_1._collect_candidates`` walks components in ascending label order and
-then sorts the candidates by CNR with Python's **stable** sort.  A stable sort keeps
-the label visit order for candidates whose CNR is *exactly* equal, so in principle a
-replacement connected-components implementation that numbers components differently
-could reorder the defect list.  Exact CNR ties do occur: a symmetric grid of identical
-defects on a constant background produces many.
+``Detector202_1._collect_candidates`` used to depend on OpenCV's component label
+*numbering*: it walked components in ascending label order and then sorted by CNR with a
+stable sort, so candidates whose CNR was exactly equal stayed in label order.  Exact ties
+happen on any regular array of identical parts (measured 433/435 candidates), so a
+replacement connected-components implementation that produced the same components with a
+different numbering would have reordered the defect list - which is what made the
+label-ordering gap a blocker.
 
-This tool settles the question empirically instead of arguing from the contract:
+The tie-break is now explicit: CNR descending, then the component's bounding box in
+raster order.  Bounding boxes are disjoint for connected components, so that is a total
+order and the output no longer depends on the numbering at all.
 
-* build a scene that produces exact CNR ties,
-* relabel the component map with an arbitrary permutation of the component numbers
-  (which is exactly what a differently-numbered CCL implementation would hand over),
-* re-run ``_collect_candidates`` on the permuted labels and compare the resulting
-  defect list, field by field, with the original.
-
-If the output is unchanged for every permutation then the label order is not
-observable in the detector output, and a GPU CCL only has to reproduce the component
-*set* and the per-component stats, not OpenCV's numbering.
+This tool is the check for that property: it builds a scene with exact CNR ties, relabels
+the component map with random permutations (permuting the stats table with it, because
+stats are indexed by label), re-runs the candidate stage, and compares the resulting
+defect list field by field.  Every permutation must reproduce the same list.
 
 Usage:
     .\\env\\Scripts\\python.exe tools\\cnr_label_order_impact.py [--json OUTPUT]
@@ -137,10 +135,16 @@ def main() -> int:
     for _ in range(args.permutations):
         order = rng.permutation(component_labels)
         remap = np.zeros(count, dtype=np.int32)
+        permuted_stats = np.zeros_like(stats)
+        # The label map and the stats table are both indexed by label, so a relabelling
+        # has to permute the stats as well; permuting only the labels would feed each
+        # component another component's bounding box and area.
+        permuted_stats[0] = stats[0]
         for new_index, original in enumerate(order):
             remap[original] = new_index + 1
+            permuted_stats[new_index + 1] = stats[original]
         permuted = remap[labels]
-        payload = _payload(detector, analysis, permuted, stats, count)
+        payload = _payload(detector, analysis, permuted, permuted_stats, count)
         if payload == baseline_payload:
             identical += 1
             continue

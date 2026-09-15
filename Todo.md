@@ -357,8 +357,15 @@ float32 累加、OpenCV 的 kernel 係數）與 `vf_gaussian_blur_f32_roi`，並
 （1）**label 0 的 stats 描述的是背景像素**（例如 50×40 影像中 16×10 白色矩形 → `[0,0,50,40,1840]`）；
 （2）**某標籤若無像素，stats 為 sentinel `[-1, INT_MAX, 0, 0, 0]`、centroid 為 NaN**（全前景時 label 0 即如此）。
 
-**已知限制（尚未解決，已縮小到單一具體原因）**：**隨機遮罩**上 component 數量與像素集合正確，但
-**8 連通的標籤編號順序不同**（例：96 個 component 數量相同，但 cv2 把 `(19,0)` 編為 5、參考實作編為 4）。
+**已知限制（已解決，2026-09-15）**：原本的缺口是「隨機遮罩上 8 連通的標籤編號順序與 OpenCV 不同」，
+而 202 的缺陷清單順序依賴該編號，因此無法以不同編號的 GPU CCL 取代。**此依賴已依使用者決定移除**：
+`_collect_candidates` 現在以 `(-cnr, bbox.y, bbox.x)` 排序，平手順序由 bounding box 的 raster 順序決定，
+與編號無關；且量測顯示**產線形狀的雜訊表面 0/121 個候選位於平手群**，所以這項改變在產線上是 no-op。
+**因此 GPU 版 connected components 現在只需要與 OpenCV 一致到「component 集合 + 每個 component 的
+stats」**，不再需要重現 `flattenL` 的編號。以下的規則研究保留為歷史記錄與 `tools/connected_components_reference.py`
+的依據（該參考實作的 4 連通仍完全等價、可續用）。
+
+原始缺口描述與研究（保留供參考）：**隨機遮罩**上 component 數量與像素集合正確，但**8 連通的標籤編號順序不同**（例：96 個 component 數量相同，但 cv2 把 `(19,0)` 編為 5、參考實作編為 4）。
 **4 連通已完全正確**（4 個隨機遮罩全部 count／label map／stats／centroids 相同）。此缺口已由專門的測試
 （`test_random_masks_agree_on_component_count_but_not_yet_on_label_order`）釘住，
 **不影響既有產線**（202 仍使用 OpenCV），但**在修正前不得以本參考實作作為 GPU 化的黃金標準**。
@@ -767,6 +774,8 @@ vs 原本 `[255,255,20,20]`）。因此「標籤編號順序」對 202 的最終
 - [ ] 加速不得犧牲 GUI 回應、打包啟動、結果追溯、錯誤訊息或 CPU fallback。
 
 ## 完成紀錄
+
+- [x] 2026-09-15：**依使用者決定移除 connected components 的標籤排序依賴，CCL 缺口不再是 GPU 化的阻擋。** `Detector202_1._collect_candidates` 原本靠 Python 穩定排序的副作用決定平手順序（CNR 完全相等時保留 component 標籤的走訪順序），因此輸出與 OpenCV 的標籤**編號**綁在一起；這是候選抽取 GPU 化的唯一阻擋。現改為**明確的平手鍵**：`(-cnr, bbox.y, bbox.x)`，即 CNR 遞減、同分依 bounding box 的 raster 順序。連通元件的 bounding box 彼此不相交，因此這是**全序**，輸出與編號完全無關。**先量化影響再改**（新增 `tools/cnr_tie_share.py`）：**產線形狀的雜訊表面 0/121 個候選位於平手群**（2000×12000 含 96 缺陷為 0/97、2000×4000 含 24 缺陷為 0/24、乾淨表面 0 候選），因此這項改變在產線上**是 no-op**；只有「完全相同缺陷的規則陣列」會受影響（pitch40 283/285、pitch64 120/120、pitch128 30/30，合計 433/435）。**契約測試更新**：`test_cnr_ties_follow_bounding_box_raster_order`（原為 `..._ascending_component_label_order`）改為斷言 bbox raster 順序；新增 `test_output_is_independent_of_the_component_label_numbering`，以 50 次隨機置換 component 標籤（**並同步置換以 label 為索引的 stats 表**）驗證產出的缺陷清單逐欄相同。**過程中修掉兩個我自己造成的 stats 錯誤**：`tools/cnr_label_order_impact.py` 與新測試第一版都只置換了 label map、沒有置換 stats 表，於是每個 component 拿到別人的 bbox／area，量到「100/100 不同」的假結果；修正後為 **100/100 相同**，工具說明也同步改寫（它原本的結論已被本筆取代）。全套 425 → **426 tests OK**、compileall exit 0；產線 quick 幾何端到端仍為 CPU 1443.2 → CUDA 985.3 ms、decision-bearing 欄位相同，確認改動沒有副作用。**仍未完成**：GPU 版 connected components 本身（現在只差「component 集合與 stats 相同」這個較弱的條件，不再需要重現 OpenCV 的編號）。
 
 - [x] 2026-09-15：**發現 RTX 正式驗收完全沒有涵蓋 202-CS-SN-1，並補上可驗證的覆蓋。** 查證 `gpu/validate_cuda_dll.py` 的 `PRODUCTION_RECIPES` 與五份正式 Recipe 的實際內容後確認：五份 Recipe 啟用的分別是 `401-CS-AP-1`（A_AOI_01）、`401-CS-AP-1`（CIRCLE_401_1）、`401-AS-SN-1`（NEGATIVE_401）、`401-CS-AP-2`（WHITE_RATIO_401_2）、`900-CS-AP-1`（FRAME_900），**沒有任何一份啟用 202**。因此既有的「10 個正式案例全部等價通過」只證明我沒破壞 401／900 路徑，**不涵蓋我這幾輪改動的 202 CNR 路徑**（Gaussian、融合遮罩、median）。新增 `tools/make_detector_202_manifest.py`：以決定性合成圖產生 202 的 PASS／NG 對（PASS 0 缺陷、NG 3 缺陷，並**先用 CPU 參考實測確認** PASS／NG 真的成立才寫入 manifest，不讓期望值成為假設），再把這對案例**附加**到既有五份 Recipe 的合成 manifest 上——因為 `load_production_manifest` 要求 `PRODUCTION_RECIPES` 裡每份 Recipe 都有 PASS 與 NG，單一 Recipe 的小 manifest 無法通過驗證。202 的 recipe 沿用清單內的檔名（`PRODUCT_A_CIRCLE_401_1_AOI_01.yaml`），案例 id 以 `detector202_` 開頭、manifest note 明文說明此點，不假裝是產線樣本。**主 session 實測結果**：`validate_cuda_dll.py --production-manifest` **exit 0、「12 CPU/GPU-equivalent labeled cases」、「All requested CUDA validations passed」**，12 個案例（既有 10 ＋ 202 的 2）全部 `CPU and GPU inspection results are identical`。這同時確認我這幾輪的改動**沒有破壞任何既有正式 Recipe 的等價性**，也補上了 202 的覆蓋。**仍未完成**：真圖 PASS/NG 與產線樣本 manifest（本筆為合成圖，已標明）。
 
