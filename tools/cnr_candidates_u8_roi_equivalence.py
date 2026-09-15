@@ -208,15 +208,7 @@ def main() -> int:
         raise SystemExit("vf_cnr_candidates_u8_roi is unavailable; rebuild the CUDA DLL")
     cases = []
     counts = []
-    production_threshold = Detector202_1.DEVICE_CANDIDATES_MIN_PIXELS
     try:
-        # Below the production ROI-size bound the detector keeps the host route on purpose.
-        routing_image = make_scene(260, 320, 3, 5, defects=70)
-        cases.append(compare_case(
-            runtime, routing_image, (12, 9, 280, 220), "below_size_bound_keeps_host", dict(SMALL_BASE), False))
-        # Equivalence is a property of the export, independent of that routing bound, so the small
-        # scenes below exercise the device path directly.
-        Detector202_1.DEVICE_CANDIDATES_MIN_PIXELS = 0
         for channels in (1, 3):
             for seed in (3, 11):
                 image = make_scene(260, 320, channels, seed + channels, defects=70)
@@ -242,7 +234,6 @@ def main() -> int:
         counts.append(component_count_case(runtime, production, (0, 0, 2000, 12000), {}))
         metrics = runtime.performance_stats()
     finally:
-        Detector202_1.DEVICE_CANDIDATES_MIN_PIXELS = production_threshold
         runtime.close()
 
     production_rows = [row for row in cases if row["name"].startswith("production_12000x2000")]

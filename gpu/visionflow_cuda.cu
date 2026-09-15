@@ -11,6 +11,7 @@
 // with a stable radix sort, and prefix-sums per-component offsets with the same CUB toolkit copy.
 #include <cub/device/device_run_length_encode.cuh>
 #include <cub/device/device_scan.cuh>
+#include <cub/device/device_segmented_reduce.cuh>
 #include <cub/device/device_select.cuh>
 #include <algorithm>
 #include <cfloat>
@@ -197,6 +198,40 @@ struct PersistentContext {
     size_t cand_out_floats_capacity = 0;
     uint8_t* cand_cub_scratch = nullptr;
     size_t cand_cub_scratch_capacity = 0;
+    // Parallel ring statistics: per-slot background flags, the value sequences (component values then
+    // compacted background values), per-candidate counts/offsets, the pairwise leaf table and results.
+    unsigned char* cand_flags = nullptr;
+    size_t cand_flags_capacity = 0;
+    float* cand_values = nullptr;
+    size_t cand_values_capacity = 0;
+    long long* cand_value_offsets = nullptr;
+    size_t cand_value_offsets_capacity = 0;
+    long long* cand_background_counts = nullptr;
+    size_t cand_background_counts_capacity = 0;
+    long long* cand_background_offsets = nullptr;
+    size_t cand_background_offsets_capacity = 0;
+    long long* cand_segment_ends = nullptr;
+    size_t cand_segment_ends_capacity = 0;
+    long long* cand_seq_start = nullptr;
+    size_t cand_seq_start_capacity = 0;
+    long long* cand_seq_length = nullptr;
+    size_t cand_seq_length_capacity = 0;
+    long long* cand_leaf_counts = nullptr;
+    size_t cand_leaf_counts_capacity = 0;
+    long long* cand_leaf_offsets = nullptr;
+    size_t cand_leaf_offsets_capacity = 0;
+    long long* cand_leaf_start = nullptr;
+    size_t cand_leaf_start_capacity = 0;
+    int32_t* cand_leaf_length = nullptr;
+    size_t cand_leaf_length_capacity = 0;
+    int32_t* cand_leaf_sequence = nullptr;
+    size_t cand_leaf_sequence_capacity = 0;
+    float* cand_leaf_values = nullptr;
+    size_t cand_leaf_values_capacity = 0;
+    float* cand_seq_mean = nullptr;
+    size_t cand_seq_mean_capacity = 0;
+    float* cand_seq_std = nullptr;
+    size_t cand_seq_std_capacity = 0;
     unsigned long long allocation_count = 0;
     cudaStream_t stream = nullptr;
     cudaError_t initialization_error = cudaSuccess;
@@ -261,7 +296,15 @@ struct PersistentContext {
                  static_cast<void*>(cand_windows), static_cast<void*>(cand_window_sizes),
                  static_cast<void*>(cand_gather_offsets), static_cast<void*>(cand_gather),
                  static_cast<void*>(cand_out_ints), static_cast<void*>(cand_out_floats),
-                 static_cast<void*>(cand_cub_scratch)}) {
+                 static_cast<void*>(cand_cub_scratch), static_cast<void*>(cand_flags),
+                 static_cast<void*>(cand_values), static_cast<void*>(cand_value_offsets),
+                 static_cast<void*>(cand_background_counts), static_cast<void*>(cand_background_offsets),
+                 static_cast<void*>(cand_segment_ends), static_cast<void*>(cand_seq_start),
+                 static_cast<void*>(cand_seq_length), static_cast<void*>(cand_leaf_counts),
+                 static_cast<void*>(cand_leaf_offsets), static_cast<void*>(cand_leaf_start),
+                 static_cast<void*>(cand_leaf_length), static_cast<void*>(cand_leaf_sequence),
+                 static_cast<void*>(cand_leaf_values), static_cast<void*>(cand_seq_mean),
+                 static_cast<void*>(cand_seq_std)}) {
             visionflow_cuda::free_device(pointer);
         }
         visionflow_cuda::free_device(resident_u8);
@@ -4984,37 +5027,98 @@ __device__ float cand_pairwise_leaf(
     return result;
 }
 
-__device__ float cand_pairwise_sum(
-    const float* values, const int32_t* indices, long long start, long long n, bool squared, float mean) {
-    constexpr int STACK = 64;
-    long long frame_start[STACK];
-    long long frame_n[STACK];
-    int frame_stage[STACK];
-    float partial[STACK];
+// The pairwise recursion splits a run of n > 128 values at n/2 rounded down to a multiple of 8 and
+// evaluates everything else as leaves. The leaf layout depends only on n, so the statistics are built
+// in three data-parallel phases instead of one long loop per candidate: every leaf of every sequence is
+// summed in its own device thread, then each sequence walks the same recursion over its leaf sums in
+// left-to-right order. Only that walk fixes the float32 combination order, and it touches about n/100
+// values, so no thread runs a window-sized loop.
+constexpr long long CAND_LEAF_SIZE = 128;
+constexpr int CAND_STACK = 64;
+
+__device__ __forceinline__ long long cand_split(long long count) {
+    long long half = count / 2;
+    return half - half % 8;
+}
+
+__device__ long long cand_leaf_count(long long n) {
+    if (n <= 0) return 0;
+    long long pending[CAND_STACK];
+    int top = 0;
+    long long leaves = 0;
+    pending[top++] = n;
+    while (top > 0) {
+        const long long count = pending[--top];
+        if (count <= CAND_LEAF_SIZE) {
+            ++leaves;
+            continue;
+        }
+        const long long half = cand_split(count);
+        pending[top++] = count - half;
+        pending[top++] = half;
+    }
+    return leaves;
+}
+
+// Emits the leaves of one sequence in left-to-right order, which is the order the walk consumes them.
+__device__ void cand_emit_leaves(
+    long long start, long long n, int sequence, long long first_leaf,
+    long long* leaf_start, int32_t* leaf_length, int32_t* leaf_sequence) {
+    if (n <= 0) return;
+    long long pending_start[CAND_STACK];
+    long long pending_n[CAND_STACK];
+    int top = 0;
+    long long leaf = first_leaf;
+    pending_start[top] = start;
+    pending_n[top] = n;
+    ++top;
+    while (top > 0) {
+        --top;
+        const long long base = pending_start[top];
+        const long long count = pending_n[top];
+        if (count <= CAND_LEAF_SIZE) {
+            leaf_start[leaf] = base;
+            leaf_length[leaf] = static_cast<int32_t>(count);
+            leaf_sequence[leaf] = sequence;
+            ++leaf;
+            continue;
+        }
+        const long long half = cand_split(count);
+        pending_start[top] = base + half;
+        pending_n[top] = count - half;
+        ++top;
+        pending_start[top] = base;
+        pending_n[top] = half;
+        ++top;
+    }
+}
+
+// The same recursion as NumPy's pairwise_sum, reading the precomputed leaf sums in order.
+__device__ float cand_combine_leaves(const float* leaf_values, long long first_leaf, long long n) {
+    long long frame_n[CAND_STACK];
+    int frame_stage[CAND_STACK];
+    float partial[CAND_STACK];
     int frames = 1;
     int partials = 0;
-    frame_start[0] = start;
+    long long leaf = first_leaf;
     frame_n[0] = n;
     frame_stage[0] = 0;
     while (frames > 0) {
         const int top = frames - 1;
         const long long count = frame_n[top];
-        if (count <= 128) {
-            partial[partials++] = cand_pairwise_leaf(values, indices, frame_start[top], count, squared, mean);
+        if (count <= CAND_LEAF_SIZE) {
+            partial[partials++] = leaf_values[leaf++];
             --frames;
             continue;
         }
-        long long half = count / 2;
-        half -= half % 8;
+        const long long half = cand_split(count);
         if (frame_stage[top] == 0) {
             frame_stage[top] = 1;
-            frame_start[frames] = frame_start[top];
             frame_n[frames] = half;
             frame_stage[frames] = 0;
             ++frames;
         } else if (frame_stage[top] == 1) {
             frame_stage[top] = 2;
-            frame_start[frames] = frame_start[top] + half;
             frame_n[frames] = count - half;
             frame_stage[frames] = 0;
             ++frames;
@@ -5028,68 +5132,141 @@ __device__ float cand_pairwise_sum(
     return partial[0];
 }
 
-// np.mean on a float32 array: float32(float64(sum) / float64(count)) because the reduction returns a
-// float32 scalar divided by an np.intp count. np.std follows _var: the same mean, np.subtract and
-// np.square in float32, a second pairwise sum, the same float64 division, then a float32 sqrt.
-__device__ void cand_mean_std(
-    const float* values, const int32_t* indices, long long start, long long n, float* mean, float* std_value) {
-    const float total = cand_pairwise_sum(values, indices, start, n, false, 0.0f);
-    const float average = static_cast<float>(static_cast<double>(total) / static_cast<double>(n));
-    *mean = average;
-    if (std_value != nullptr) {
-        const float squares = cand_pairwise_sum(values, indices, start, n, true, average);
-        const float variance = static_cast<float>(static_cast<double>(squares) / static_cast<double>(n));
-        *std_value = sqrtf(variance);
+// The kept candidate whose half-open slot range [offsets[i], offsets[i + 1]) contains `slot`. Empty
+// ranges share their start with the next range, so the largest start not above the slot is the
+// non-empty range that owns it.
+__device__ __forceinline__ int cand_owner(const long long* offsets, int count, long long slot) {
+    int low = 0;
+    int high = count - 1;
+    while (low < high) {
+        const int middle = low + (high - low + 1) / 2;
+        if (offsets[middle] <= slot) low = middle;
+        else high = middle - 1;
     }
+    return low;
 }
 
-// Per surviving component: np.mean of its pixels in raster order, then the ring background of the
-// clamped padded window - every pixel whose label differs from the component's (background label 0
-// included) and that the inclusion mask keeps - gathered in raster order into this candidate's slice.
-__global__ void cand_stats_kernel(
-    const int32_t* kept, const int32_t* boxes, const int32_t* windows, const long long* gather_offsets,
-    const int32_t* offsets, const int32_t* roots, const int32_t* sorted_pixels, const int32_t* parent,
-    const float* gray, float* gather, int count, CandidateGeometry geometry, int min_background_pixels,
-    int32_t* out_ints, float* out_floats) {
+__device__ __forceinline__ long long cand_slot() {
+    return static_cast<long long>(blockIdx.x) * blockDim.x + threadIdx.x;
+}
+
+// Component pixel values in raster order, one thread per pixel of every kept component.
+__global__ void cand_component_values_kernel(
+    const long long* value_offsets, int count, const int32_t* kept, const int32_t* component_offsets,
+    const int32_t* sorted_pixels, const float* gray, float* values, long long total) {
+    const long long slot = cand_slot();
+    if (slot >= total) return;
+    const int candidate = cand_owner(value_offsets, count, slot);
+    const long long local = slot - value_offsets[candidate];
+    values[slot] = gray[sorted_pixels[component_offsets[kept[candidate]] + local]];
+}
+
+// Ring background candidates, one thread per pixel of every clamped window: the value and whether the
+// host gather `local_image[(local_labels != label) & local_inclusion]` keeps it.
+__global__ void cand_background_slots_kernel(
+    const long long* window_offsets, int count, const int32_t* kept, const int32_t* windows,
+    const int32_t* roots, const int32_t* parent, const float* gray, CandidateGeometry geometry,
+    unsigned char* flags, float* values, long long total) {
+    const long long slot = cand_slot();
+    if (slot >= total) return;
+    const int candidate = cand_owner(window_offsets, count, slot);
+    const int32_t* window = windows + static_cast<size_t>(candidate) * 4;
+    const long long window_width = window[2] - window[0];
+    const long long local = slot - window_offsets[candidate];
+    const int xx = window[0] + static_cast<int>(local % window_width);
+    const int yy = window[1] + static_cast<int>(local / window_width);
+    const int32_t pixel = yy * geometry.width + xx;
+    flags[slot] = (parent[pixel] != roots[kept[candidate]] && cand_included(geometry, xx, yy)) ? 1 : 0;
+    values[slot] = gray[pixel];
+}
+
+__global__ void cand_segment_ends_kernel(
+    const long long* offsets, const long long* sizes, long long* ends, int count) {
     const int candidate = blockIdx.x * blockDim.x + threadIdx.x;
     if (candidate >= count) return;
-    const int component = kept[candidate];
-    const int32_t* box = boxes + static_cast<size_t>(component) * 5;
-    const int32_t* window = windows + static_cast<size_t>(candidate) * 4;
-    int32_t* record = out_ints + static_cast<size_t>(candidate) * CAND_RECORD_INTS;
-    float* stats = out_floats + static_cast<size_t>(candidate) * CAND_RECORD_FLOATS;
-    record[0] = box[0];
-    record[1] = box[1];
-    record[2] = box[2];
-    record[3] = box[3];
-    record[4] = box[4];
-    record[5] = 0;
-    record[6] = CAND_STATUS_OK;
-    float defect_mean = 0.0f;
-    cand_mean_std(gray, sorted_pixels, offsets[component], box[4], &defect_mean, nullptr);
-    stats[0] = defect_mean;
-    stats[1] = 0.0f;
-    stats[2] = 0.0f;
+    ends[candidate] = offsets[candidate] + sizes[candidate];
+}
 
-    const int32_t root = roots[component];
-    const long long base = gather_offsets[candidate];
-    long long background = 0;
-    for (int yy = window[1]; yy < window[3]; ++yy) {
-        for (int xx = window[0]; xx < window[2]; ++xx) {
-            const int32_t pixel = yy * geometry.width + xx;
-            if (parent[pixel] != root && cand_included(geometry, xx, yy)) {
-                gather[base + background] = gray[pixel];
-                ++background;
-            }
-        }
-    }
-    record[5] = static_cast<int32_t>(background);
-    if (background < min_background_pixels) {
-        record[6] = CAND_STATUS_GLOBAL_BACKGROUND;
+// Sequence 2c holds candidate c's component values, sequence 2c+1 its compacted background values.
+__global__ void cand_sequences_kernel(
+    const long long* value_offsets, const int32_t* kept, const int32_t* boxes,
+    const long long* background_offsets, const long long* background_counts, long long component_total,
+    long long* sequence_start, long long* sequence_length, long long* leaf_counts, int count) {
+    const int candidate = blockIdx.x * blockDim.x + threadIdx.x;
+    if (candidate >= count) return;
+    const size_t component = static_cast<size_t>(candidate) * 2;
+    sequence_start[component] = value_offsets[candidate];
+    sequence_length[component] = boxes[static_cast<size_t>(kept[candidate]) * 5 + 4];
+    sequence_start[component + 1] = component_total + background_offsets[candidate];
+    sequence_length[component + 1] = background_counts[candidate];
+    leaf_counts[component] = cand_leaf_count(sequence_length[component]);
+    leaf_counts[component + 1] = cand_leaf_count(sequence_length[component + 1]);
+}
+
+__global__ void cand_emit_leaves_kernel(
+    const long long* sequence_start, const long long* sequence_length, const long long* leaf_offsets,
+    long long* leaf_start, int32_t* leaf_length, int32_t* leaf_sequence, int count) {
+    const int sequence = blockIdx.x * blockDim.x + threadIdx.x;
+    if (sequence >= count) return;
+    cand_emit_leaves(
+        sequence_start[sequence], sequence_length[sequence], sequence, leaf_offsets[sequence],
+        leaf_start, leaf_length, leaf_sequence);
+}
+
+// Leaf sums; the squared pass applies np.subtract/np.square against the sequence mean and only runs
+// for background sequences, which are the only ones np.std is taken of.
+__global__ void cand_leaf_sum_kernel(
+    const float* values, const long long* leaf_start, const int32_t* leaf_length,
+    const int32_t* leaf_sequence, const float* sequence_mean, int squared, float* leaf_values,
+    long long total) {
+    const long long leaf = cand_slot();
+    if (leaf >= total) return;
+    const int sequence = leaf_sequence[leaf];
+    if (squared && (sequence & 1) == 0) return;
+    leaf_values[leaf] = cand_pairwise_leaf(
+        values, nullptr, leaf_start[leaf], leaf_length[leaf], squared != 0,
+        squared ? sequence_mean[sequence] : 0.0f);
+}
+
+// np.mean: float32(float64(sum) / float64(count)). np.std (_var): the same float64 division of the
+// squared-deviation sum, then a float32 sqrt.
+__global__ void cand_combine_kernel(
+    const float* leaf_values, const long long* leaf_offsets, const long long* sequence_length,
+    int squared, float* sequence_mean, float* sequence_std, int count) {
+    const int sequence = blockIdx.x * blockDim.x + threadIdx.x;
+    if (sequence >= count) return;
+    const long long n = sequence_length[sequence];
+    if (squared) {
+        if ((sequence & 1) == 0) return;
+        sequence_std[sequence] = 0.0f;
+        if (n <= 0) return;
+        const float squares = cand_combine_leaves(leaf_values, leaf_offsets[sequence], n);
+        sequence_std[sequence] = sqrtf(static_cast<float>(static_cast<double>(squares) / static_cast<double>(n)));
         return;
     }
-    if (background == 0) return;
-    cand_mean_std(gather, nullptr, base, background, &stats[1], &stats[2]);
+    sequence_mean[sequence] = 0.0f;
+    if (n <= 0) return;
+    const float total = cand_combine_leaves(leaf_values, leaf_offsets[sequence], n);
+    sequence_mean[sequence] = static_cast<float>(static_cast<double>(total) / static_cast<double>(n));
+}
+
+__global__ void cand_records_kernel(
+    const int32_t* kept, const int32_t* boxes, const long long* background_counts,
+    const float* sequence_mean, const float* sequence_std, int min_background_pixels,
+    int32_t* out_ints, float* out_floats, int count) {
+    const int candidate = blockIdx.x * blockDim.x + threadIdx.x;
+    if (candidate >= count) return;
+    const int32_t* box = boxes + static_cast<size_t>(kept[candidate]) * 5;
+    int32_t* record = out_ints + static_cast<size_t>(candidate) * CAND_RECORD_INTS;
+    float* stats = out_floats + static_cast<size_t>(candidate) * CAND_RECORD_FLOATS;
+    const long long background = background_counts[candidate];
+    const size_t sequence = static_cast<size_t>(candidate) * 2;
+    for (int field = 0; field < 5; ++field) record[field] = box[field];
+    record[5] = static_cast<int32_t>(background);
+    record[6] = background < min_background_pixels ? CAND_STATUS_GLOBAL_BACKGROUND : CAND_STATUS_OK;
+    stats[0] = sequence_mean[sequence];
+    stats[1] = background > 0 ? sequence_mean[sequence + 1] : 0.0f;
+    stats[2] = background > 0 ? sequence_std[sequence + 1] : 0.0f;
 }
 
 int cand_reserve_cub(PersistentContext* persistent, size_t bytes) {
@@ -5228,6 +5405,188 @@ int cand_group_components(
     if (result != VF_CUDA_OK) return result;
     *out_kept_count = word;
     return VF_CUDA_OK;
+}
+
+__global__ void cand_kept_areas_kernel(const int32_t* kept, const int32_t* boxes, long long* areas, int count) {
+    const int candidate = blockIdx.x * blockDim.x + threadIdx.x;
+    if (candidate >= count) return;
+    areas[candidate] = boxes[static_cast<size_t>(kept[candidate]) * 5 + 4];
+}
+
+int cand_exclusive_sum(PersistentContext* persistent, const long long* input, long long* output, int count) {
+    size_t cub_bytes = 0;
+    cudaError_t error = cub::DeviceScan::ExclusiveSum(nullptr, cub_bytes, input, output, count, persistent->stream);
+    if (error != cudaSuccess) return cuda_result(error);
+    int result = cand_reserve_cub(persistent, cub_bytes);
+    if (result != VF_CUDA_OK) return result;
+    error = cub::DeviceScan::ExclusiveSum(
+        persistent->cand_cub_scratch, cub_bytes, input, output, count, persistent->stream);
+    return error == cudaSuccess ? VF_CUDA_OK : cuda_result(error);
+}
+
+// Reads offsets[count - 1] + sizes[count - 1], the total a prefix sum covers.
+int cand_read_total(
+    PersistentContext* persistent, const long long* offsets, const long long* sizes, int count, long long* total) {
+    long long last_offset = 0;
+    long long last_size = 0;
+    cudaError_t error = cudaMemcpyAsync(
+        &last_offset, offsets + (count - 1), sizeof(long long), cudaMemcpyDeviceToHost, persistent->stream);
+    if (error == cudaSuccess) error = cudaMemcpyAsync(
+        &last_size, sizes + (count - 1), sizeof(long long), cudaMemcpyDeviceToHost, persistent->stream);
+    if (error != cudaSuccess) return cuda_result(error);
+    int result = visionflow_cuda::stream_result(persistent->stream);
+    if (result != VF_CUDA_OK) return result;
+    *total = last_offset + last_size;
+    return VF_CUDA_OK;
+}
+
+// Ring statistics for `kept_count` candidates whose windows and window offsets are already on the
+// device, written into cand_out_ints/cand_out_floats. See the leaf-layout comment above.
+int cand_ring_statistics(
+    PersistentContext* persistent, int kept_count, long long window_total, CandidateGeometry geometry,
+    int min_background_pixels) {
+    const size_t kept = static_cast<size_t>(kept_count);
+    const int sequences = kept_count * 2;
+    int result = reserve_device(
+        &persistent->cand_value_offsets, &persistent->cand_value_offsets_capacity, kept, &persistent->allocation_count);
+    if (result == VF_CUDA_OK) result = reserve_device(
+        &persistent->cand_segment_ends, &persistent->cand_segment_ends_capacity, kept, &persistent->allocation_count);
+    if (result == VF_CUDA_OK) result = reserve_device(
+        &persistent->cand_background_counts, &persistent->cand_background_counts_capacity, kept,
+        &persistent->allocation_count);
+    if (result == VF_CUDA_OK) result = reserve_device(
+        &persistent->cand_background_offsets, &persistent->cand_background_offsets_capacity, kept,
+        &persistent->allocation_count);
+    if (result == VF_CUDA_OK) result = reserve_device(
+        &persistent->cand_seq_start, &persistent->cand_seq_start_capacity, kept * 2, &persistent->allocation_count);
+    if (result == VF_CUDA_OK) result = reserve_device(
+        &persistent->cand_seq_length, &persistent->cand_seq_length_capacity, kept * 2, &persistent->allocation_count);
+    if (result == VF_CUDA_OK) result = reserve_device(
+        &persistent->cand_leaf_counts, &persistent->cand_leaf_counts_capacity, kept * 2, &persistent->allocation_count);
+    if (result == VF_CUDA_OK) result = reserve_device(
+        &persistent->cand_leaf_offsets, &persistent->cand_leaf_offsets_capacity, kept * 2,
+        &persistent->allocation_count);
+    if (result == VF_CUDA_OK) result = reserve_device(
+        &persistent->cand_seq_mean, &persistent->cand_seq_mean_capacity, kept * 2, &persistent->allocation_count);
+    if (result == VF_CUDA_OK) result = reserve_device(
+        &persistent->cand_seq_std, &persistent->cand_seq_std_capacity, kept * 2, &persistent->allocation_count);
+    if (result != VF_CUDA_OK) return result;
+    const unsigned int candidate_blocks = cand_blocks(kept_count);
+
+    // Component values: one prefix sum over the kept areas, then one thread per component pixel.
+    cand_kept_areas_kernel<<<candidate_blocks, CAND_THREADS, 0, persistent->stream>>>(
+        persistent->cand_kept, persistent->cand_boxes, persistent->cand_segment_ends, kept_count);
+    result = visionflow_cuda::kernel_launch_result();
+    if (result == VF_CUDA_OK) result = cand_exclusive_sum(
+        persistent, persistent->cand_segment_ends, persistent->cand_value_offsets, kept_count);
+    long long component_total = 0;
+    if (result == VF_CUDA_OK) result = cand_read_total(
+        persistent, persistent->cand_value_offsets, persistent->cand_segment_ends, kept_count, &component_total);
+    if (result != VF_CUDA_OK) return result;
+    const long long value_total = component_total + window_total;
+    if (value_total > static_cast<long long>(INT_MAX)) return VF_CUDA_UNSUPPORTED;
+    result = reserve_device(
+        &persistent->cand_values, &persistent->cand_values_capacity, static_cast<size_t>(value_total),
+        &persistent->allocation_count);
+    if (result != VF_CUDA_OK) return result;
+    cand_component_values_kernel<<<cand_blocks(component_total), CAND_THREADS, 0, persistent->stream>>>(
+        persistent->cand_value_offsets, kept_count, persistent->cand_kept, persistent->cand_offsets,
+        persistent->cand_sorted_pixels, persistent->cnr_mask_image, persistent->cand_values, component_total);
+    result = visionflow_cuda::kernel_launch_result();
+    if (result != VF_CUDA_OK) return result;
+
+    // Background: classify every window pixel in parallel, compact in order, count per candidate.
+    if (window_total > 0) {
+        const size_t window_count = static_cast<size_t>(window_total);
+        result = reserve_device(
+            &persistent->cand_flags, &persistent->cand_flags_capacity, window_count, &persistent->allocation_count);
+        if (result == VF_CUDA_OK) result = reserve_device(
+            &persistent->cand_gather, &persistent->cand_gather_capacity, window_count, &persistent->allocation_count);
+        if (result != VF_CUDA_OK) return result;
+        cand_background_slots_kernel<<<cand_blocks(window_total), CAND_THREADS, 0, persistent->stream>>>(
+            persistent->cand_gather_offsets, kept_count, persistent->cand_kept, persistent->cand_windows,
+            persistent->cand_roots, persistent->ccl_parent, persistent->cnr_mask_image, geometry,
+            persistent->cand_flags, persistent->cand_gather, window_total);
+        cand_segment_ends_kernel<<<candidate_blocks, CAND_THREADS, 0, persistent->stream>>>(
+            persistent->cand_gather_offsets, persistent->cand_window_sizes, persistent->cand_segment_ends, kept_count);
+        result = visionflow_cuda::kernel_launch_result();
+        if (result != VF_CUDA_OK) return result;
+        const int window_items = static_cast<int>(window_total);
+        size_t cub_bytes = 0;
+        cudaError_t error = cub::DeviceSelect::Flagged(
+            nullptr, cub_bytes, persistent->cand_gather, persistent->cand_flags,
+            persistent->cand_values + component_total, persistent->cand_words, window_items, persistent->stream);
+        if (error != cudaSuccess) return cuda_result(error);
+        result = cand_reserve_cub(persistent, cub_bytes);
+        if (result != VF_CUDA_OK) return result;
+        error = cub::DeviceSelect::Flagged(
+            persistent->cand_cub_scratch, cub_bytes, persistent->cand_gather, persistent->cand_flags,
+            persistent->cand_values + component_total, persistent->cand_words, window_items, persistent->stream);
+        if (error != cudaSuccess) return cuda_result(error);
+        cub_bytes = 0;
+        error = cub::DeviceSegmentedReduce::Sum(
+            nullptr, cub_bytes, persistent->cand_flags, persistent->cand_background_counts, kept_count,
+            persistent->cand_gather_offsets, persistent->cand_segment_ends, persistent->stream);
+        if (error != cudaSuccess) return cuda_result(error);
+        result = cand_reserve_cub(persistent, cub_bytes);
+        if (result != VF_CUDA_OK) return result;
+        error = cub::DeviceSegmentedReduce::Sum(
+            persistent->cand_cub_scratch, cub_bytes, persistent->cand_flags, persistent->cand_background_counts,
+            kept_count, persistent->cand_gather_offsets, persistent->cand_segment_ends, persistent->stream);
+        if (error != cudaSuccess) return cuda_result(error);
+    } else {
+        cudaError_t error = cudaMemsetAsync(
+            persistent->cand_background_counts, 0, sizeof(long long) * kept, persistent->stream);
+        if (error != cudaSuccess) return cuda_result(error);
+    }
+    result = cand_exclusive_sum(
+        persistent, persistent->cand_background_counts, persistent->cand_background_offsets, kept_count);
+    if (result != VF_CUDA_OK) return result;
+
+    // Sequences and their pairwise leaf layout.
+    cand_sequences_kernel<<<candidate_blocks, CAND_THREADS, 0, persistent->stream>>>(
+        persistent->cand_value_offsets, persistent->cand_kept, persistent->cand_boxes,
+        persistent->cand_background_offsets, persistent->cand_background_counts, component_total,
+        persistent->cand_seq_start, persistent->cand_seq_length, persistent->cand_leaf_counts, kept_count);
+    result = visionflow_cuda::kernel_launch_result();
+    if (result == VF_CUDA_OK) result = cand_exclusive_sum(
+        persistent, persistent->cand_leaf_counts, persistent->cand_leaf_offsets, sequences);
+    long long leaf_total = 0;
+    if (result == VF_CUDA_OK) result = cand_read_total(
+        persistent, persistent->cand_leaf_offsets, persistent->cand_leaf_counts, sequences, &leaf_total);
+    if (result != VF_CUDA_OK) return result;
+    const size_t leaves = static_cast<size_t>(leaf_total > 0 ? leaf_total : 1);
+    result = reserve_device(
+        &persistent->cand_leaf_start, &persistent->cand_leaf_start_capacity, leaves, &persistent->allocation_count);
+    if (result == VF_CUDA_OK) result = reserve_device(
+        &persistent->cand_leaf_length, &persistent->cand_leaf_length_capacity, leaves, &persistent->allocation_count);
+    if (result == VF_CUDA_OK) result = reserve_device(
+        &persistent->cand_leaf_sequence, &persistent->cand_leaf_sequence_capacity, leaves,
+        &persistent->allocation_count);
+    if (result == VF_CUDA_OK) result = reserve_device(
+        &persistent->cand_leaf_values, &persistent->cand_leaf_values_capacity, leaves, &persistent->allocation_count);
+    if (result != VF_CUDA_OK) return result;
+    const unsigned int sequence_blocks = cand_blocks(sequences);
+    const unsigned int leaf_blocks = cand_blocks(leaf_total > 0 ? leaf_total : 1);
+    cand_emit_leaves_kernel<<<sequence_blocks, CAND_THREADS, 0, persistent->stream>>>(
+        persistent->cand_seq_start, persistent->cand_seq_length, persistent->cand_leaf_offsets,
+        persistent->cand_leaf_start, persistent->cand_leaf_length, persistent->cand_leaf_sequence, sequences);
+
+    // Means for every sequence, then the squared-deviation sums for the background sequences.
+    for (int squared = 0; squared <= 1; ++squared) {
+        cand_leaf_sum_kernel<<<leaf_blocks, CAND_THREADS, 0, persistent->stream>>>(
+            persistent->cand_values, persistent->cand_leaf_start, persistent->cand_leaf_length,
+            persistent->cand_leaf_sequence, persistent->cand_seq_mean, squared, persistent->cand_leaf_values,
+            leaf_total);
+        cand_combine_kernel<<<sequence_blocks, CAND_THREADS, 0, persistent->stream>>>(
+            persistent->cand_leaf_values, persistent->cand_leaf_offsets, persistent->cand_seq_length, squared,
+            persistent->cand_seq_mean, persistent->cand_seq_std, sequences);
+    }
+    cand_records_kernel<<<candidate_blocks, CAND_THREADS, 0, persistent->stream>>>(
+        persistent->cand_kept, persistent->cand_boxes, persistent->cand_background_counts,
+        persistent->cand_seq_mean, persistent->cand_seq_std, min_background_pixels,
+        persistent->cand_out_ints, persistent->cand_out_floats, kept_count);
+    return visionflow_cuda::kernel_launch_result();
 }
 
 VF_CUDA_API int vf_cnr_candidates_u8_roi(
@@ -5443,17 +5802,7 @@ VF_CUDA_API int vf_cnr_candidates_u8_roi(
             *out_status = CAND_STATUS_GATHER_LIMIT;
             return VF_CUDA_UNSUPPORTED;
         }
-        result = reserve_device(
-            &persistent->cand_gather, &persistent->cand_gather_capacity,
-            static_cast<size_t>(gather_total > 0 ? gather_total : 1), &persistent->allocation_count);
-        if (result != VF_CUDA_OK) return result;
-        cand_stats_kernel<<<cand_blocks(kept_count), CAND_THREADS, 0, persistent->stream>>>(
-            persistent->cand_kept, persistent->cand_boxes, persistent->cand_windows,
-            persistent->cand_gather_offsets, persistent->cand_offsets, persistent->cand_roots,
-            persistent->cand_sorted_pixels, persistent->ccl_parent, persistent->cnr_mask_image,
-            persistent->cand_gather, kept_count, geometry, min_background_pixels,
-            persistent->cand_out_ints, persistent->cand_out_floats);
-        result = visionflow_cuda::kernel_launch_result();
+        result = cand_ring_statistics(persistent, kept_count, gather_total, geometry, min_background_pixels);
         if (result != VF_CUDA_OK) return result;
         cudaEventRecord(persistent->timing_events[TIMING_AFTER_KERNEL], persistent->stream);
         error = cudaMemcpyAsync(

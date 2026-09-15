@@ -3,7 +3,6 @@ from __future__ import annotations
 from copy import deepcopy
 from pathlib import Path
 import unittest
-from unittest.mock import patch
 
 import cv2
 import numpy as np
@@ -980,8 +979,7 @@ class Detector2021DeviceCandidateRoutingTests(unittest.TestCase):
         gray = self._gray()
         params = self._params()
         detector, runtime = self._device_detector(gray, params)
-        with patch.object(Detector202_1, "DEVICE_CANDIDATES_MIN_PIXELS", 0):
-            defects = detector.detect(gray)
+        defects = detector.detect(gray)
         expected = Detector202_1(params=params).detect(gray)
         self.assertEqual(len(runtime.candidate_calls), 1)
         self.assertEqual(runtime.resident_calls, [])
@@ -1003,8 +1001,7 @@ class Detector2021DeviceCandidateRoutingTests(unittest.TestCase):
             candidate_max_value=200, gaussian_sigma=1.5,
         )
         detector, runtime = self._device_detector(gray, params)
-        with patch.object(Detector202_1, "DEVICE_CANDIDATES_MIN_PIXELS", 0):
-            detector.detect(gray)
+        detector.detect(gray)
         _roi, ints, reals = runtime.candidate_calls[0]
         height, width = gray.shape
         minimum_area, maximum_area = detector._effective_component_area_limits(height, width)
@@ -1027,26 +1024,24 @@ class Detector2021DeviceCandidateRoutingTests(unittest.TestCase):
         gray = self._gray()
         params = self._params()
         detector, runtime = self._device_detector(gray, params, fail_candidates=True)
-        with patch.object(Detector202_1, "DEVICE_CANDIDATES_MIN_PIXELS", 0):
-            defects = detector.detect(gray)
+        defects = detector.detect(gray)
         self.assertEqual(len(runtime.candidate_calls), 1)
         self.assertEqual(len(runtime.resident_calls), 1)
         self.assertEqual({d["metadata"]["component_backend"] for d in defects}, {"opencv_cpu"})
         self.assertEqual(self._strip(defects), self._strip(Detector202_1(params=params).detect(gray)))
 
-    def test_small_rois_and_debug_exports_keep_the_host_route(self):
+    def test_debug_exports_and_shape_mismatches_keep_the_host_route(self):
         gray = self._gray()
         params = self._params()
-        detector, runtime = self._device_detector(gray, params)
-        self.assertLess(gray.size, Detector202_1.DEVICE_CANDIDATES_MIN_PIXELS)
-        detector.detect(gray)
-        self.assertEqual(runtime.candidate_calls, [])
-
         debug_detector, debug_runtime = self._device_detector(gray, params)
         debug_detector.export_debug_images = True
-        with patch.object(Detector202_1, "DEVICE_CANDIDATES_MIN_PIXELS", 0):
-            debug_detector.detect(gray)
+        debug_detector.detect(gray)
         self.assertEqual(debug_runtime.candidate_calls, [])
+
+        mismatched, mismatched_runtime = self._device_detector(gray, params)
+        mismatched._active_device_roi = _PlanResidentRoi(gray.shape[1] - 1, gray.shape[0])
+        mismatched.detect(gray)
+        self.assertEqual(mismatched_runtime.candidate_calls, [])
         self.assertIn("202-1_candidate_mask", debug_detector.debug_images)
 
 

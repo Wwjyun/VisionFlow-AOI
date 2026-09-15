@@ -87,8 +87,8 @@ plan，tile metadata 以 `cpu_crossover` 路線與 `preprocess_routes` 標示。
   但 **kernel 本體只有 0.606 ms**；接線後 202 的 `automatic_cnr_mask` 836.6 → 438.8 ms，
   產線形狀端到端 1337 → 1019 ms（**1.31×**）。真正的大幅收益需把 residual 留在 device。
 - `vf_cnr_candidates_u8_roi`（202 候選抽取：morphology、排除區、connected components、面積／邊界過濾與
-  ring CNR 統計）：**已接入** `detectors/detector_202_1.py` 的 `_device_candidates`（ROI 面積 ≥ 1024×1024）。
-  71/71 案例與既有 resident mask＋OpenCV 路徑逐欄相同，mean/std 依 NumPy float32 pairwise 順序逐位元重現；
+  ring CNR 統計）：**已接入** `detectors/detector_202_1.py` 的 `_device_candidates`。
+  70/70 案例與既有 resident mask＋OpenCV 路徑逐欄相同，mean/std 依 NumPy float32 pairwise 順序逐位元重現；
   詳見〈CCL＋ring CNR 留在 device〉一節。以下為接入前的背景紀錄。
 - **connected components 與 ring CNR 統計（接入前紀錄）**：`tools/connected_components_reference.py`
   與 `cv2.connectedComponentsWithStats` 在 **4 連通完全等價**（含標籤編號；10 種形狀 × 3 密度 × 3 seed
@@ -449,62 +449,74 @@ Recipe 在 Designer 儲存後 session 仍會依 mtime 重建，需要重新預�
 4. **Stats 與分組**：`cub::DeviceSelect::Flagged` 取出前景像素，以 root 為 key 做穩定的
    `cub::DeviceRadixSort::SortPairs`（同一 component 內保留 raster 順序），`DeviceRunLengthEncode` 得到
    area，per-component kernel 算 bbox 並套用與 host 相同的面積／border margin 過濾。
-5. **Ring CNR**：每個候選在 device 上依 raster 順序收集 component 像素與 window 背景（label 不同且未被排除），
-   以 **NumPy float32 pairwise 加總順序**（<8 從 -0.0 循序、≤128 八線、否則在 n/2 取 8 的倍數處切開）
-   計算總和，`mean = float32(float64(sum) / float64(n))`、`std = sqrt(float32(float64(Σ(v-mean)²) / float64(n)))`。
-   這些是查 NumPy 2.5.1 `_methods._mean/_var` 與 `pairwise_sum` 後確認的實際公式，Python 探針在 632 種長度
-   與 boolean-mask gather 上與 `np.sum/np.mean/np.std` 逐位元相同。contrast、CNR 與排序仍由 host 以原本的
-   Python 表達式計算。
+5. **Ring CNR**：mean/std 以 **NumPy float32 pairwise 加總順序**（<8 從 -0.0 循序、≤128 八線、否則在 n/2 取
+   8 的倍數處切開）計算，`mean = float32(float64(sum) / float64(n))`、
+   `std = sqrt(float32(float64(Σ(v-mean)²) / float64(n)))`。這些是查 NumPy 2.5.1 `_methods._mean/_var` 與
+   `pairwise_sum` 後確認的實際公式，Python 探針在 632 種長度與 boolean-mask gather 上與 `np.sum/np.mean/np.std`
+   逐位元相同。contrast、CNR 與排序仍由 host 以原本的 Python 表達式計算。
+
+   **全部資料平行**（第一版是每個候選一個 thread 循序掃 window 並加總；這個平台一次以 32 條 lane 同步執行，
+   長度不一的長迴圈互相等待，小 ROI 反而比 CPU 慢，見下表）：
+   - component 像素值與 window 背景都是「每個像素一個 thread」：以二分搜尋找出 slot 屬於哪個候選，背景像素標記
+     「label 不同且未被排除」；`cub::DeviceSelect::Flagged` 依原順序壓縮、`cub::DeviceSegmentedReduce::Sum`
+     算各候選背景數。壓縮後的順序就是 host boolean-mask gather 的 raster 順序。
+   - pairwise 樹的葉節點（≤128 個值）只由序列長度決定：先在 device 算出每個序列的葉數與葉表，**所有序列的
+     所有葉節點各一個 thread** 計算葉和；每個序列再依相同遞迴、由左到右合併自己的葉和（約 n/100 次加法），
+     這一步決定 float32 合併順序，因此保留在序列自己的 thread。平方偏差和以同一張葉表再跑一次。
 6. **退回條件**：ring 背景少於 `min_background_pixels`（host 會改用整張 included 影像）、紀錄容量不足
    （runtime 會自動以正確容量重試一次）、ring window 總量超過 2^28 個 float，都回傳 `VF_CUDA_UNSUPPORTED`
    並以 `out_status` 說明；Detector 對任何例外都整段改走既有 resident mask＋OpenCV 路徑，結果不變。
 
-Detector 端：`Detector202_1.detect` 在有 resident ROI、runtime 具此 export、非 debug 影像、ROI 面積
-≥ `DEVICE_CANDIDATES_MIN_PIXELS`（1024×1024）時直接取得候選，完全不跑 host gray、mask 與 label。
+Detector 端：`Detector202_1.detect` 在有 resident ROI、runtime 具此 export、非 debug 影像、ROI 尺寸相符時
+直接取得候選，完全不跑 host gray、mask 與 label；**沒有 ROI 尺寸下限**（依據見下表）。
 缺陷 metadata 新增 `component_backend`（`opencv_cpu`／`cuda_resident`）。`device_host_split` 會把
 `automatic_cnr_mask`、`candidate_extraction`、`geometry_and_statistics` 標為 device。
 
-**等價驗證**（`tools/cnr_candidates_u8_roi_equivalence.py`，RTX 3090）
+**等價驗證**（`tools/cnr_candidates_u8_roi_equivalence.py`，RTX 3090，平行化後重跑）
 
-- 71/71 案例：device 與既有 resident mask＋OpenCV 路徑所有缺陷欄位完全相同；與 CPU 參考除了已知漂移的
+- 70/70 案例：device 與既有 resident mask＋OpenCV 路徑所有缺陷欄位完全相同；與 CPU 參考除了已知漂移的
   4 個 residual 診斷值與來源標籤外完全相同。每個案例都必須有缺陷，空清單會判定失敗。
 - 涵蓋：1／3 通道、兩組 seed、4／8 連通、open／close（k5 i2）／dilate／erode／無 morphology、
   production 遮罩、自訂 center＋全 inset、偏移 center、緊／寬 padding、border margin 0、小面積上限、
   candidate value 1、`min_background_pixels` 0、900 缺陷密集場景、108 個完全相同缺陷的 CNR 平手陣列、
   三次 12000×2000 正式尺寸（89 缺陷）。
-- 退回：偶數 morphology kernel 與需要整張背景的案例都有缺陷，且確實走 `opencv_cpu`、結果與 CPU 相同；
-  低於尺寸界線的 ROI 確實留在 host。
+- 退回：偶數 morphology kernel 與需要整張背景的案例都有缺陷，且確實走 `opencv_cpu`、結果與 CPU 相同。
 - Component 數量：13/13 與 `cv2.connectedComponentsWithStats` 相同。
-- 穩定性：12000×2000 連續 1000 次、3 張影像輪替，結果逐位元決定性；median 25.4 ms、P95 28.5 ms；
-  device allocation 由 36 增長到 47 後不再增加。
-- 正式 Recipe manifest：12/12 CPU/GPU 等價（202 的 manifest 影像為 512×512，依尺寸界線走 host）。
+- 穩定性：12000×2000 連續 1000 次、3 張影像輪替，結果逐位元決定性；median 9.5 ms、P95 10.7 ms
+  （循序版 25.4／28.5 ms）；device allocation 增長到 69 後不再增加。
+- 正式 Recipe manifest：12/12 CPU/GPU 等價（202 的 512×512 manifest 影像現在也走 device）。
 - 完整 CUDA validator、native smoke（新增：與 `vf_cnr_mask_u8_roi` 的 median/MAD/threshold 逐位元比對）通過。
 
-**ROI 尺寸界線的依據**（單一 ROI detector 時間，device／既有路徑，每格 5 次取後 4 次 median）
+**各 ROI 尺寸的 detector 時間**（單一 ROI，device／既有 resident mask＋OpenCV 路徑，每格 5 次取後 4 次 median，
+遮罩關閉；循序版為第一版每候選循序的實作）
 
-| ROI | 預設 padding（上限 50） | 倍數 | padding 上限 8 | 倍數 |
-|---|---:|---:|---:|---:|
-| 256×256 | 6.84／3.10 ms | **0.45×** | 2.90／3.04 ms | 1.05× |
-| 512×512 | 21.54／10.21 ms | **0.47×** | 4.95／6.44 ms | 1.30× |
-| 1024×1024 | 26.69／25.59 ms | 0.96× | 7.08／23.60 ms | 3.33× |
-| 2000×2000 | 29.53／69.63 ms | 2.36× | 10.99／57.35 ms | 5.22× |
-| 4000×2000 | 39.54／112.52 ms | 2.85× | 14.46／89.41 ms | 6.18× |
-| 12000×2000 | 45.96／240.56 ms | **5.23×** | 24.47／211.87 ms | 8.66× |
+| ROI | 循序版（預設 padding） | 平行版（預設 padding） | 倍數 | 平行版（padding 上限 8） | 倍數 |
+|---|---:|---:|---:|---:|---:|
+| 64×64 | — | 0.81／0.98 ms | 1.20× | 0.93／0.88 ms | 0.95× |
+| 128×128 | — | 1.82／1.80 ms | 0.99× | 1.50／1.83 ms | 1.22× |
+| 192×192 | — | 2.01／1.88 ms | 0.94× | 1.60／1.67 ms | 1.04× |
+| 256×256 | 6.84／3.10 ms（0.45×） | 1.86／3.37 ms | **1.81×** | 1.66／2.26 ms | 1.36× |
+| 384×384 | — | 2.76／4.10 ms | 1.48× | 1.84／3.47 ms | 1.89× |
+| 512×512 | 21.54／10.21 ms（0.47×） | 2.54／6.59 ms | **2.59×** | 2.24／7.03 ms | 3.13× |
+| 768×768 | — | 3.46／13.56 ms | 3.92× | 2.79／11.50 ms | 4.11× |
+| 1024×1024 | 26.69／25.59 ms（0.96×） | 4.03／22.12 ms | 5.49× | 3.51／19.47 ms | 5.55× |
+| 2000×2000 | 29.53／69.63 ms（2.36×） | 7.90／58.31 ms | 7.38× | 7.69／52.20 ms | 6.79× |
+| 12000×2000 | 45.96／240.56 ms（5.23×） | 22.38／233.32 ms | **10.43×** | 20.80／206.52 ms | 9.93× |
 
-時間主要跟著 ring window 大小走：每個候選在一個 device thread 內循序掃描自己的 window 並做 pairwise
-加總，小 ROI 攤不掉這個成本。因此暫以 1024×1024 為界；**下一步優化**是把 window 收集改成跨像素平行、
-pairwise 樹的 leaf 跨候選平行，只保留 leaf 合併在 thread 內循序（合併順序決定 float32 結果，不能改）。
+192×192 以下兩條路徑差距在 0.13 ms 以內（互有勝負），256×256 起 device 一律較快，因此移除第一版的
+1024×1024 尺寸界線。**量測注意**：量測小 ROI 時必須確認 detector 真的走 device；第一次平行化後的量測漏了
+尺寸界線，小 ROI 其實兩邊都走既有路徑，數字作廢後重量（`component_backend` 可用來確認）。
 
 **完整 pipeline**（`tools/benchmark_pipeline_production.py --profile production`，warm-up 1＋量測 3 輪）
 
-| 階段 | CPU median／P95 | v1.6.1 GPU | 本次 GPU median／P95 | CPU/GPU 倍數 |
-|---|---:|---:|---:|---:|
-| **端到端** | 6725.5／6905.7 ms | 1957.5 ms | **1467.7／1488.2 ms** | **4.58×** |
-| Detector 合計 | 5648.1／5761.1 ms | 900.9 ms | **334.4／349.5 ms** | 16.89× |
-| Tiling 合計 | 109.8／125.9 ms | 3.4 ms | 6.5／10.2 ms | 16.96× |
-| 讀檔與解碼 | 806.2／856.9 ms | 796.0 ms | 829.4／864.7 ms | 0.97× |
-| 初始化（含整圖上傳） | 0.1 ms | 174.9 ms | 153.5／157.2 ms | — |
-| Recipe 設定 | 107.3 ms | 90.9 ms | 108.0 ms | 0.99× |
+| 階段 | CPU median／P95 | v1.6.1 GPU | 循序版 GPU | **平行版 GPU median／P95** | CPU/GPU 倍數 |
+|---|---:|---:|---:|---:|---:|
+| **端到端** | 6441.7／6461.6 ms | 1957.5 ms | 1467.7 ms | **1111.2／1150.5 ms** | **5.80×** |
+| Detector 合計 | 5399.6／5439.4 ms | 900.9 ms | 334.4 ms | **88.7／94.1 ms** | 60.90× |
+| Tiling 合計 | 96.0／104.1 ms | 3.4 ms | 6.5 ms | 2.5／2.7 ms | 37.83× |
+| 讀檔與解碼 | 769.4／776.0 ms | 796.0 ms | 829.4 ms | 759.6／796.6 ms | 1.01× |
+| 初始化（含整圖上傳） | 0.1 ms | 174.9 ms | 153.5 ms | 122.0／126.0 ms | — |
+| Recipe 設定 | 105.3 ms | 90.9 ms | 108.0 ms | 97.8 ms | 1.08× |
 
 | 每輪 GPU 傳輸 | v1.6.1 | 本次 |
 |---|---:|---:|
@@ -514,9 +526,9 @@ pairwise 樹的 leaf 跨候選平行，只保留 leaf 合併在 thread 內循序
 
 3/3 輪 PASS/NG、defect、bbox、area、confidence 與 metadata（來源標籤除外）完全相同；另以同圖單次對照確認
 558 個缺陷只有 `background_backend`／`residual_backend`／`component_backend` 三個來源標籤不同。
-GPU 端到端 1467.7 ms 的組成：解碼 829 ms（57%）、Detector 334 ms（23%）、初始化 153 ms（10%）、
-Recipe 108 ms（7%）。**剩下最大的一段是影像解碼**（使用者優先順序第 2 項）。
-JSON：`outputs_validation/cnr_candidates/production_candidates.json`、
+GPU 端到端 1111.2 ms 的組成：**解碼 760 ms（68%）**、初始化 122 ms（11%）、Recipe 98 ms（9%）、
+Detector 89 ms（8%）。剩下最大的一段是影像解碼（使用者優先順序第 2 項）。
+JSON：`outputs_validation/cnr_candidates/production_parallel.json`（循序版：`production_candidates.json`）、
 `outputs_validation/cnr_candidates/cnr_candidates_u8_roi_equivalence.json`。
 
 ## 檔案

@@ -515,11 +515,6 @@ class Detector202_1(Detector202):
         }
 
     _DEVICE_MORPHOLOGY_CODES = {"open": 0, "close": 1, "dilate": 2, "erode": 3}
-    # RTX 3090 per-ROI detector time, device candidates vs the resident-mask + OpenCV route, default
-    # ring padding: 256x256 0.45x, 512x512 0.47x, 1024x1024 0.96x, 2000x2000 2.36x, 12000x2000 5.23x.
-    # Each ring window is scanned sequentially inside one device thread, which small ROIs never
-    # amortise, so smaller ROIs keep the host route (see gpu/README.md).
-    DEVICE_CANDIDATES_MIN_PIXELS = 1024 * 1024
 
     def _device_candidate_parameters(self, height: int, width: int) -> tuple[list[int], list[float]]:
         """Pack the host candidate semantics in the ``vf_cnr_candidates_u8_roi`` parameter layout."""
@@ -586,7 +581,6 @@ class Detector202_1(Detector202):
             or self.export_debug_images
             or device_roi is None
             or (int(device_roi.height), int(device_roi.width)) != (height, width)
-            or height * width < self.DEVICE_CANDIDATES_MIN_PIXELS
         ):
             return None
         int_params, real_params = self._device_candidate_parameters(height, width)
