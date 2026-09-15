@@ -230,8 +230,9 @@ D2H、避免 144 MB mask H2D，並讓 CCL 的 kernel 加速反映到端到端時
 三輪 CPU/GPU 都是 NG、6/6 NG tiles、558 defects，PASS/NG、defect count/type/bbox/area/
 confidence 與判定 metadata **3/3 完全相同**；此圖的 residual diagnostics 也沒有漂移。GPU 每輪只有
 一次整圖 upload：H2D 638.976 MB；D2H 288 MB（六張 gray 加六張 candidate mask）；共 13 次
-native calls。實際 split 是 decode、CCL/ring、PASS/NG 彙整在 CPU；resident upload、anchor、ROI、
-preprocess 與 automatic CNR mask 在 GPU。證據：
+native calls。實際 split 是 decode、anchor、CCL/ring、PASS/NG 彙整在 CPU；resident upload、ROI、
+preprocess 與 automatic CNR mask 在 GPU。（原紀錄寫 anchor 在 GPU，經 v1.6.0 驗收查證更正：
+GPU 呼叫統計沒有 `vf_match_template_gray_u8`，anchor 時間也與 CPU 相同，見下一節。）證據：
 `outputs_validation/gpu_mode_goal/production_final.json`。
 
 最終驗證結果：
@@ -246,6 +247,96 @@ preprocess 與 automatic CNR mask 在 GPU。證據：
 - `python -m unittest discover -s tests -v`：435 tests 通過；compileall 與 CUDA preflight 通過。
 - CLI 合成 NG smoke 正常完成並寫出 overlay、NG tile、CSV、matrix CSV 與 JSON；CLI exit 1 代表檢出
   NG，是既有命令列結果契約。
+
+### 2026-09-15 v1.6.0 發行版：全流程各階段對照與兩種 mode 流程
+
+v1.6.0 發行前以 release commit 的 CUDA 原始碼重新編譯 DLL（CUDA 13.3、MSVC x64、`sm_86`），
+再用發行成品 DLL 重跑同一正式尺寸基準。這是 v1.6.0 對應的數字；和上一節的差異屬於跨輪波動
+（CPU 6504→6793 ms、GPU 2097→2011 ms），判定結果相同。
+
+```powershell
+.\env\Scripts\python.exe tools\benchmark_pipeline_production.py `
+  --profile production --warmup 1 --repetitions 3 `
+  --json outputs_validation\release_v1.6.0\production_benchmark.json
+```
+
+條件：RTX 3090、16384×13000 合成圖、一列 6 個高 12000×寬 2000 ROI、`202-CS-SN-1`，
+warm-up 1 輪＋量測 3 輪。單位 ms。縮排的「└」列是上一列的子階段，不另外加總。
+
+| 階段 | CPU median | CPU P95 | GPU median | GPU P95 | 倍數 | GPU mode 實際位置 |
+|---|---:|---:|---:|---:|---:|---|
+| **端到端** | **6792.8** | 7174.1 | **2011.1** | 2023.4 | **3.38×** | 混合 |
+| 讀檔與解碼 `image_load` | 767.5 | 857.1 | 767.9 | 794.9 | 1.00× | CPU |
+| Recipe 設定 `recipe_setup` | 90.1 | 95.9 | 92.8 | 93.8 | 0.97× | CPU |
+| 初始化 `initialization` | 0.1 | 0.1 | 199.3 | 200.1 | — | 推定含 CUDA 初始化與整圖上傳 |
+| Tiling 合計 `tiling` | 135.6 | 148.6 | 58.9 | 61.9 | 2.30× | 混合 |
+| └ Anchor 定位 `template_match` | 58.8 | 59.5 | 58.7 | 61.6 | 1.00× | CPU（超出 GPU 形狀界限） |
+| └ ROI 產生 `roi_generation` | 77.3 | 89.1 | 0.17 | 0.24 | 444× | GPU |
+| Detector 合計 `detectors_total` | 5649.7 | 6183.5 | 859.2 | 942.8 | 6.58× | 混合 |
+| └ Gray 前處理 `preprocess` | 28.5 | 28.9 | 38.2 | 44.2 | 0.75× | GPU，並下載 gray |
+| └ Automatic CNR mask | 5260.6 | 5794.7 | 477.0 | 529.8 | **11.03×** | GPU `vf_cnr_mask_u8_roi` |
+| └ CCL＋ring CNR | 292.5 | 294.4 | 278.8 | 296.3 | 1.05× | CPU（OpenCV CCL） |
+| └ 結果組裝 `result_assembly` | 4.8 | 12.0 | 5.8 | 5.9 | 0.83× | CPU |
+| 彙整＋報告 | 1.2 | 1.3 | 1.2 | 1.7 | 1.04× | CPU |
+
+每輪 GPU 傳輸量（JSON 內為 warm-up＋3 輪共 4 輪累計，已除以 4）：
+
+| Export | 每輪次數 | H2D | D2H | 用途 |
+|---|---:|---:|---:|---|
+| `vf_context_upload_u8` | 1 | 638.976 MB | 0 | 解碼後整圖上傳一次 |
+| `vf_plan_execute_roi` | 6 | 0 | 144 MB | gray ROI，供 CPU ring CNR |
+| `vf_cnr_mask_u8_roi` | 6 | 0 | 144 MB | candidate mask，供 CPU CCL |
+| **合計** | **13** | **638.976 MB** | **288 MB** | |
+
+3/3 輪 CPU/GPU 皆 NG，PASS/NG、defect 數、bbox、area、confidence 與判定 metadata 完全相同
+（`decision_fields_identical=true`、`worst_diagnostic_drift=0.0`）。`normalised_identical=false`
+是因為嚴格比對也包含刻意標示來源的 `background_backend`、`residual_backend`、
+`background_precision_note`（CPU 與 CUDA 必然不同，工具以 `_BACKEND_PROVENANCE` 排除於判定比對）。
+
+GPU mode 2011 ms 的組成：解碼 38%、Detector 43%（CNR 477 ms、CCL 279 ms）、初始化 10%、
+Recipe 5%、Tiling 3%。因此下一輪的收益排序是：CCL 與 ring 統計留在 device（同時省下
+288 MB D2H）、影像解碼、第一張檢測的初始化預熱；Gray 前處理在 GPU 反而慢 0.75×，
+只有在 CCL/ring 上 device、不再需要下載 gray 時才有意義。
+
+兩種 mode 的資料流程（時間為上表 median）：
+
+```mermaid
+flowchart TB
+    subgraph CPU["CPU mode：端到端 6793 ms"]
+        direction TB
+        c1["讀檔與解碼<br/>768 ms"] --> c2["Anchor 定位<br/>59 ms"]
+        c2 --> c3["6 個 ROI 產生<br/>77 ms"]
+        c3 --> c4["Gray 前處理<br/>29 ms"]
+        c4 --> c5["Automatic CNR mask<br/>5261 ms"]
+        c5 --> c6["CCL ＋ ring CNR<br/>293 ms"]
+        c6 --> c7["判定、彙整、報告<br/>約 1 ms"]
+    end
+    subgraph GPU["GPU mode v1.6.0：端到端 2011 ms（3.38×）"]
+        direction TB
+        g1["讀檔與解碼（CPU）<br/>768 ms"] --> g2["整圖上傳一次<br/>H2D 639 MB"]
+        g2 --> g3["Anchor 定位（CPU）<br/>59 ms"]
+        g3 --> g4["6 個 ROI 產生（GPU）<br/>0.2 ms"]
+        g4 --> g5["Gray 前處理（GPU）<br/>38 ms"]
+        g5 --> g6["Automatic CNR mask（GPU）<br/>477 ms"]
+        g5 -. "D2H gray 144 MB" .-> g7
+        g6 -. "D2H mask 144 MB" .-> g7["CCL ＋ ring CNR（CPU）<br/>279 ms"]
+        g7 --> g8["判定、彙整、報告（CPU）<br/>約 1 ms"]
+    end
+    classDef host fill:#F1EFE8,stroke:#5F5E5A,color:#2C2C2A
+    classDef device fill:#E1F5EE,stroke:#0F6E56,color:#04342C
+    classDef xfer fill:#FAEEDA,stroke:#854F0B,color:#412402
+    class c1,c2,c3,c4,c5,c6,c7,g1,g3,g7,g8 host
+    class g4,g5,g6 device
+    class g2 xfer
+```
+
+灰色為 CPU／host、綠色為 GPU／device、黃色為 PCIe 上傳；虛線是下載回 host 的資料。
+
+**`device_host_split` 回報誤差（尚未修正，已列入 `Todo.md` P0）**：同一份 JSON 的
+`device_host_split.anchor_localization` 是 `device`，但 GPU 呼叫統計只有上表三個 export，
+沒有 `vf_match_template_gray_u8`，anchor 時間也與 CPU 相同。原因是
+`core/pipeline_stages.py` 只要 `resident_image is not None` 就把 anchor 標成 device，沒有依本次
+實際呼叫的 export 判斷。修正前，接手者判斷 anchor 位置請以 `gpu_metrics.functions` 為準。
 
 ## 檔案
 

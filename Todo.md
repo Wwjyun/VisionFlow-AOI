@@ -798,6 +798,8 @@ vs 原本 `[255,255,20,20]`）。因此「標籤編號順序」對 202 的最終
 
 ## 完成紀錄
 
+- [x] 2026-09-15：`gpu/README.md` 新增「v1.6.0 發行版：全流程各階段對照與兩種 mode 流程」，以發行成品 DLL 的正式尺寸 benchmark（`outputs_validation/release_v1.6.0/production_benchmark.json`）記錄 13 個階段的 CPU/GPU median、P95、倍數與實際執行位置、每輪傳輸量、GPU mode 時間組成與下一輪收益排序，並附 CPU／GPU mode Mermaid 流程圖。同時更正前一節「anchor 在 GPU」的描述：GPU 呼叫統計沒有 `vf_match_template_gray_u8`，anchor 實際在 CPU；`device_host_split` 誤報的修正仍列於 P0 未完成。僅文件變更。
+
 - [x] 2026-09-15：正式發布 VisionFlow AOI `v1.6.0` CUDA-enabled Windows x64（以 `gh release create` 發布）；annotated tag 指向 release commit `17cfef5` 且該 commit 位於 `origin/main`。DLL 以 CUDA 13.3、MSVC x64、`sm_86` 在 RTX 3090 重編，native smoke 與完整 CUDA validator 通過；PyInstaller 打包後 packaged `--smoke-test` 與獨立解壓 smoke 均 exit 0。GitHub Release 為非草稿、非 prerelease、latest，僅含 `VisionFlow-AOI-v1.6.0-windows-x64.zip` 一項資產；ZIP 為 118,751,085 bytes、SHA-256 `11F83E5990B5F4CD824C5785CC4979122E256EE58475C2B216C95CFFC6B721A3`，內含 6 份 Recipe（含 1 份 example）與 1 份 CUDA DLL（SHA-256 `E8437444361C72C7CDAA89FAABADC3013D910F0ED7312A05758BB4BE590478B5`）。GitHub 回傳的 size／digest 與重新下載後的獨立驗證一致。非 RTX 3090 GPU 與無 GPU 電腦的實機矩陣仍待跨機驗證。
 
 - [x] 2026-09-15：準備 VisionFlow AOI v1.6.0 CUDA-enabled Windows x64 發行原始碼；GUI Pipeline 版本同步為 1.6.0，新增 `docs/release-notes/visionflow-aoi-v1.6.0.md`，發行範圍涵蓋新 GPU mode（整圖單次 resident upload、device Anchor Grid／ROI／前處理、`vf_cnr_mask_u8_roi` resident CNR）。以 CUDA 13.3、MSVC x64、`sm_86` 對同一份 CUDA 原始碼重編 DLL，native smoke、完整 CUDA validator、resident CNR 15/15 等價、435 tests、compileall、preflight、`git diff --check`、GUI offscreen smoke 均通過；正式尺寸 16384×13000／6×(12000h×2000w) 端到端 CPU 6792.8 ms、GPU 2011.1 ms（median，3.38×），3/3 判定欄位相同。PyInstaller、packaged smoke、ZIP 雜湊與 GitHub Release 由上方 v1.6.0 發布紀錄完成。
