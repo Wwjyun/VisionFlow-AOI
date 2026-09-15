@@ -327,6 +327,45 @@ def _timing_summary(samples: list[float]) -> dict:
     }
 
 
+_EXCLUSIVE_PIPELINE_STAGES = (
+    "recipe_setup",
+    "image_load",
+    "initialization",
+    "tiling",
+    "tiling_finalize",
+    "detectors_total",
+    "detector_finalize",
+    "aggregation",
+    "result_assembly",
+    "result_sanitization",
+    "reporting_total",
+    "finalization",
+    "memory_release",
+)
+
+
+def _profiler_coverage(result: dict, external_ms: float) -> dict[str, float]:
+    """Split one run into named stages, internal gaps, and return/logging overhead.
+
+    Template matching and ROI generation are already inside tiling, while the Python detector
+    loop is inside detectors_total. Excluding those nested rows prevents double counting.
+    """
+    performance = result.get("execution", {}).get("performance", {})
+    stages = performance.get("stages_sec", {})
+    internal_ms = float(performance.get("end_to_end_sec", 0.0)) * 1000.0
+    named_ms = sum(
+        float(stages.get(name, 0.0)) * 1000.0
+        for name in _EXCLUSIVE_PIPELINE_STAGES
+    )
+    return {
+        "external_ms": float(external_ms),
+        "internal_ms": internal_ms,
+        "named_stage_ms": named_ms,
+        "internal_unprofiled_ms": max(0.0, internal_ms - named_ms),
+        "return_overhead_ms": max(0.0, float(external_ms) - internal_ms),
+    }
+
+
 def _stage_values(results: list[dict], detector: bool = False) -> dict[str, list[float]]:
     collected: dict[str, list[float]] = {}
     for result in results:
@@ -500,6 +539,24 @@ def main() -> int:
     else:
         print("residual-derived diagnostics: no drift on this image")
 
+    cpu_coverage = [
+        _profiler_coverage(result, elapsed)
+        for result, elapsed in zip(cpu_results, cpu_times)
+    ]
+    gpu_coverage = [
+        _profiler_coverage(result, elapsed)
+        for result, elapsed in zip(gpu_results, gpu_times)
+    ]
+    print()
+    print("profiler coverage (median per-run residual; nested stages excluded):")
+    for backend, rows in (("CPU", cpu_coverage), ("CUDA", gpu_coverage)):
+        print(
+            f"  {backend:4s} internal_unprofiled="
+            f"{statistics.median(row['internal_unprofiled_ms'] for row in rows):.3f} ms  "
+            f"return/logging overhead="
+            f"{statistics.median(row['return_overhead_ms'] for row in rows):.3f} ms"
+        )
+
     execution = gpu_result.get("execution", {}).get("gpu", {})
     split = execution.get("device_host_split")
     resident = execution.get("resident_image")
@@ -590,6 +647,8 @@ def main() -> int:
         "decision_equal_runs": sum(item["decision_equal"] for item in comparisons),
         "drifting_diagnostics": comparison["drift_counts"],
         "worst_diagnostic_drift": comparison["worst_drift"],
+        "cpu_profiler_coverage": cpu_coverage,
+        "gpu_profiler_coverage": gpu_coverage,
         "device_host_split": split,
         "resident_image": resident,
         "tiling": tiling,

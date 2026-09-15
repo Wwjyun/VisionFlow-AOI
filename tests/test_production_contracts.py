@@ -14,7 +14,13 @@ import yaml
 from core.detector_manager import DetectorManager
 from core.parameter_schema import ParameterSpec
 from core.pipeline import AOIPipeline
-from core.provenance import canonical_sha256, inspection_provenance, sha256_bytes
+from core.provenance import (
+    _cached_build_provenance,
+    build_provenance,
+    canonical_sha256,
+    inspection_provenance,
+    sha256_bytes,
+)
 from core.recipe_manager import RecipeError, RecipeManager
 from core.report_artifacts import CsvExporter
 from gpu.benchmark_gate import compare_p95
@@ -364,6 +370,23 @@ class ContinuousValidationContractTests(unittest.TestCase):
 
 
 class ProvenanceAndDatasetTests(unittest.TestCase):
+    def test_build_provenance_is_cached_but_callers_receive_independent_dicts(self):
+        from unittest.mock import patch
+
+        _cached_build_provenance.cache_clear()
+        try:
+            with patch("core.provenance._read_packaged_provenance", return_value=None), patch(
+                "core.provenance._git", side_effect=("abc123", " M core/pipeline.py")
+            ) as git:
+                first = build_provenance()
+                first["commit"] = "mutated"
+                second = build_provenance()
+
+            self.assertEqual(git.call_count, 2)
+            self.assertEqual(second, {"commit": "abc123", "dirty": True, "source": "git"})
+        finally:
+            _cached_build_provenance.cache_clear()
+
     def test_source_and_effective_recipe_hashes_are_distinct_and_deterministic(self):
         path = ROOT / "recipes/PRODUCT_A_NEGATIVE_401_AOI_01.yaml"
         recipe = RecipeManager().load(path)

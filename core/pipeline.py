@@ -149,27 +149,28 @@ class AOIPipeline(LogMixin):
 
         with profiler.measure("tiling"):
             tiles = list(tiler.iter_tiles(image))
-        tiler_profile = getattr(tiler, "last_profile_ms", {})
-        profiler.add_duration(
-            "template_match", float(tiler_profile.get("template_match_ms", 0.0)) / 1000.0
-        )
-        profiler.add_duration(
-            "roi_generation", float(tiler_profile.get("roi_generation_ms", 0.0)) / 1000.0
-        )
-        tiling_gpu_metrics = gpu_runtime.performance_stats()
-        crop_metrics = tiling_gpu_metrics.get("functions", {}).get("vf_crop_u8", {})
-        if tiling_gpu_requested and crop_metrics.get("calls", 0) > 1:
-            self.logger.warning(
-                "CUDA tiling performed %s synchronous crop round trips and estimated %s H2D bytes; "
-                "keep gpu.tiling disabled for performance until source buffers are reusable",
-                crop_metrics["calls"],
-                crop_metrics["host_to_device_bytes"],
+        with profiler.measure("tiling_finalize"):
+            tiler_profile = getattr(tiler, "last_profile_ms", {})
+            profiler.add_duration(
+                "template_match", float(tiler_profile.get("template_match_ms", 0.0)) / 1000.0
             )
-        self.logger.info("Tiles prepared: count=%s mode=%s", len(tiles), tile_config.get("mode", "grid"))
-        self._progress(20, f"Tiles prepared: {len(tiles)}")
+            profiler.add_duration(
+                "roi_generation", float(tiler_profile.get("roi_generation_ms", 0.0)) / 1000.0
+            )
+            tiling_gpu_metrics = gpu_runtime.performance_stats()
+            crop_metrics = tiling_gpu_metrics.get("functions", {}).get("vf_crop_u8", {})
+            if tiling_gpu_requested and crop_metrics.get("calls", 0) > 1:
+                self.logger.warning(
+                    "CUDA tiling performed %s synchronous crop round trips and estimated %s H2D bytes; "
+                    "keep gpu.tiling disabled for performance until source buffers are reusable",
+                    crop_metrics["calls"],
+                    crop_metrics["host_to_device_bytes"],
+                )
+            self.logger.info("Tiles prepared: count=%s mode=%s", len(tiles), tile_config.get("mode", "grid"))
+            self._progress(20, f"Tiles prepared: {len(tiles)}")
 
-        total_work = max(len(tiles) * max(len(detectors), 1), 1)
-        tile_workers = self._tile_worker_count(recipe, detectors, resident_image, len(tiles))
+            total_work = max(len(tiles) * max(len(detectors), 1), 1)
+            tile_workers = self._tile_worker_count(recipe, detectors, resident_image, len(tiles))
         with profiler.measure("detectors_total"):
             if tile_workers > 1:
                 tile_results = self._inspect_tiles_parallel(
@@ -185,67 +186,76 @@ class AOIPipeline(LogMixin):
                     tiles, detectors, profiler, total_work
                 )
 
-        if crossover_policy is not None and resident_image is not None:
-            native_gpu_detectors = [
-                detector for detector in detectors
-                if detector.use_gpu and self.detector_manager.uses_native_cuda_runtime(detector.detector_id)
-            ]
-            if native_gpu_detectors and all(
-                detector.cpu_crossover_covers(crossover_policy) for detector in native_gpu_detectors
-            ):
-                # Every plan chosen here still resolves to CPU for exactly the plans and input shapes
-                # it ran, so later images with the same recipe/shape skip the whole-image H2D upload.
-                # A different tile or image shape has its own calibration key and keeps uploading.
-                crossover_policy.mark_resident_upload_unneeded(resident_skip_key)
-        detector_fallbacks = {
-            detector.detector_id: detector.gpu_fallback_reason
-            for detector in detectors
-            if getattr(detector, "gpu_requested", detector.use_gpu)
-            and detector.gpu_fallback_reason
-        }
-        if detector_fallbacks:
-            self.logger.warning("Detector CUDA fallback: %s", detector_fallbacks)
-        fallback_message = " (CPU fallback)" if (
-            (
-                gpu_requested
-                and (not gpu_runtime.available or gpu_runtime.last_error)
-            )
-            or detector_fallbacks
-        ) else ""
-        self._progress(85, f"Aggregating PASS / NG result{fallback_message}")
+        with profiler.measure("detector_finalize"):
+            if crossover_policy is not None and resident_image is not None:
+                native_gpu_detectors = [
+                    detector for detector in detectors
+                    if detector.use_gpu and self.detector_manager.uses_native_cuda_runtime(detector.detector_id)
+                ]
+                if native_gpu_detectors and all(
+                    detector.cpu_crossover_covers(crossover_policy) for detector in native_gpu_detectors
+                ):
+                    # Every plan chosen here still resolves to CPU for exactly the plans and input shapes
+                    # it ran, so later images with the same recipe/shape skip the whole-image H2D upload.
+                    # A different tile or image shape has its own calibration key and keeps uploading.
+                    crossover_policy.mark_resident_upload_unneeded(resident_skip_key)
+            detector_fallbacks = {
+                detector.detector_id: detector.gpu_fallback_reason
+                for detector in detectors
+                if getattr(detector, "gpu_requested", detector.use_gpu)
+                and detector.gpu_fallback_reason
+            }
+            if detector_fallbacks:
+                self.logger.warning("Detector CUDA fallback: %s", detector_fallbacks)
+            fallback_message = " (CPU fallback)" if (
+                (
+                    gpu_requested
+                    and (not gpu_runtime.available or gpu_runtime.last_error)
+                )
+                or detector_fallbacks
+            ) else ""
+            self._progress(85, f"Aggregating PASS / NG result{fallback_message}")
         with profiler.measure("aggregation"):
             aggregate = Aggregator(recipe["decision"]).aggregate(tile_results)
-        result = InspectionResultAssembler.build(
-            image_path=image_path,
-            started=started,
-            recipe=recipe,
-            provenance=provenance,
-            aggregate=aggregate,
-            tile_results=tile_results,
-            detector_manager=self.detector_manager,
-            detectors=detectors,
-            gpu_runtime=gpu_runtime,
-            gpu_mode=gpu_mode,
-            tiling_gpu_requested=tiling_gpu_requested,
-            tiling_cuda_crop_skipped=tiling_cuda_crop_skipped,
-            display_requested=self.recipe_manager.gpu_feature_requested(gpu_config, "display"),
-            resident_image=resident_image,
-            resident_upload_memory=resident_upload_memory,
-            resident_skipped_by_crossover=resident_skipped_by_crossover and detector_gpu_requested,
-            profiler=profiler,
-        )
+        with profiler.measure("result_assembly"):
+            result = InspectionResultAssembler.build(
+                image_path=image_path,
+                started=started,
+                recipe=recipe,
+                provenance=provenance,
+                aggregate=aggregate,
+                tile_results=tile_results,
+                detector_manager=self.detector_manager,
+                detectors=detectors,
+                gpu_runtime=gpu_runtime,
+                gpu_mode=gpu_mode,
+                tiling_gpu_requested=tiling_gpu_requested,
+                tiling_cuda_crop_skipped=tiling_cuda_crop_skipped,
+                display_requested=self.recipe_manager.gpu_feature_requested(gpu_config, "display"),
+                resident_image=resident_image,
+                resident_upload_memory=resident_upload_memory,
+                resident_skipped_by_crossover=resident_skipped_by_crossover and detector_gpu_requested,
+                profiler=profiler,
+            )
 
-        serializable_result = self._without_runtime_images(result)
+        with profiler.measure("result_sanitization"):
+            serializable_result = self._without_runtime_images(result)
         self._progress(92, "Writing overlay, CSV, and JSON")
         with profiler.measure("reporting_total"):
             outputs = Reporter(self.output_dir, recipe["output"], profiler=profiler).write(image, result)
-        serializable_result["outputs"] = outputs
-        # InspectionResultAssembler runs before report artifacts are written.  The
-        # public duration is end-to-end, so finalize it only after overlay/CSV/JSON
-        # writers have returned instead of exposing the pre-reporting timestamp.
-        serializable_result["duration_sec"] = round(time.perf_counter() - started, 3)
-        serializable_result["execution"]["ai"] = self.detector_manager.ai_performance_stats()
-        serializable_result["execution"]["gpu"]["metrics"] = gpu_runtime.performance_stats()
+        with profiler.measure("finalization"):
+            serializable_result["outputs"] = outputs
+            # InspectionResultAssembler runs before report artifacts are written.  The
+            # public duration is end-to-end, so finalize it only after overlay/CSV/JSON
+            # writers have returned instead of exposing the pre-reporting timestamp.
+            serializable_result["duration_sec"] = round(time.perf_counter() - started, 3)
+            serializable_result["execution"]["ai"] = self.detector_manager.ai_performance_stats()
+            serializable_result["execution"]["gpu"]["metrics"] = gpu_runtime.performance_stats()
+        # The public result no longer references pixel arrays. Release the decoded image and its
+        # tile views here so their refcount/free cost is visible instead of appearing as
+        # unexplained time after ``run()`` returns to the caller.
+        with profiler.measure("memory_release"):
+            del result, aggregate, tile_results, tiles, image
         serializable_result["execution"]["performance"] = profiler.snapshot()
         self.logger.info(
             "Inspection completed: image=%s final=%s defects=%s ng_tiles=%s duration=%.3fs",

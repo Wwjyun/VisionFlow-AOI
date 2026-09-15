@@ -5,6 +5,7 @@ import json
 import os
 import subprocess
 import sys
+from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
@@ -19,18 +20,26 @@ def canonical_sha256(value: Any) -> str:
 
 
 def build_provenance() -> dict[str, Any]:
+    """Return process-stable application provenance without spawning Git per image."""
+    commit, dirty, source = _cached_build_provenance()
+    return {"commit": commit, "dirty": dirty, "source": source}
+
+
+@lru_cache(maxsize=1)
+def _cached_build_provenance() -> tuple[str, bool | None, str]:
+    """Resolve build identity once; a running executable cannot change its own build."""
     env_commit = os.environ.get("VISIONFLOW_BUILD_COMMIT", "").strip()
     if env_commit:
-        return {"commit": env_commit, "dirty": _env_bool("VISIONFLOW_BUILD_DIRTY"), "source": "environment"}
+        return env_commit, _env_bool("VISIONFLOW_BUILD_DIRTY"), "environment"
     packaged = _read_packaged_provenance()
     if packaged is not None:
-        return packaged
+        return str(packaged["commit"]), bool(packaged["dirty"]), str(packaged["source"])
     try:
         commit = _git("rev-parse", "HEAD")
         dirty = bool(_git("status", "--porcelain", "--untracked-files=no"))
-        return {"commit": commit, "dirty": dirty, "source": "git"}
+        return commit, dirty, "git"
     except (OSError, subprocess.SubprocessError):
-        return {"commit": "unknown", "dirty": None, "source": "unavailable"}
+        return "unknown", None, "unavailable"
 
 
 def inspection_provenance(recipe_path: Path, effective_recipe: dict[str, Any]) -> dict[str, Any]:

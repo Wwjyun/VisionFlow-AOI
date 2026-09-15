@@ -9,6 +9,7 @@ from tools.benchmark_pipeline_production import (
     PRODUCTION_GAP_X,
     PRODUCTION_ROI,
     PRODUCTION_ROI_ORIGINS,
+    _profiler_coverage,
     _recipe,
     _timing_summary,
 )
@@ -68,6 +69,29 @@ class ProductionBenchmarkContractTests(unittest.TestCase):
         self.assertEqual(summary["median_ms"], 3.0)
         self.assertEqual(summary["p95_ms"], 5.0)
         self.assertEqual(summary["count"], 5)
+
+    def test_profiler_coverage_does_not_double_count_nested_stages(self):
+        result = {
+            "execution": {
+                "performance": {
+                    "end_to_end_sec": 0.100,
+                    "stages_sec": {
+                        "image_load": 0.030,
+                        "tiling": 0.020,
+                        "template_match": 0.019,
+                        "roi_generation": 0.001,
+                        "detectors_total": 0.040,
+                        "python_tile_detector_loop": 0.005,
+                    },
+                }
+            }
+        }
+
+        coverage = _profiler_coverage(result, 112.0)
+
+        self.assertAlmostEqual(coverage["named_stage_ms"], 90.0)
+        self.assertAlmostEqual(coverage["internal_unprofiled_ms"], 10.0)
+        self.assertAlmostEqual(coverage["return_overhead_ms"], 12.0)
 
 
 if __name__ == "__main__":

@@ -579,13 +579,63 @@ BMP 的「解碼」本質上只是列翻轉，OpenCV 卻逐列串流處理而佔
 | Recipe 設定 | 94.3 ms | 97.8 ms | 108.8／120.8 ms | 0.87× |
 | Tiling 合計 | 74.6 ms | 2.5 ms | 2.6／8.1 ms | 28.42× |
 
-3/3 輪判定欄位完全相同。GPU 三輪為 647.4、521.7、680.6 ms。GPU 端到端 647 ms 中，各階段合計約 526 ms：
-解碼 203 ms（31%）、整圖上傳 114 ms（18%）、Recipe 設定 109 ms（17%）、Detector 97 ms（15%）；另有約
-121 ms 不在任何 profiler 階段內（結果組裝、metrics 快照與序列化等），是下一輪值得先量清楚的部分。
+3/3 輪判定欄位完全相同。這一版表格當時把不同 repetition 的各 stage median 相加，得到約 121 ms 的「未歸類」時間；這個算法不成立，因為各 stage median 不一定來自同一輪，而且 `template_match`／`roi_generation` 已包含在 `tiling`，`python_tile_detector_loop` 也包含在 `detectors_total`。後續已用逐輪 exclusive stage coverage 重算，詳見下一節。
 JSON：`outputs_validation/decode_profile/production_bmp_reader.json`、`image_load_bmp.json`。
 
 **v1.6.1 → 目前 `main` 的 GPU 端到端**：1957.5 ms → CCL＋ring 上 GPU 1467.7 ms → ring 平行化 1111.2 ms →
 BMP 讀取器 **647.4 ms**（-67%）。
+
+
+### 2026-09-15 profiler 缺口校正與 provenance 快取
+
+這輪先量測 BMP 版留下的「約 121 ms 未歸類時間」，沒有直接猜測要優化的程式。`AOIPipeline` 新增
+`tiling_finalize`、`detector_finalize`、`result_assembly`、`result_sanitization`、`finalization` 與
+`memory_release`；production benchmark 改為逐次 run 計算 exclusive stages，再分成 pipeline 內部未命名時間與
+函式回傳／logging 時間。大型 decoded image、tile view 與 aggregate 持有的 view 會在 profiler snapshot 前明確釋放，
+因此 NumPy refcount／free 成本現在歸在 `memory_release`，不會落到函式外。
+
+校正結果：
+
+- provenance 快取前的 3 輪，CPU／GPU 內部未命名時間 median 分別只有 **1.587／1.508 ms**，不是 121 ms。
+- 加入完整釋放歸因後的正式尺寸 3 輪，CPU／GPU 內部未命名時間為 **1.078／1.050 ms**，函式回傳與 logging
+  差距為 **0.783／0.865 ms**。結果組裝 0.24 ms、序列化清理 0.01 ms、finalization 0.04 ms，都不是瓶頸。
+- 釋放 639 MB decoded image 與六個 ROI view 本身要花時間；最終 3 輪 `memory_release` median 為
+  CPU **47.85 ms**、GPU **27.46 ms**。這是已命名的記憶體生命週期成本。
+
+真正可移除的固定成本是 `inspection_provenance`：每張圖都執行 `git rev-parse HEAD` 與
+`git status --porcelain --untracked-files=no` 兩個子程序。單獨量測第一呼叫 **121.536 ms**，同 process 後續呼叫
+原本仍重複付費。現在 build commit／dirty／source 依 process 快取一次，每次仍回傳獨立 dict，避免 caller 修改快取；
+warm median 降到 **0.157 ms**，完整 pipeline 的 `recipe_setup` 由 BMP 版 **108.8 ms** 降到 **0.78 ms**。
+GUI、batch、monitor 與 benchmark warm-up 後都受益；一次性 CLI 的第一張仍會支付一次 Git 查詢。process 啟動後的
+working-tree dirty 狀態視為該次載入程式的 provenance，不會在同一 process 內重新掃描。
+
+**最終正式尺寸結果**（RTX 3090；16384×13000 BMP；六個高 12000、寬 2000 ROI；warm-up 1＋量測 3 輪）：
+
+| 階段 | CPU median／P95 | GPU median／P95 | CPU/GPU 倍數 |
+|---|---:|---:|---:|
+| **端到端** | 5372.4／5401.0 ms | **494.5／573.5 ms** | **10.86×** |
+| 讀檔與 BMP 解碼 | 191.9／208.0 ms | 164.0／171.1 ms | 1.17× |
+| 初始化（含整圖一次 H2D） | 0.09／0.13 ms | 196.4／196.6 ms | — |
+| Tiling | 65.36／68.73 ms | 12.99／15.29 ms | 5.03× |
+| Detector | 5066.65／5121.59 ms | 85.26／165.91 ms | 59.43× |
+| Recipe setup | 0.76／1.42 ms | 0.78／1.19 ms | 0.98× |
+| Memory release | 47.85／52.15 ms | 27.46／27.62 ms | 1.74× |
+| Reporting | 1.17／1.54 ms | 1.15／1.18 ms | 1.02× |
+| 內部未命名時間 | 1.078 ms | 1.050 ms | — |
+| 函式回傳／logging 差距 | 0.783 ms | 0.865 ms | — |
+
+GPU 每張圖只有一次 638,976,000-byte 原圖 H2D；六次 `vf_cnr_candidates_u8_roi` 與一次 anchor match 合計 D2H
+**22,340 bytes**，共 8 次 native calls。runtime 回報 anchor localization、ROI、preprocess、automatic CNR mask、
+candidate extraction、geometry/statistics 在 device；最終 PASS/NG aggregation 與 reporting 在 CPU。
+
+三輪的 PASS/NG、tile／defect 數量、type、bbox、area、confidence 與其餘 decision metadata 全部相同。
+只有六個 `anchor_score` 因 backend 浮點計算有漂移，最大絕對差 **6.557e-7**，不影響判定。相較 BMP 讀取器完成時的
+647.4 ms，本輪為 494.5 ms，快 **1.31×（-23.6%）**；相較 v1.6.1 的 1957.5 ms，現行 GPU mode 快 **3.96×**。
+
+證據：`outputs_validation/decode_profile/production_gap_profile.json`、
+`production_provenance_cached.json`、`production_release_probe.json`、
+`production_provenance_release_final.json`。這輪沒有修改 `.cu`、CUDA header 或 ABI，因此不需要重編 DLL；量測使用
+前一輪已為 RTX 3090／`sm_86` 重編並驗證的 DLL。
 
 ## 檔案
 
