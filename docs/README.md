@@ -12,8 +12,8 @@ Release notes 位於 [`release-notes/`](release-notes/)，檔名同時標示產�
 
 目前版本：
 
-- [`visionflow-aoi-v1.6.1.md`](release-notes/visionflow-aoi-v1.6.1.md)
 - [`visionflow-aoi-v1.6.2.md`](release-notes/visionflow-aoi-v1.6.2.md)
+- [`visionflow-aoi-v1.6.1.md`](release-notes/visionflow-aoi-v1.6.1.md)
 - [`visionflow-aoi-v1.6.0.md`](release-notes/visionflow-aoi-v1.6.0.md)
 - [`visionflow-aoi-v1.5.1.md`](release-notes/visionflow-aoi-v1.5.1.md)
 - [`visionflow-aoi-v1.5.0.md`](release-notes/visionflow-aoi-v1.5.0.md)
