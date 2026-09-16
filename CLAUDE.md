@@ -30,6 +30,8 @@ Project skills live in `.claude/skills/` and are Claude Code copies of the Git-t
 | `aoi-release` | Packaging, version bump, tag, GitHub Release |
 | `aoi-weekly-report` | Thursday–Wednesday weekly report (no application validation) |
 
+`archify` (`.claude/skills/archify/`) is the exception to the mirroring rule above: it is vendored third-party tooling (MIT, `tt-a1i/archify`) used to render the `架構圖/` diagram set, and it has **no** `codex-skills/` counterpart. Do not mirror or reformat it; update it by re-vendoring upstream. Render through `node .claude/skills/archify/bin/archify.mjs`, pass `--repo-root .` whenever a spec declares `sources` evidence, and finish with `validate` → `deliver` → `visual-check` at `--quality showcase`. Diagram outputs stay untracked under `架構圖/` per `ARTIFACTS.md`.
+
 ## Delegating coding to the `aoi-coder` subagent
 
 `.claude/agents/aoi-coder.md` defines a coding subagent for well-scoped implementation work.
