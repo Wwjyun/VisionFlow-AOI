@@ -691,9 +691,10 @@ Worker 預設為 `min(8, CPU 核數, 影像數)`；可用 `AOI_BATCH_WORKERS` �
 
 ### CCD 控制
 
-CCD 控制頁移植自線掃相機擷取程式（C# `CameraCaptureApp`，Teledyne DALSA Sapera LT＋JS Automation LSI-8181），目前完成 GUI 與無硬體模擬，**尚未連接真實相機或米輪**：
+CCD 控制頁移植自線掃相機擷取程式（C# `CameraCaptureApp`，Teledyne DALSA Sapera LT＋JS Automation LSI-8181），目前完成 GUI、無硬體模擬與 LSI-8181 米輪 ctypes 綁定；**Sapera 相機尚未連接，米輪綁定尚未在實際卡片上驗證**：
 
-- 預設 backend 顯示「不可用」與原因，主程式其他功能不受影響。要在沒有硬體的電腦試用畫面，啟動前設定 `VISIONFLOW_CCD_SIMULATOR=1`，改用模擬相機與模擬米輪。
+- 相機 backend 目前顯示「不可用」與原因，主程式其他功能不受影響。要在沒有硬體的電腦試用畫面，啟動前設定 `VISIONFLOW_CCD_SIMULATOR=1`，改用模擬相機與模擬米輪。
+- 米輪透過 `LSI8181_64.dll` 控制（需 64 位元 Python 與 JS Automation 驅動，DLL 不隨程式打包）。載入順序：環境變數 `VISIONFLOW_LSI8181_DLL` 指定的路徑（找不到即視為不可用，不再搜尋）→ 程式所在資料夾（打包後為 EXE 資料夾）→ Windows 系統 DLL 搜尋路徑。載入失敗或缺少必要函式時，CCD 控制會顯示原因。連線流程與原程式相同：初始化、讀卡片資訊、quadrature／倍頻、反向（只切 A 相極性位元）、Compare 自動遞增、CMP OUT 脈衝輸出與啟用、CMP0–CMP7、以 Compare 模式啟動計數；任一步驟失敗會停止計數並關閉卡片。
 - Engineer 可連線／斷線、開始預覽、停止、擷取、保留影像、設定存圖格式與資料夾、連線米輪；Admin 另可修改 Sapera 位置、曝光、增益、影像長度、內部線速率、觸發模式、米輪參數與 CMP0–CMP7。未明確開放給 Engineer 的控制一律只給 Admin。
 - 相機設定按「套用相機設定」後保存，**於下次連線時寫入相機**；已連線時畫面會標示「待重新連線寫入」。這沿用原程式的流程，因為 Sapera 建立取像物件後部分參數會鎖定。
 - 保留影像會以背景佇列寫入完整解析度影像，格式為 BMP（檢測交接用）、PNG、TIF 或 TIF（不壓縮）；先寫 `.tmp` 再更名，預設資料夾為 `outputs\ccd_snapshots`。存圖未完成時無法關閉程式。

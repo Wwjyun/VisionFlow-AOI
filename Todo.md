@@ -691,7 +691,7 @@ vs 原本 `[255,255,20,20]`）。因此「標籤編號順序」對 202 的最終
 
 - [x] 新增頂層 `devices/`（`ccd_models.py` typed value objects、`interfaces.py`、`simulated.py`、`factory.py`、`ccd_settings_store.py`、`frame_writer.py`），GUI 放 `gui/screens/ccd_screen.py` 與 `gui/ccd_controller.py`（相機是常駐 session 而非單次 worker，因此不放 `workflow_controllers.py`）；GUI 不直接呼叫 Sapera 或 ctypes。`AGENT.md` 模組職責與 `README.md` 已同步。（2026-09-17）
 - [x] 定義 backend-neutral `LineScanCamera`／`MeterWheel` 介面與 `SimulatedLineScanCamera`／`SimulatedMeterWheel`，`MainWindow` 可注入 devices 與設定檔 store，無硬體電腦與 CI 可測；未設定 `VISIONFLOW_CCD_SIMULATOR=1` 時預設為「不可用」backend 並顯示原因。（2026-09-17）
-- [ ] LSI-8181 以 ctypes 包裝 `LSI8181_64.dll`，函式與型別對照 `Native/Lsi8181Native.cs`（byte／ushort／short／int／uint 與 ref 參數），非 0 回傳碼轉成具名例外；反向計數讀寫 CIO polarity，只切 A 相 bit 0 並保留其他 bit；DLL 與驅動不提交、不假設存在。實作 `MeterWheel` 介面後由 `devices/factory.py` 選用。
+- [x] LSI-8181 以 ctypes 包裝 `LSI8181_64.dll`（`devices/lsi8181.py`，2026-09-17）：23 個使用中的 export 與型別對照 `Native/Lsi8181Native.cs`（byte／ushort／short／int／uint 與指標輸出），不包裝 `LSI8181_CO_read`；非 0 回傳碼與 Windows 例外轉成含動作與狀態碼的 `Lsi8181Error`；呼叫前檢查 card／int32／int16／uint16 範圍；反向計數讀寫 CIO polarity，只切 A 相 bit 0；連線順序與 `Lsi8181MeterWheelService.Open` 相同，但任一步失敗會停止計數並關閉卡片（原 C# 會留在已初始化狀態）；所有 native 呼叫以鎖序列化。DLL 與驅動不提交；`devices/factory.py` 預設選用此綁定，DLL 載入失敗只讓米輪不可用。驗證：ctypes callback 假卡 16 項測試，並在本機以 MSVC 編出同名 stub DLL 經 `WinDLL` 實際載入確認 export、int32 極值、uint16 40000、極性位元與 CMP0–7 往返（stub 未提交）。**實際卡片驗證仍待相機機台。**
 - [ ] Lifecycle 明確：`close()`／context manager；每個 Sapera 物件個別 guarded destroy／dispose 並記 log，清理失敗不得傳到 UI thread；關閉主程式一定斷線。不使用持有相機、影像或設定的 mutable module global。（GUI 層已完成：`CcdController.close()` 停止輪詢、預覽 thread 與存圖佇列並關閉 devices，存圖未完成時阻止關窗；Sapera 物件清理待綁定實作。）
 - [x] 相機與米輪 session 由 `MainWindow` composition root 擁有的 `CcdController` 管理，不由頁面擁有；切換頁面不斷線，只有斷線按鈕或關閉主程式才釋放。（2026-09-17）
 - [ ] 偵測 Sapera runtime 與 managed DLL 版本不符（開發機 9.12、現場 8.6 曾出現 `FileLoadException`），以繁中 inline notice 顯示「Sapera runtime 版本不符」與兩個版本號，不得當成「沒有擷取卡」。
@@ -752,7 +752,8 @@ vs 原本 `[255,255,20,20]`）。因此「標籤編號順序」對 202 的最終
 
 - [ ] 自動測試（fake backend，無硬體）：設定 round trip 與預設值、載入不觸發寫入、Trigger 互斥矩陣、Software Trigger 狀態機、忙碌／Stop 語意、自動存圖不重複、滾動合成順序、`.tmp` 存檔、波形吸附與取樣、缺 Sapera／缺 DLL 時主程式可啟動且 CCD 頁顯示不可用、OP／工程／管理可見性、GUI offscreen smoke。（`tests/test_ccd_devices.py`、`tests/test_ccd_gui.py` 已涵蓋設定 round trip／損毀檔、載入不寫入、Trigger 16 種組合、忙碌／Stop、`.tmp` 與四格式無損、存圖佇列上限、米輪保存與寫入、不可用後端、權限可見性、鍵盤、監控來源與關窗；待補：Software Trigger 監控、自動存圖、滾動、波形。）
 - [ ] 打包：Sapera runtime、`LSI8181_64.dll` 與驅動由現場安裝、不打包；若採 pythonnet 則打包其 runtime。packaged `--smoke-test` 增加「無相機環境 CPU 檢測正常、CCD 顯示不可用」；README 補 Sapera 版本對齊的部署說明。
-- [ ] 實機驗收（在相機機台執行，未實測不得勾選）：連線／斷線重複；Exposure、Gain、Length、Internal Line Rate 讀回與畫面效果；Continuous 沒有 Sapera 警告視窗；External Trigger 一個脈衝一條線、湊滿 Length 才顯示；One Frame；Software Trigger 監控與擷取中 Stop；米輪自動連線、重開後設定保留、示波器確認 CMP_OUT 脈寬與 CMP0–7；16384×50000 各格式存圖時間；連續取像＋存圖＋檢測長時間穩定、記憶體平台與 GUI 回應。
+- [ ] 相機機台有 `LSI8181_64.dll` 時，建立預設 `MainWindow` 的 unit tests 可能在事件迴圈中觸發米輪自動連線並寫入已存設定；評估測試環境預設以 `VISIONFLOW_LSI8181_DLL` 指向不存在路徑隔離硬體。
+- [ ] 實機驗收（在相機機台執行，未實測不得勾選）：連線／斷線重複；Exposure、Gain、Length、Internal Line Rate 讀回與畫面效果；Continuous 沒有 Sapera 警告視窗；External Trigger 一個脈衝一條線、湊滿 Length 才顯示；One Frame；Software Trigger 監控與擷取中 Stop；米輪自動連線、重開後設定保留、Encoder 正反向計數與倍頻、Compare 自動遞增、錯誤卡片 ID 的狀態碼訊息、示波器確認 CMP_OUT 脈寬與 CMP0–7；16384×50000 各格式存圖時間；連續取像＋存圖＋檢測長時間穩定、記憶體平台與 GUI 回應。
 
 ### 暫不移植
 
@@ -899,6 +900,8 @@ vs 原本 `[255,255,20,20]`）。因此「標籤編號順序」對 202 的最終
 - [ ] 加速不得犧牲 GUI 回應、打包啟動、結果追溯、錯誤訊息或 CPU fallback。
 
 ## 完成紀錄
+
+- [x] 2026-09-17：**P11 LSI-8181 米輪 ctypes 綁定。** 新增 `devices/lsi8181.py`：`Lsi8181Library` 為 `LSI8181_64.dll` 的 23 個使用中 export 設定 argtypes／restype（對照 `xx_ccd` `Native/Lsi8181Native.cs`），載入順序為 `VISIONFLOW_LSI8181_DLL`（指定但不存在即不可用）→ 程式所在資料夾 → 系統 DLL 搜尋，並拒絕 32 位元 Python 與缺少 export 的 DLL；`Lsi8181MeterWheel` 實作 `MeterWheel`，連線順序與 `Lsi8181MeterWheelService.Open` 相同（initial、info、quadrature＋1 µs debounce＋倍頻碼 X4=0／X2=1／X1=2、只切 A 相極性位元、Compare 自動遞增、CMP OUT 脈衝輸出＋toggle preset、CMP0–7 與 mask、Compare 模式啟動計數），但中途失敗會停止計數並關閉卡片；非 0 狀態碼與 Windows 例外轉為含繁中動作與狀態碼的 `Lsi8181Error`，呼叫前檢查數值寬度，native 呼叫以 RLock 序列化，DLL 載入失敗只快取一次。`devices/factory.py` 預設改用此綁定（相機仍為不可用），`VISIONFLOW_CCD_SIMULATOR=1` 仍使用模擬器。新增 `tests/test_lsi8181_binding.py`（16 項，以 `WINFUNCTYPE` callback 假卡經真實 ctypes 轉換驗證呼叫順序、數值、極性位元、int32 極值、CMP0–7 往返、錯誤釋放、範圍檢查、多執行緒與 CCD 畫面整合）；另於本機以 MSVC 編譯同名 stub DLL 經 `WinDLL` 實際載入驗證（stub 未提交）。未連接實際 LSI-8181 卡片。
 
 - [x] 2026-09-17：**P11 產品層相機參數存入 Recipe `camera` 區段。** 新增 `devices/ccd_recipe.py`（`camera` 區段 codec：曝光、增益、影像長度、內部線速率、`trigger` 模式與三個選項、選用 `auto_save`），`RecipeManager.validate` 對此區段嚴格驗證並回報具體欄位；`CameraRecipeSettings` 成為產品層值物件，`SaveSettings` 移除自動存圖旗標（舊機台設定檔多出的欄位會被忽略）。`DesignerRecipeMapper` 只在有相機設定時寫出 `camera`；Recipe 設計新增「相機 CCD」區塊（包含開關、數值、觸發規則與自動存圖），參與 dirty tracking，僅管理模式可編輯，未修改時原樣回傳以免 NumStepper 顯示精度改寫數值（例如 1234.56）。`MainWindow` 載入 Recipe 時把 `camera` 套用到 `CcdController`，沒有此區段的舊 Recipe 保留目前參數，已連線且不同時提示需重連；CCD 控制「套用相機設定」只保存 Sapera 位置到機台設定檔，產品層參數同步為 Recipe 設計未儲存變更（未載入 Recipe 時提示只用於本次執行），CCD 頁顯示參數來源與是否已儲存，也不會把未編輯的數值四捨五入。五份追蹤中的 Recipe 均無 `camera` 區段且載入不變。新增 `tests/test_ccd_recipe.py`（11）並更新既有 CCD 測試；本機無相機，未做硬體驗證。
 

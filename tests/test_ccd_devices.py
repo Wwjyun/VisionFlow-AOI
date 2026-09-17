@@ -33,6 +33,7 @@ from devices.factory import (
     UnavailableMeterWheel,
     create_ccd_devices,
 )
+from devices.lsi8181 import DLL_PATH_ENV, Lsi8181MeterWheel
 from devices.frame_writer import SnapshotSaveQueue, write_frame_atomic
 from devices.simulated import SimulatedLineScanCamera, SimulatedMeterWheel
 
@@ -267,9 +268,12 @@ class SimulatedDeviceTests(unittest.TestCase):
 
 class FactoryTests(unittest.TestCase):
     def test_default_devices_are_unavailable_with_operator_reasons(self):
-        devices = create_ccd_devices({})
+        with tempfile.TemporaryDirectory() as directory:
+            devices = create_ccd_devices({DLL_PATH_ENV: str(Path(directory) / "LSI8181_64.dll")})
         self.assertIsInstance(devices.camera, UnavailableLineScanCamera)
-        self.assertIsInstance(devices.meter_wheel, UnavailableMeterWheel)
+        self.assertIsInstance(devices.meter_wheel, Lsi8181MeterWheel)
+        self.assertFalse(devices.meter_wheel.availability().available)
+        self.assertIn(SIMULATOR_ENV, devices.meter_wheel.availability().reason)
         self.assertFalse(devices.camera.availability().available)
         self.assertIn(SIMULATOR_ENV, devices.camera.availability().reason)
         with self.assertRaises(DeviceError):
@@ -284,6 +288,15 @@ class FactoryTests(unittest.TestCase):
         self.assertIsInstance(devices.camera, SimulatedLineScanCamera)
         self.assertIsInstance(devices.meter_wheel, SimulatedMeterWheel)
         devices.close()
+
+    def test_unavailable_meter_wheel_placeholder_rejects_every_operation(self):
+        meter_wheel = UnavailableMeterWheel("沒有驅動")
+        self.assertEqual(meter_wheel.availability().reason, "沒有驅動")
+        with self.assertRaises(DeviceError):
+            meter_wheel.connect(MeterWheelSettings())
+        with self.assertRaises(DeviceError):
+            meter_wheel.read_encoder()
+        self.assertFalse(meter_wheel.is_connected)
 
 
 if __name__ == "__main__":

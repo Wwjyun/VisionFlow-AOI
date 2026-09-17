@@ -18,6 +18,7 @@ from devices.ccd_models import (
     TriggerSettings,
 )
 from devices.interfaces import FrameListener, LineScanCamera, MeterWheel
+from devices.lsi8181 import Lsi8181Library, Lsi8181MeterWheel
 from devices.simulated import SimulatedLineScanCamera, SimulatedMeterWheel
 
 SIMULATOR_ENV = "VISIONFLOW_CCD_SIMULATOR"
@@ -25,10 +26,6 @@ SIMULATOR_ENV = "VISIONFLOW_CCD_SIMULATOR"
 CAMERA_BINDING_PENDING_REASON = (
     "Sapera LT 相機綁定尚未實作（P11 pythonnet spike 待相機機台執行）；"
     f"可設定環境變數 {SIMULATOR_ENV}=1 使用模擬相機。"
-)
-METER_WHEEL_BINDING_PENDING_REASON = (
-    "LSI-8181 米輪綁定尚未實作；"
-    f"可設定環境變數 {SIMULATOR_ENV}=1 使用模擬米輪。"
 )
 
 
@@ -141,7 +138,8 @@ def create_ccd_devices(environ: Mapping[str, str] | None = None) -> CcdDevices:
     env = os.environ if environ is None else environ
     if str(env.get(SIMULATOR_ENV, "")).strip().lower() in {"1", "true", "yes", "on"}:
         return CcdDevices(SimulatedLineScanCamera(), SimulatedMeterWheel(auto_advance_per_read=25))
+    # The LSI-8181 DLL is loaded lazily; a missing driver only makes the meter wheel unavailable.
     return CcdDevices(
         UnavailableLineScanCamera(CAMERA_BINDING_PENDING_REASON),
-        UnavailableMeterWheel(METER_WHEEL_BINDING_PENDING_REASON),
+        Lsi8181MeterWheel(loader=lambda: Lsi8181Library.load(environ=env)),
     )
