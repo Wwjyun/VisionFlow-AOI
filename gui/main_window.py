@@ -26,6 +26,7 @@ from PySide6.QtWidgets import (
 from core.camera_monitor_processor import CameraFrameQueue
 from core.logging_system import LogMixin, configure_logging
 from core.gpu_session import GpuExecutionSession, GpuExecutionSessionCache
+from gui.performance_summary import VRAM_LOW_NOTICE
 from core.recipe_manager import RecipeError, RecipeManager
 from devices.ccd_models import CAMERA_STATE_LABELS, TRIGGER_MODE_LABELS, CameraRecipeSettings, CameraStatus
 from devices.ccd_recipe import camera_settings_from_recipe
@@ -117,11 +118,15 @@ def _backend_status_from_result(result: dict | None) -> dict:
         ),
         "",
     )
+    memory = (gpu_execution.get("resident_image", {}) or {}).get("device_memory_before_upload", {}) or {}
     return {
         "requested": requested,
         "active": active,
         "device_name": active_device or str(tiling_status.get("device_name") or "CUDA"),
         "fallback_reason": next((reason for reason in reasons if reason), ""),
+        "vram_low": bool(memory.get("dedicated_vram_low", False)),
+        "vram_free_bytes": int(memory.get("free_bytes", 0) or 0),
+        "vram_total_bytes": int(memory.get("total_bytes", 0) or 0),
     }
 
 
@@ -1201,6 +1206,8 @@ class MainWindow(QMainWindow, LogMixin):
         self.run_screen.op_panel.set_history(self.history)
 
         self.statusBar().showMessage(f"檢測完成：{final}{backend_text}")
+        if backend_status.get("vram_low"):
+            self._notice(f"效能提醒：{VRAM_LOW_NOTICE}", "warning")
 
     def _on_inspection_failed(self, message: str) -> None:
         self._notice(f"檢測失敗：{message}", "error")

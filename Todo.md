@@ -605,7 +605,7 @@ vs 原本 `[255,255,20,20]`）。因此「標籤編號順序」對 202 的最終
 
 ### GUI 後續優化（2026-09-15 v1.6.0 發行後盤點）
 
-- [ ] **檢測效能分析面板**：GUI 目前只在 viewer tooltip 顯示預覽的 QImage／QPixmap 時間，`execution.performance` 的各階段耗時、Detector 子階段、`device_host_split`、H2D／D2H bytes 與 native call 數都沒有呈現。在 Results（或 Run 側欄摺疊區）新增唯讀面板，資料一律取自本次執行結果 metadata，不得由 Recipe 推論；hybrid 步驟與 fallback 原因以文字標示。需測試 CPU-only、CUDA、fallback 三種結果的顯示。
+- [x] **檢測效能分析面板**（2026-09-17 完成，見完成紀錄）：GUI 目前只在 viewer tooltip 顯示預覽的 QImage／QPixmap 時間，`execution.performance` 的各階段耗時、Detector 子階段、`device_host_split`、H2D／D2H bytes 與 native call 數都沒有呈現。在 Results（或 Run 側欄摺疊區）新增唯讀面板，資料一律取自本次執行結果 metadata，不得由 Recipe 推論；hybrid 步驟與 fallback 原因以文字標示。需測試 CPU-only、CUDA、fallback 三種結果的顯示。
 - [x] **執行進度訊息繁中化**（2026-09-17 完成，見完成紀錄）：`core/pipeline.py` 的 `Starting inspection`、`Recipe loaded`、`Tiles prepared`、`Inspecting tile n/m`、`Writing overlay, CSV, and JSON` 等英文訊息直接顯示在 Run 面板，違反操作文字繁中契約。改為繁中（保留 ROI、NG 等縮寫），並補 GUI 訊息測試；log 可維持英文。
 - [ ] **大圖預覽記憶體與 LOD**：`ImagePreviewWorker` 對 16384×13000 影像會建立全解析 RGB `QImage.copy()`（約 639 MB），`set_qimage` 再轉成全尺寸 `QPixmap`，同一張圖在 GUI 行程內至少佔兩份大型記憶體。改為依 viewport 顯示降採樣金字塔或分塊，放大後才載入原解析度區塊；overlay 座標、縮放與游標座標仍以原圖像素為準。需量測記憶體峰值與顯示時間前後對照。
 - [x] **預覽與檢測重複解碼**（2026-09-17 完成：預覽與檢測共用不划算，改為 session 緩衝重用同一檔案的解碼結果，見完成紀錄）：預覽與 `InspectionWorker` 各自解碼同一檔案，正式尺寸 `image_load` 約 768 ms（GPU 模式端到端的 38%）。評估以路徑＋mtime＋size 為 key 的單份解碼快取（設記憶體上限、檔案變更即失效、回傳唯讀或獨立副本），不得違反 GPU 模式「解碼後只上傳一次」邊界；以量測決定是否採用。
@@ -619,7 +619,7 @@ vs 原本 `[255,255,20,20]`）。因此「標籤編號順序」對 202 的最終
 - [x] **批量模式預先建立 CUDA context**（2026-09-17）：盤點確認 DLL 載入與 CUDA context 在 `GpuRuntime` 建構時完成，批量的 session 本來就在執行緒池與每張 `duration_sec` 計時開始前建立。本次補上開始前的 `gpu.mode` 檢查與紀錄：`GpuExecutionSession.warm_up_before_run()` 由批量（不帶樣本、不試跑）與監控（帶樣本）共用；strict CUDA 不可用時批量在第一張前直接失敗，不再每張各產生一筆 ERROR；`auto` 記錄原因後照常逐張處理；摘要新增 `gpu_warmup`（含 `session_ms`、context 狀態），進度文字顯示 context／fallback 狀態。第一張仍需配置的裝置記憶體不預先試跑，實際影響待下方 RTX 3090 量測。
 - [x] **GPU 模式選擇重新設計**（2026-09-15 使用者回報表達不明確）：Designer 原本以「Auto／CPU only／CUDA required」下拉加「失敗回退 CPU」開關表達，四種組合只有三種行為（`auto`＋關閉回退等同 `cuda`），且 CPU 模式下 GPU 進階開關仍可操作。改為「僅 CPU」「GPU 優先，失敗改用 CPU」「僅 GPU（嚴格）」三個含行為說明的選項；舊 Recipe `auto`＋關閉回退顯示為嚴格並標示，未變更時原值保存、不產生 dirty；CPU 時停用進階設定；狀態列顯示 CUDA 可用性、啟用 GPU 的 Detector 數，以及「切小圖使用 GPU」無效組合警示。
 - [x] **v1.6.0 在另一台電腦「同參數同一張實際照片 GPU 比 CPU 慢約 1 秒」已確認原因**（2026-09-15 使用者回報；同日使用者確認：當時 Detector 的 GPU 開關未開啟，開啟後耗時降為原本約 1/3。v1.6.1 已修正此組合下逐張重傳整圖的切圖變慢，並在 Designer 狀態列警示）。原始調查紀錄：需取得該電腦 `outputs\logs\aoi.log` 對應檢測的 `Inspection performance`／`CUDA host metrics`、GPU 型號與 Recipe `gpu` 區段及各 Detector `use_gpu`。已在 RTX 3090 重現一個量級吻合的 GUI 可觸發原因（GPU mode＋切小圖使用 GPU＋Detector GPU 關 → 每張 tile 重傳整張原圖，切圖 85 → 872 ms），`main` 已修正；其他候選：非 `sm_86` 相容 GPU、冷啟動第一張、預覽使用 GPU。
-- [ ] **VRAM 與整圖上傳狀態**：runtime 已回報 `resident_image.device_memory_before_upload`（可用 VRAM、上傳大小、`dedicated_vram_low`）與 crossover 略過上傳，但 GUI 未顯示。於 TopBar backend chip tooltip 或效能面板顯示，VRAM 不足時以 inline notice 提示，狀態不得只依賴顏色。
+- [x] **VRAM 與整圖上傳狀態**（2026-09-17 完成，見完成紀錄）：runtime 已回報 `resident_image.device_memory_before_upload`（可用 VRAM、上傳大小、`dedicated_vram_low`）與 crossover 略過上傳，但 GUI 未顯示。於 TopBar backend chip tooltip 或效能面板顯示，VRAM 不足時以 inline notice 提示，狀態不得只依賴顏色。
 - [ ] **CPU／GPU 對照執行（工程／管理模式）**：同一張影像、同一份 Recipe 各跑一次 CPU 與 GPU，顯示判定欄位（PASS/NG、defect 數、bbox、area、confidence、metadata）是否一致與各階段倍數，比較邏輯沿用 `tools/benchmark_pipeline_production.py`，不修改 Recipe、不產生 dirty 狀態；OP 模式不可見。
 
 ## P7：CI、GitHub Actions 與發布
@@ -903,6 +903,8 @@ vs 原本 `[255,255,20,20]`）。因此「標籤編號順序」對 202 的最終
 - [ ] 加速不得犧牲 GUI 回應、打包啟動、結果追溯、錯誤訊息或 CPU fallback。
 
 ## 完成紀錄
+
+- [x] 2026-09-17：**Results 效能分析面板與 VRAM／整圖上傳狀態。** 新增 `gui/performance_summary.py`，只讀本次檢測結果的 `execution`（不讀 Recipe）整理出：實際後端與 fallback 原因（沿用 detector／tiling status，`active` 才顯示 CUDA）、總耗時與各階段（讀圖、初始化／整圖上傳、切圖、Detector、彙總、報表輸出、釋放記憶體）、Detector 子階段、`device_host_split` 各步驟的 GPU／CPU（列在 `hybrid_steps` 的步驟標示「GPU（部分 CPU）」）、整圖上傳狀態（已上傳大小／crossover 略過／未上傳）、主機→GPU 與 GPU→主機 bytes、原生呼叫次數、上傳前可用／總顯示卡記憶體與是否不足、主機影像緩衝（重用／新配置、pinned／pageable、略過讀檔），以及各 Detector fallback 原因。`ResultsScreen` 右側新增唯讀「效能分析」面板，與其他 Results 內容一起延遲填入；預設收合、內容放在高度上限 320 px 的捲動區，不擠壓 NG 切圖縮圖，展開狀態在切換結果時保留；CPU-only 結果不顯示傳輸區。TopBar 後端 chip tooltip 加上整圖上傳前可用顯示卡記憶體；`dedicated_vram_low` 時 tooltip 與面板以文字「注意」說明，檢測完成時另以 warning inline notice 提示（狀態不只靠顏色）。以 RTX 3090 正式尺寸真實 GPU 結果 offscreen 截圖確認版面（`outputs_validation/perf_panel/results_screen.png`）。新增 `tests/test_performance_panel.py`（CUDA／CPU-only／fallback 三種結果的摘要內容與面板顯示、預設收合與展開保留、VRAM 不足與 crossover 略過文字、TopBar tooltip、MainWindow inline notice）。完整 608 tests、compileall、CUDA preflight、`git diff --check`、GUI offscreen smoke 通過。
 
 - [x] 2026-09-17：**執行進度訊息繁中化。** `core/pipeline.py` 送到 GUI Run 面板、監控與批量進度的訊息改為繁中：「開始檢測」「Recipe 已載入」「影像已載入」「Detector 已初始化」「切圖完成：n 個 Tile」「檢測 Tile i/n（Detector ID）」「準備 Tile i/n」「彙總 PASS／NG 判定（CPU fallback）」「正在寫出 overlay、CSV 與 JSON」「檢測完成」；`core/batch_processor.py` 的「Batch c/t: finished 檔名」改為「批量 c/t：已完成 檔名」。log 訊息維持英文。新增 `tests/test_progress_messages.py`，以真實 CPU 單張檢測與批量收集全部進度訊息，逐則要求含中文字，且排除 Detector ID 與影像檔名後只允許 PASS、NG、CPU、CUDA、GPU、ROI、DLL、Tile、Detector、Recipe、overlay、CSV、JSON、fallback、worker 等既有縮寫與專有名詞。完整 604 tests、compileall、CUDA preflight、CLI 合成圖 smoke 通過。
 
