@@ -901,6 +901,8 @@ vs 原本 `[255,255,20,20]`）。因此「標籤編號順序」對 202 的最終
 
 ## 完成紀錄
 
+- [x] 2026-09-17：重整根目錄 `README.md` 為專案入口文件；將快速開始、操作入口、架構、Recipe、切圖／Detector、GUI 權限、CCD 實際完成度、輸出、CUDA、獨立工具、打包驗證與文件導覽重新分層，刪除首頁內過度細碎且容易過期的 Detector 公式與歷代 GPU 實驗敘述，改連結至 `gpu/README.md`、`tools/README.md`、`docs/` 與 `Todo.md`。同步更正 Sapera LT 相機 binding 仍待實作與相機機台驗證的狀態，保留 v1.6.2 已有 RTX 3090 數據但明確限制其適用範圍；未修改 runtime、Recipe、CUDA source／header／ABI／DLL。
+
 - [x] 2026-09-17：**P11 相機直連監控的檢測後端。** 採記憶體交接：`core/image_loader.py` 新增 `frame_to_bgr`（灰階 frame 轉三通道，與 8-bit BMP 解碼逐像素相同，永遠回傳可寫入的新陣列）；`AOIPipeline.run_frame` 以虛擬影像名稱檢測 frame，檔案路徑 `run()` 與其結果 schema 不變，frame 結果加上 `source` metadata 並寫入 JSON，`compact_inspection_result` 保留 `source`。新增 `core/camera_monitor_processor.py`：`CameraFrameQueue`（有界、執行緒安全、記錄未能排入的 frame 名稱而不保留像素）與 `CameraMonitorProcessor`（共用 GPU session 與預熱、依序檢測、輸出與資料夾監控相同格式的項目與 CSV 彙總、停止時完成佇列中的 frame、未檢測 frame 以 ERROR 回報）；`gui/workers.py` 新增 `CameraMonitorWorker`。`CcdController` 新增 `camera_monitor_blocker`、`attach_inspection_queue`／`detach_inspection_queue`，只在外部觸發或軟體觸發連線時把 frame 與序號、擷取時間、觸發模式、尺寸交給佇列。`MainWindow` 移除「尚未實作」阻擋：相機直連依相機狀態顯示可否啟動、啟動時建立佇列與 worker、停止時立即停止交接，相機項目的「開啟原始影像」改為說明需使用自動存圖。新增 `tests/test_camera_monitor.py`（8 項：BMP 逐像素等價、`run_frame` 與檔案檢測判定等價且含實際缺陷、佇列上限與關閉、處理順序／未檢測回報／停止排空、worker 失敗、只交接觸發 frame、MainWindow 端到端），更新監控來源測試。大 frame 記憶體與實機壓測仍待相機機台。
 
 - [x] 2026-09-17：依使用者決定，P11 的滾動式拍照與灰階波形從待辦移到「暫不移植」並寫明理由：兩者都是 `xx_ccd` 的顯示／調光輔助功能，不影響檢測；跨 frame 缺陷若日後出現，改列為檢測流程的 frame 拼接需求；灰階需求改建議簡化為預覽游標灰階值與飽和像素比例。自動測試項目同步移除滾動與波形。僅文件變更。
