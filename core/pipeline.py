@@ -10,6 +10,7 @@ from typing import Callable
 from core.aggregator import Aggregator
 from core.detector_manager import DetectorManager
 from core.image_loader import frame_to_bgr, load_image
+from core.gpu_metrics import performance_stats_delta
 from core.gpu_runtime import GpuRuntime, GpuRuntimeError
 from core.gpu_session import GpuExecutionSession
 from core.logging_system import LogMixin
@@ -95,6 +96,7 @@ class AOIPipeline(LogMixin):
             detector_gpu_allowed = prepared.detector_gpu_allowed
             gpu_requested = prepared.gpu_requested
             gpu_runtime = prepared.gpu_runtime
+            gpu_metrics_baseline = gpu_runtime.performance_stats()
         if gpu_requested and not gpu_runtime.available and not gpu_runtime.fallback_to_cpu:
             raise GpuRuntimeError(gpu_runtime.unavailable_reason)
         if gpu_requested and gpu_runtime.available:
@@ -261,6 +263,7 @@ class AOIPipeline(LogMixin):
                 resident_image=resident_image,
                 resident_upload_memory=resident_upload_memory,
                 resident_skipped_by_crossover=resident_skipped_by_crossover and detector_gpu_requested,
+                gpu_metrics_baseline=gpu_metrics_baseline,
                 profiler=profiler,
             )
             if source is not None:
@@ -278,7 +281,11 @@ class AOIPipeline(LogMixin):
             # writers have returned instead of exposing the pre-reporting timestamp.
             serializable_result["duration_sec"] = round(time.perf_counter() - started, 3)
             serializable_result["execution"]["ai"] = self.detector_manager.ai_performance_stats()
-            serializable_result["execution"]["gpu"]["metrics"] = gpu_runtime.performance_stats()
+            cumulative_gpu_metrics = gpu_runtime.performance_stats()
+            serializable_result["execution"]["gpu"]["metrics"] = performance_stats_delta(
+                cumulative_gpu_metrics, gpu_metrics_baseline
+            )
+            serializable_result["execution"]["gpu"]["metrics_cumulative"] = cumulative_gpu_metrics
         # The public result no longer references pixel arrays. Release the decoded image and its
         # tile views here so their refcount/free cost is visible instead of appearing as
         # unexplained time after ``run()`` returns to the caller.

@@ -10,6 +10,7 @@ from __future__ import annotations
 import unittest
 from pathlib import Path
 
+from core.gpu_metrics import performance_stats_delta
 from core.pipeline_stages import InspectionResultAssembler
 
 
@@ -103,6 +104,67 @@ class DeviceHostSplitTests(unittest.TestCase):
         # A step with no device export in this run stays host work.
         self.assertEqual(split["geometry_and_statistics"], "cpu")
         self.assertEqual(split["pass_ng_decision"], "cpu")
+
+    def test_second_run_does_not_reuse_first_run_export_counts(self):
+        runtime = _CountingRuntime({"vf_median_f32": 12})
+        baseline = runtime.performance_stats()
+
+        split = InspectionResultAssembler._device_host_split(
+            gpu_runtime=runtime,
+            detectors=[_Detector(routes={"cpu": 1})],
+            resident_image=object(),
+            tiling_gpu_requested=False,
+            gpu_metrics_baseline=baseline,
+        )
+
+        self.assertEqual(split["candidate_extraction"], "cpu")
+        self.assertEqual(split["hybrid_steps"], {})
+
+    def test_current_run_metrics_are_deltas_and_cumulative_metrics_are_preserved(self):
+        from core.performance import PipelineProfiler
+
+        class _Manager:
+            @staticmethod
+            def ai_performance_stats():
+                return {}
+
+        runtime = _CountingRuntime({"vf_median_f32": 12})
+        baseline = runtime.performance_stats()
+        runtime._functions["vf_median_f32"]["calls"] = 15
+        result = InspectionResultAssembler.build(
+            image_path=Path("input.png"), started=0.0,
+            recipe={"recipe_name": "r", "machine_id": "m", "product_id": "p", "version": "1"},
+            provenance={}, aggregate={"final_result": "PASS", "summary": {}},
+            tile_results=[], detector_manager=_Manager(), detectors=[_Detector()],
+            gpu_runtime=runtime, gpu_mode="auto", tiling_gpu_requested=False,
+            display_requested=False, resident_image=None, profiler=PipelineProfiler(),
+            gpu_metrics_baseline=baseline,
+        )["execution"]["gpu"]
+
+        self.assertEqual(result["metrics"]["functions"]["vf_median_f32"]["calls"], 3)
+        self.assertEqual(result["metrics_cumulative"]["functions"]["vf_median_f32"]["calls"], 15)
+        self.assertEqual(result["metrics"]["measurement_period"], "current_pipeline_run")
+
+    def test_metrics_delta_covers_transfers_timings_and_drops_stale_native_timing(self):
+        baseline = {
+            "load_sec": 0.25, "call_count": 4, "estimated_round_trips": 4,
+            "host_to_device_bytes": 100, "device_to_host_bytes": 40,
+            "wall_sec": 0.5, "lock_wait_sec": 0.1, "kernel_launch_count": 8,
+            "native_cumulative_ms": {"kernel_ms": 3.0},
+            "native_timings_ms": {"kernel_ms": 1.0},
+            "functions": {"vf_median_f32": {
+                "calls": 4, "host_to_device_bytes": 100, "device_to_host_bytes": 40,
+                "wall_sec": 0.5, "lock_wait_sec": 0.1,
+            }},
+        }
+        current = {**baseline, "native_timings_ms": {"kernel_ms": 99.0}}
+
+        no_calls = performance_stats_delta(current, baseline)
+
+        self.assertEqual(no_calls["load_sec"], 0.0)
+        self.assertEqual(no_calls["call_count"], 0)
+        self.assertEqual(no_calls["functions"], {})
+        self.assertIsNone(no_calls["native_timings_ms"])
 
     def test_unknown_or_zero_counts_never_imply_device_work(self):
         for functions in ({}, {"vf_median_f32": 0}, {"vf_upload_unrelated_export": 5}):

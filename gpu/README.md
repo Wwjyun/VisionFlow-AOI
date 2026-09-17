@@ -377,6 +377,12 @@ v1.6.0 發行檔仍有此問題；判斷 v1.6.0 的 anchor 位置請以 `gpu_met
   tiler、strict 失敗、回退不污染 `last_error`、搜尋區灰階等價；`tests/test_device_host_split.py` 補
   「只有 resident 上傳不得回報 device anchor」。
 
+自 2026-09-17 起，共用 session 的觀測也改為逐張計算：Pipeline 在影像 GPU 操作前保存
+`performance_stats()` 基線，`execution.gpu.metrics` 是本輪差值，`metrics_cumulative` 才是整個 session
+累計值。`device_host_split` 的 CNR／候選／統計階段只依本輪 `functions` 差值判定，因此預熱或前一張
+影像曾呼叫 CUDA export，不會讓本輪純 CPU 路徑誤報為 device；本輪零 CUDA 呼叫時也不沿用上一輪的
+`native_timings_ms`。
+
 RTX 3090、同一正式尺寸基準（16384×13000、6 ROI、`202-CS-SN-1`，warm-up 1＋量測 3 輪）：
 
 | 階段 | v1.6.0 CPU | 修正後 CPU | v1.6.0 GPU | 修正後 GPU |

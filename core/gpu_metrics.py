@@ -1,6 +1,87 @@
 from __future__ import annotations
 
 
+_CUMULATIVE_FIELDS = (
+    "load_sec",
+    "call_count",
+    "estimated_round_trips",
+    "host_to_device_bytes",
+    "device_to_host_bytes",
+    "wall_sec",
+    "lock_wait_sec",
+    "kernel_launch_count",
+)
+
+_FUNCTION_CUMULATIVE_FIELDS = (
+    "calls",
+    "host_to_device_bytes",
+    "device_to_host_bytes",
+    "wall_sec",
+    "lock_wait_sec",
+)
+
+
+def _nonnegative_difference(current, baseline, *, integer: bool = False):
+    value = max(0, current - baseline)
+    return int(value) if integer else round(float(value), 6)
+
+
+def performance_stats_delta(current: dict, baseline: dict | None) -> dict:
+    """Return metrics produced after ``baseline`` while preserving current runtime gauges.
+
+    Runtime statistics are session-cumulative. Pipeline results need a per-run view so a call
+    made by a warm-up or earlier image cannot make a later CPU route look like device work.
+    """
+    if not isinstance(current, dict):
+        return {}
+    before = baseline if isinstance(baseline, dict) else {}
+    delta = {
+        key: value
+        for key, value in current.items()
+        if key not in {*_CUMULATIVE_FIELDS, "native_cumulative_ms", "functions"}
+    }
+    for key in _CUMULATIVE_FIELDS:
+        integer = key not in {"load_sec", "wall_sec", "lock_wait_sec"}
+        delta[key] = _nonnegative_difference(
+            current.get(key, 0) or 0,
+            before.get(key, 0) or 0,
+            integer=integer,
+        )
+
+    current_native = current.get("native_cumulative_ms") or {}
+    before_native = before.get("native_cumulative_ms") or {}
+    delta["native_cumulative_ms"] = {}
+    for name, value in current_native.items():
+        difference = _nonnegative_difference(value or 0, before_native.get(name, 0) or 0)
+        if difference > 0:
+            delta["native_cumulative_ms"][str(name)] = difference
+
+    current_functions = current.get("functions") or {}
+    before_functions = before.get("functions") or {}
+    functions = {}
+    for name, entry in current_functions.items():
+        if not isinstance(entry, dict):
+            continue
+        previous = before_functions.get(name) or {}
+        item = {}
+        for key in _FUNCTION_CUMULATIVE_FIELDS:
+            integer = key not in {"wall_sec", "lock_wait_sec"}
+            item[key] = _nonnegative_difference(
+                entry.get(key, 0) or 0,
+                previous.get(key, 0) or 0,
+                integer=integer,
+            )
+        if any(item.values()):
+            functions[str(name)] = item
+    delta["functions"] = functions
+    if delta["call_count"] == 0:
+        # The native DLL exposes only its most recent operation. Do not attach a prior image's
+        # timing payload to a run that issued no CUDA call.
+        delta["native_timings_ms"] = None
+    delta["measurement_period"] = "current_pipeline_run"
+    return delta
+
+
 class GpuPerformanceRecorder:
     def __init__(self) -> None:
         self.values = {

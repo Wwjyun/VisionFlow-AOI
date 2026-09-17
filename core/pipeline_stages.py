@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from core.preprocess_cache import TilePreprocessCache
+from core.gpu_metrics import performance_stats_delta
 from core.provenance import inspection_provenance
 from core.recipe_builder import RecipeTemplatePathSync
 from core.result_mapper import map_tile_result_to_global
@@ -143,13 +144,13 @@ class InspectionResultAssembler:
     }
 
     @staticmethod
-    def _device_call_counts(gpu_runtime) -> dict:
+    def _device_call_counts(gpu_runtime, gpu_metrics_baseline: dict | None = None) -> dict:
         """Return the per-export call counts of this run, or ``{}`` when unavailable."""
         stats = getattr(gpu_runtime, "performance_stats", None)
         if not callable(stats):
             return {}
         try:
-            snapshot = stats()
+            snapshot = performance_stats_delta(stats(), gpu_metrics_baseline)
         except Exception:  # a runtime that cannot report must not break result assembly
             return {}
         if not isinstance(snapshot, dict):
@@ -187,6 +188,7 @@ class InspectionResultAssembler:
         resident_image,
         tiling_gpu_requested: bool,
         anchor_on_device: bool = False,
+        gpu_metrics_baseline: dict | None = None,
     ) -> dict:
         """Report which pipeline steps ran on the device and which stayed on the host.
 
@@ -207,7 +209,9 @@ class InspectionResultAssembler:
             and not getattr(detector, "cpu_crossover_only", False)
             for detector in native_detectors
         )
-        call_counts = InspectionResultAssembler._device_call_counts(gpu_runtime)
+        call_counts = InspectionResultAssembler._device_call_counts(
+            gpu_runtime, gpu_metrics_baseline
+        )
         step_sides = {}
         step_exports = {}
         for step, exports in InspectionResultAssembler._DEVICE_STAGE_EXPORTS.items():
@@ -272,7 +276,12 @@ class InspectionResultAssembler:
         resident_upload_memory: dict | None = None,
         resident_skipped_by_crossover: bool = False,
         tiling_cuda_crop_skipped: bool = False,
+        gpu_metrics_baseline: dict | None = None,
     ) -> dict:
+        cumulative_gpu_metrics = gpu_runtime.performance_stats()
+        run_gpu_metrics = performance_stats_delta(
+            cumulative_gpu_metrics, gpu_metrics_baseline
+        )
         tiling_status = gpu_runtime.status(tiling_gpu_requested and not tiling_cuda_crop_skipped)
         if tiling_cuda_crop_skipped:
             tiling_status["requested"] = True
@@ -319,6 +328,7 @@ class InspectionResultAssembler:
                             ) == "cuda_dll"
                             for tile_result in tile_results
                         ),
+                        gpu_metrics_baseline=gpu_metrics_baseline,
                     ),
                     "detectors": {
                         detector.detector_id: InspectionResultAssembler._detector_gpu_status(
@@ -326,7 +336,8 @@ class InspectionResultAssembler:
                         )
                         for detector in detectors
                     },
-                    "metrics": gpu_runtime.performance_stats(),
+                    "metrics": run_gpu_metrics,
+                    "metrics_cumulative": cumulative_gpu_metrics,
                 },
                 "performance": profiler.snapshot(),
             },
