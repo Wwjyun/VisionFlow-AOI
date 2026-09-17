@@ -730,6 +730,12 @@ RSS 768.2→771.5 MiB、VRAM 2919 MiB 維持平台，pool 1 次配置／99 次�
 證據：`outputs_validation/host_image_buffer_ab/`（`ab_off_vs_pageable.json`、`ab_off_vs_pageable_vs_auto.json`、
 `production_final.json`、`stability_100.json`）。
 
+後續同日加入**同檔解碼重用**：pool 記住 backing 目前持有的檔案身分（解析後路徑、大小、`st_mtime_ns`、檔案 ID），
+同一未變更檔案再檢測時略過讀檔，仍照常整圖上傳一次；pool 交出的影像為唯讀，避免任何步驟就地修改快取像素。
+不輸出檔案時同檔再檢測 median 223.7→142.0 ms（讀圖 80.96→0.26 ms），開啟全部輸出與 debug images 時
+202／401 各 6 次結果相同且與 CPU 判定欄位一致；GUI 自動背景預熱後第一次檢測 266～270→182～186 ms。
+證據：`outputs_validation/decode_reuse/`。
+
 ### 2026-09-17 GUI／批量／監控共用 GPU session
 
 `GpuExecutionSessionCache` 原本以 Recipe 路徑＋mtime＋size 為 key，Designer 存任何 Detector 參數都會重建

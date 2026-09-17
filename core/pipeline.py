@@ -136,11 +136,17 @@ class AOIPipeline(LogMixin):
         )
         with profiler.measure("image_load"):
             if frame is None:
-                image = load_image(
-                    image_path,
-                    preserve_bmp_file_order=preserve_bmp_file_order,
-                    backing_provider=host_image_lease if preserve_bmp_file_order else None,
-                )
+                pooled = preserve_bmp_file_order and host_image_lease is not None
+                # An unchanged file whose pixels are still in the session backing is not read again.
+                image = host_image_lease.cached_image(image_path) if pooled else None
+                if image is None:
+                    image = load_image(
+                        image_path,
+                        preserve_bmp_file_order=preserve_bmp_file_order,
+                        backing_provider=host_image_lease if preserve_bmp_file_order else None,
+                    )
+                    if pooled:
+                        image = host_image_lease.adopt(image_path, image)
             else:
                 image = frame_to_bgr(frame)
         self.logger.info("Image loaded: image=%s shape=%s", image_path, getattr(image, "shape", None))

@@ -4,6 +4,8 @@ import os
 import sys
 import threading
 
+from pathlib import Path
+
 import numpy as np
 
 from core.logging_system import LogMixin
@@ -22,6 +24,11 @@ class HostImageBufferPool(LogMixin):
     returns ``None`` and the reader allocates a fresh array as before. A backing is reused only
     when nothing but the pool still references it: if a view of the previous image survived its
     run, the backing is detached (and unpinned) instead of being overwritten under that view.
+
+    The backing also remembers which file it holds. Inspecting the same unchanged file again (same
+    resolved path, size, modification time and file ID) reuses the decoded pixels instead of reading
+    them, which is the GUI re-inspection and warm-up-then-inspect case. Pooled images are handed to
+    the pipeline read-only, so no step can alter the cached pixels in place.
 
     ``AOI_HOST_IMAGE_BUFFER`` selects ``auto`` (reuse, pin when the CUDA DLL exports host
     registration), ``pageable`` (reuse, never pin) or ``off`` (always allocate).
@@ -47,9 +54,12 @@ class HostImageBufferPool(LogMixin):
         self._leased = False
         self._closed = False
         self._last_lease: dict = {}
+        self._source: tuple | None = None
+        self._source_layout: tuple[int, int, bool] | None = None
         self.allocation_count = 0
         self.reuse_count = 0
         self.detached_count = 0
+        self.decode_skipped_count = 0
 
     @property
     def enabled(self) -> bool:
@@ -62,6 +72,9 @@ class HostImageBufferPool(LogMixin):
             if not self.enabled or self._leased or shape[0] <= 0 or shape[1] <= 0:
                 return None
             reused = self._buffer is not None and self._buffer.shape == shape
+            # The reader is about to overwrite the backing, so it no longer holds any known file.
+            self._source = None
+            self._source_layout = None
             if reused:
                 self.reuse_count += 1
             else:
@@ -72,8 +85,42 @@ class HostImageBufferPool(LogMixin):
                 if self.mode == "auto":
                     self._pinned = self._pin_locked(self._buffer)
             self._leased = True
-            self._last_lease = {"reused": reused, "pinned": self._pinned, "nbytes": int(self._buffer.nbytes)}
+            self._last_lease = {
+                "reused": reused, "pinned": self._pinned, "nbytes": int(self._buffer.nbytes),
+                "decode_skipped": False,
+            }
             return self._buffer
+
+    def acquire_cached(self, source: tuple) -> tuple[np.ndarray, tuple[int, int, bool]] | None:
+        """Lease the backing without reading when it still holds exactly ``source``."""
+        with self._lock:
+            if (
+                not self.enabled or self._leased or self._buffer is None
+                or source is None or self._source != source or self._source_layout is None
+            ):
+                return None
+            self._leased = True
+            self.reuse_count += 1
+            self.decode_skipped_count += 1
+            self._last_lease = {
+                "reused": True, "pinned": self._pinned, "nbytes": int(self._buffer.nbytes),
+                "decode_skipped": True,
+            }
+            return self._buffer, self._source_layout
+
+    def record_source(self, source: tuple, image: np.ndarray) -> bool:
+        """Remember that the leased backing now holds ``source``; False when ``image`` is not pooled."""
+        with self._lock:
+            buffer = self._buffer
+            if (
+                not self._leased or buffer is None
+                or image.ndim != 3 or image.shape[2] != 3 or not np.may_share_memory(image, buffer)
+            ):
+                return False
+            if source is not None:
+                self._source = source
+                self._source_layout = (int(image.shape[0]), int(image.shape[1]), int(image.strides[0]) < 0)
+            return True
 
     def lease(self) -> "HostImageLease":
         """Per-run handle: pass it as the reader's backing provider and close it after the run."""
@@ -124,6 +171,8 @@ class HostImageBufferPool(LogMixin):
         buffer = self._buffer
         self._buffer = None
         self._baseline_refs = 0
+        self._source = None
+        self._source_layout = None
         if buffer is not None and self._pinned:
             try:
                 self._runtime.unregister_host_buffer(buffer)
@@ -143,7 +192,45 @@ class HostImageLease:
     def __init__(self, pool: HostImageBufferPool):
         self._pool = pool
         self._active = False
+        self._pending_source: tuple | None = None
         self.details: dict = {}
+
+    @staticmethod
+    def source_identity(path) -> tuple | None:
+        """File identity used to reuse decoded pixels: resolved path, size, mtime and file ID."""
+        try:
+            resolved = Path(path).resolve()
+            stat = resolved.stat()
+        except OSError:
+            return None
+        return (str(resolved), int(stat.st_size), int(stat.st_mtime_ns), int(stat.st_ino))
+
+    def cached_image(self, path) -> np.ndarray | None:
+        """Return the still-decoded pixels of an unchanged ``path`` read-only, or ``None`` to read it."""
+        if self._active:
+            return None
+        self._pending_source = self.source_identity(path)
+        hit = self._pool.acquire_cached(self._pending_source)
+        if hit is None:
+            return None
+        self._active = True
+        self.details = self._pool.last_lease()
+        rows, width, bottom_up = hit[1]
+        pixels = hit[0][:, : width * 3].reshape(rows, width, 3)
+        image = pixels[::-1] if bottom_up else pixels
+        image.flags.writeable = False
+        return image
+
+    def adopt(self, path, image: np.ndarray) -> np.ndarray:
+        """After a read, make a pooled image read-only and remember its file if it did not change."""
+        if not self._active or image is None:
+            return image
+        source = self._pending_source
+        if source is not None and self.source_identity(path) != source:
+            source = None  # the file changed while it was read; never reuse these pixels
+        if self._pool.record_source(source, image):
+            image.flags.writeable = False
+        return image
 
     def __call__(self, shape: tuple[int, int]) -> np.ndarray | None:
         if self._active:

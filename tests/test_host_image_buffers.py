@@ -52,7 +52,7 @@ class HostImageBufferPoolTests(unittest.TestCase):
             with pool.lease() as concurrent:
                 self.assertIsNone(concurrent((4, 12)), "a second concurrent lease must allocate normally")
             del backing
-        self.assertEqual(first.details, {"reused": False, "pinned": False, "nbytes": 48})
+        self.assertEqual(first.details, {"reused": False, "pinned": False, "nbytes": 48, "decode_skipped": False})
         with pool.lease() as second:
             self.assertEqual(second((4, 12)).ctypes.data, address)
         self.assertEqual(second.details["reused"], True)
@@ -171,6 +171,83 @@ class BmpReaderBackingProviderTests(unittest.TestCase):
             provider.assert_not_called()
 
 
+class DecodedImageReuseTests(unittest.TestCase):
+    def _read(self, pool, path):
+        with pool.lease() as lease:
+            image = lease.cached_image(path)
+            skipped = image is not None
+            if image is None:
+                image = BmpReader(max_workers=1).read(path, preserve_file_order=True, backing_provider=lease)
+                image = lease.adopt(path, image)
+            copy = np.array(image, copy=True)
+            writeable = bool(image.flags.writeable)
+            del image
+        return copy, skipped, writeable
+
+    def test_unchanged_file_reuses_read_only_pixels_and_any_change_reads_again(self):
+        rng = np.random.default_rng(610)
+        pool = HostImageBufferPool(mode="pageable")
+        with tempfile.TemporaryDirectory() as directory:
+            first_path = Path(directory) / "first.bmp"
+            other_path = Path(directory) / "other.bmp"
+            first = rng.integers(0, 256, size=(21, 11, 3), dtype=np.uint8)
+            _write_bmp(first_path, first)
+            _write_bmp(other_path, rng.integers(0, 256, size=(21, 11, 3), dtype=np.uint8))
+
+            pixels, skipped, writeable = self._read(pool, first_path)
+            np.testing.assert_array_equal(pixels, first)
+            self.assertEqual((skipped, writeable), (False, False), "pooled images are read-only")
+            pixels, skipped, writeable = self._read(pool, first_path)
+            np.testing.assert_array_equal(pixels, first)
+            self.assertEqual((skipped, writeable), (True, False))
+
+            # Same size, new content: the file identity changes, so the pixels are read again.
+            changed = rng.integers(0, 256, size=(21, 11, 3), dtype=np.uint8)
+            _write_bmp(first_path, changed)
+            pixels, skipped, _ = self._read(pool, first_path)
+            np.testing.assert_array_equal(pixels, changed)
+            self.assertFalse(skipped)
+
+            # Reading another file overwrites the backing, so the first file is no longer cached.
+            self._read(pool, other_path)
+            pixels, skipped, _ = self._read(pool, first_path)
+            np.testing.assert_array_equal(pixels, changed)
+            self.assertFalse(skipped)
+
+            # A file that changes while it is read is never remembered.
+            with patch(
+                "core.host_image_buffers.HostImageLease.source_identity",
+                side_effect=[("before",), ("after",)],
+            ):
+                self._read(pool, other_path)
+            pixels, skipped, _ = self._read(pool, other_path)
+            self.assertFalse(skipped)
+        self.assertEqual(pool.decode_skipped_count, 1)
+        self.assertEqual(pool.detached_count, 0)
+
+    def test_detached_or_closed_backing_forgets_the_cached_file(self):
+        image = np.arange(9 * 7 * 3, dtype=np.uint8).reshape(9, 7, 3)
+        pool = HostImageBufferPool(mode="pageable")
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "image.bmp"
+            _write_bmp(path, image)
+            with pool.lease() as lease:
+                decoded = BmpReader(max_workers=1).read(path, preserve_file_order=True, backing_provider=lease)
+                leaked = lease.adopt(path, decoded)
+                del decoded
+            self.assertEqual(pool.detached_count, 1)
+            with pool.lease() as lease:
+                self.assertIsNone(lease.cached_image(path), "a detached backing holds no reusable file")
+            np.testing.assert_array_equal(leaked, image)
+            with self.assertRaises(ValueError):
+                leaked[0, 0, 0] = 1
+
+            _pixels, _skipped, _ = self._read(pool, path)
+            pool.close()
+            with pool.lease() as lease:
+                self.assertIsNone(lease.cached_image(path))
+
+
 class GpuRuntimeHostRegisterTests(unittest.TestCase):
     def _runtime(self, with_exports: bool):
         runtime = GpuRuntime(enabled=False)
@@ -251,11 +328,26 @@ class PipelineHostImageBufferTests(unittest.TestCase):
                 reports.append(pipeline.run(image_path))
                 np.testing.assert_array_equal(dll.resident, image, err_msg=f"image {index} upload")
 
+            # Inspecting the last image again skips its decode and still uploads identical pixels.
+            dll.resident = None
+            pipeline = AOIPipeline(recipe_path, root, output_overrides=overrides, gpu_session=session)
+            pipeline.recipe_manager.load = Mock(return_value=recipe)
+            pipeline.detector_manager.create_enabled = Mock(
+                return_value=[Detector401(params=params, use_gpu=True, gpu_runtime=runtime)]
+            )
+            reports.append(pipeline.run(image_path))
+            # Decision equality needs real kernels; the fake DLL's masks and crossover routing differ per run.
+            np.testing.assert_array_equal(dll.resident, image, err_msg="re-inspection upload")
+
         buffers = [report["execution"]["gpu"]["resident_image"]["host_buffer"] for report in reports]
+        self.assertEqual([item["decode_skipped"] for item in buffers], [False, False, False, True])
+        reports = reports[:3]
+        buffers = buffers[:3]
         self.assertEqual([item["reused"] for item in buffers], [False, True, True])
         self.assertTrue(all(item["pinned"] for item in buffers))
         pool = session.host_image_buffers
-        self.assertEqual((pool.allocation_count, pool.reuse_count, pool.detached_count), (1, 2, 0))
+        self.assertEqual((pool.allocation_count, pool.reuse_count, pool.detached_count), (1, 3, 0))
+        self.assertEqual(pool.decode_skipped_count, 1)
         self.assertEqual(len(dll.registered), 1)
         session.close()
         self.assertEqual(len(dll.unregistered), 1, "closing the session unpins before the runtime closes")
