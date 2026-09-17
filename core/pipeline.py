@@ -31,13 +31,17 @@ class AOIPipeline(LogMixin):
         progress_callback: Callable[[int, str], None] | None = None,
         output_overrides: dict | None = None,
         gpu_session: GpuExecutionSession | None = None,
+        gpu_mode_override: str | None = None,
     ):
+        if gpu_mode_override not in (None, "cpu"):
+            raise ValueError("gpu_mode_override only supports 'cpu'")
         self.recipe_path = Path(recipe_path)
         self.output_dir = Path(output_dir)
         self.debug = debug
         self.progress_callback = progress_callback
         self.output_overrides = output_overrides
         self.gpu_session = gpu_session
+        self.gpu_mode_override = gpu_mode_override
         self.recipe_manager = RecipeManager()
         self.detector_manager = DetectorManager(
             ai_session_manager=(
@@ -97,6 +101,7 @@ class AOIPipeline(LogMixin):
                 self.detector_manager,
                 self._build_gpu_runtime,
                 self.output_overrides,
+                gpu_mode_override=self.gpu_mode_override,
             ).prepare(self.recipe_path)
             recipe = prepared.recipe
             provenance = prepared.provenance

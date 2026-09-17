@@ -9,6 +9,7 @@ from PySide6.QtGui import QImage
 import cv2
 import numpy as np
 
+from core.backend_comparison import BackendComparison
 from core.batch_processor import BatchInspectionProcessor
 from core.camera_monitor_processor import CameraFrameQueue, CameraMonitorProcessor
 from core.csv_summary import CsvSummaryExporter
@@ -164,6 +165,45 @@ class GpuWarmupWorker(QObject, LogMixin):
             self.failed.emit(str(exc))
             return
         self.logger.info("GPU warm-up completed: %s", summary)
+        self.finished.emit(summary)
+
+
+class BackendComparisonWorker(QObject, LogMixin):
+    """Run the CPU/GPU comparison off the UI thread on the shared GUI GPU session."""
+
+    finished = Signal(dict)
+    failed = Signal(str)
+    progress = Signal(int, str)
+
+    def __init__(
+        self,
+        image_path: Path,
+        recipe_path: Path,
+        output_dir: Path,
+        gpu_session_cache: GpuExecutionSessionCache | None = None,
+    ):
+        super().__init__()
+        self.image_path = Path(image_path)
+        self.recipe_path = Path(recipe_path)
+        self.output_dir = Path(output_dir)
+        self.gpu_session_cache = gpu_session_cache
+
+    @Slot()
+    def run(self) -> None:
+        try:
+            self.logger.info("CPU/GPU comparison started: image=%s recipe=%s", self.image_path, self.recipe_path)
+            with _shared_session(self.gpu_session_cache, self.recipe_path) as gpu_session:
+                summary = BackendComparison().run(
+                    self.recipe_path,
+                    self.image_path,
+                    self.output_dir,
+                    gpu_session=gpu_session,
+                    progress_callback=self.progress.emit,
+                )
+        except Exception as exc:
+            self.logger.exception("CPU/GPU comparison failed: image=%s recipe=%s", self.image_path, self.recipe_path)
+            self.failed.emit(str(exc))
+            return
         self.finished.emit(summary)
 
 

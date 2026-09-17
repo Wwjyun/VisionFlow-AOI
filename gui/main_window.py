@@ -26,6 +26,7 @@ from PySide6.QtWidgets import (
 from core.camera_monitor_processor import CameraFrameQueue
 from core.logging_system import LogMixin, configure_logging
 from core.gpu_session import GpuExecutionSession, GpuExecutionSessionCache
+from gui.backend_comparison_dialog import BackendComparisonDialog, comparison_headline
 from gui.performance_summary import VRAM_LOW_NOTICE
 from core.recipe_manager import RecipeError, RecipeManager
 from devices.ccd_models import CAMERA_STATE_LABELS, TRIGGER_MODE_LABELS, CameraRecipeSettings, CameraStatus
@@ -54,12 +55,14 @@ from gui.widgets.topbar import TopBar
 from gui.workflow_controllers import (
     BatchWorkflowController,
     GpuWarmupWorkflowController,
+    BackendComparisonWorkflowController,
     InspectionWorkflowController,
     MonitorWorkflowController,
     PreviewWorkflowController,
     TilePreviewWorkflowController,
 )
 from gui.workers import (
+    BackendComparisonWorker,
     BatchInspectionWorker,
     CameraMonitorWorker,
     FolderMonitorWorker,
@@ -229,6 +232,9 @@ class MainWindow(QMainWindow, LogMixin):
         self._tile_preview_controller = TilePreviewWorkflowController(self)
         self._warmup_controller = GpuWarmupWorkflowController(self)
         self.warming_up = False
+        self._comparison_controller = BackendComparisonWorkflowController(self)
+        self.comparing_backends = False
+        self._comparison_dialog = None
         # Background warm-up after a CUDA recipe and an image are loaded. It does not lock the UI:
         # runs that start meanwhile wait for the shared session instead of racing it.
         self.auto_warming_up = False
@@ -482,6 +488,7 @@ class MainWindow(QMainWindow, LogMixin):
 
         self.run_screen.start_requested.connect(self._run_inspection)
         self.run_screen.warmup_requested.connect(self._run_gpu_warmup)
+        self.run_screen.compare_requested.connect(self._run_backend_comparison)
         self.run_screen.open_recipe_requested.connect(self._choose_recipe)
         self.run_screen.view_results_requested.connect(lambda: self._set_screen("results"))
         self.run_screen.image_viewer.defect_clicked.connect(self._on_defect_selected)
@@ -1114,6 +1121,7 @@ class MainWindow(QMainWindow, LogMixin):
         ready = has_image and has_recipe
         self.run_screen.run_control_panel.set_ready(ready, has_image, has_recipe, False)
         self.run_screen.run_control_panel.set_warmup_state(has_recipe, self.auto_warming_up, self.auto_warming_up)
+        self.run_screen.run_control_panel.set_compare_state(ready, False, False)
         self.run_screen.op_panel.set_state(ready, False, 0, "", self.result)
         self._update_batch_ready()
 
@@ -1230,10 +1238,75 @@ class MainWindow(QMainWindow, LogMixin):
         self.run_screen.run_control_panel.set_warmup_state(
             has_recipe, running or self.auto_warming_up, self.auto_warming_up
         )
+        self.run_screen.run_control_panel.set_compare_state(has_image and has_recipe, running, False)
 
     # ------------------------------------------------------------------
     # GPU warm-up
     # ------------------------------------------------------------------
+    # ------------------------------------------------------------------
+    # CPU/GPU comparison (Engineer/Admin; the run control panel is hidden in OP mode)
+    # ------------------------------------------------------------------
+    def _run_backend_comparison(self) -> None:
+        if self.mode == "op":
+            return
+        if not self.image_path or not self.recipe_path:
+            self._notice("請先載入影像與 Recipe。", "warning")
+            return
+        if self.running or self.batch_running or self.monitor_running or self._comparison_controller.is_running:
+            self._notice("請先等待目前檢測、預熱或對照完成。", "warning")
+            return
+        self._set_comparison_running(True)
+        self.statusBar().showMessage("CPU／GPU 對照中")
+        worker = BackendComparisonWorker(
+            image_path=self.image_path,
+            recipe_path=self.recipe_path,
+            output_dir=Path(self.output_dir or "outputs"),
+            gpu_session_cache=self._inspection_gpu_sessions,
+        )
+        self._comparison_controller.start(
+            worker,
+            signal_handlers=(
+                (worker.progress, self._on_backend_comparison_progress),
+                (worker.finished, self._on_backend_comparison_finished),
+                (worker.failed, self._on_backend_comparison_failed),
+            ),
+            terminal_signals=(worker.finished, worker.failed),
+            on_thread_finished=self._on_backend_comparison_thread_finished,
+        )
+
+    def _set_comparison_running(self, comparing: bool) -> None:
+        # The comparison runs two full inspections on the shared session; block other single-image work.
+        self.comparing_backends = comparing
+        self.running = comparing
+        self.topbar.set_running(comparing, 0)
+        has_image = self.image_path is not None
+        has_recipe = self.recipe_path is not None
+        panel = self.run_screen.run_control_panel
+        panel.set_ready(has_image and has_recipe and not comparing, has_image, has_recipe, False)
+        panel.set_warmup_state(has_recipe, comparing, False)
+        panel.set_compare_state(has_image and has_recipe, comparing, comparing)
+
+    def _on_backend_comparison_progress(self, percent: int, message: str) -> None:
+        percent = max(0, min(100, int(percent)))
+        self.topbar.set_running(True, percent)
+        self.run_screen.run_control_panel.set_progress(True, self.result is not None, percent, message)
+
+    def _on_backend_comparison_finished(self, summary: dict) -> None:
+        headline, level = comparison_headline(summary)
+        self._notice(headline, level)
+        dialog = BackendComparisonDialog(summary, self)
+        self._comparison_dialog = dialog
+        dialog.show()
+
+    def _on_backend_comparison_failed(self, message: str) -> None:
+        self._notice(f"CPU／GPU 對照失敗：{message}", "error")
+
+    def _on_backend_comparison_thread_finished(self) -> None:
+        self._comparison_controller.clear()
+        self._set_comparison_running(False)
+        self.run_screen.run_control_panel.set_progress(False, self.result is not None, 0, "")
+        self._update_run_ready()
+
     def _run_gpu_warmup(self) -> None:
         if not self.recipe_path:
             self._notice("請先載入 Recipe。", "warning")
@@ -1347,6 +1420,7 @@ class MainWindow(QMainWindow, LogMixin):
         panel = self.run_screen.run_control_panel
         panel.set_ready(has_image and has_recipe and not warming, has_image, has_recipe, False)
         panel.set_warmup_state(has_recipe, warming, warming)
+        panel.set_compare_state(has_image and has_recipe, warming, False)
         self.run_screen.op_panel.set_state(has_image and has_recipe and not warming, False, 0, "", self.result)
 
     def _on_gpu_warmup_progress(self, percent: int, message: str) -> None:
@@ -1447,6 +1521,10 @@ class MainWindow(QMainWindow, LogMixin):
             return
         if self._warmup_controller.is_running:
             QMessageBox.information(self, "背景作業", "GPU 預熱仍在執行中，請等待完成後再關閉。")
+            event.ignore()
+            return
+        if self._comparison_controller.is_running:
+            QMessageBox.information(self, "背景作業", "CPU／GPU 對照仍在執行中，請等待完成後再關閉。")
             event.ignore()
             return
         if self._preview_thread and self._preview_thread.isRunning():

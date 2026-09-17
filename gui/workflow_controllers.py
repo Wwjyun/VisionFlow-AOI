@@ -70,3 +70,7 @@ class TilePreviewWorkflowController(WorkerWorkflowController):
 
 class GpuWarmupWorkflowController(WorkerWorkflowController):
     pass
+
+
+class BackendComparisonWorkflowController(WorkerWorkflowController):
+    pass

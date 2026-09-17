@@ -36,6 +36,7 @@ import yaml
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+from core.backend_comparison import compare_decisions, normalised_result, split_decision_fields  # noqa: E402
 from core.pipeline import AOIPipeline  # noqa: E402
 from core.gpu_session import GpuExecutionSession  # noqa: E402
 from core.recipe_manager import RecipeManager  # noqa: E402
@@ -210,109 +211,10 @@ def _recipe(
     return recipe
 
 
-def _normalised(result: dict) -> dict:
-    normalised = copy.deepcopy(result)
-    for key in ("duration_sec", "outputs", "execution"):
-        normalised.pop(key, None)
-    provenance = normalised.get("provenance")
-    if isinstance(provenance, dict):
-        provenance.pop("recipe_source_sha256", None)
-        provenance.pop("effective_recipe_sha256", None)
-    for tile_result in normalised.get("tiles", []):
-        for detector_result in tile_result.get("detectors", []):
-            detector_result.pop("execution", None)
-    return normalised
-
-
-# The device float32 Gaussian is mathematically equivalent, not bit-identical, so four
-# residual-derived diagnostics drift in their last bits.  They are reported separately
-# instead of being hidden, and the decision-bearing fields are compared strictly.
-_DRIFTING_METADATA = {
-    "mad",
-    "residual_median",
-    "residual_threshold",
-    "robust_noise_sigma",
-}
-
-# Fields that exist precisely to say *which* backend produced the record.  They must
-# differ between the CPU and CUDA runs, so comparing them as decision-bearing would
-# report a difference on every defect and hide a real mismatch.
-_BACKEND_PROVENANCE = {
-    "background_backend",
-    "residual_backend",
-    "background_precision_note",
-    "component_backend",
-}
-
-
-def _split_defects(result: dict):
-    """Return ``(decision_fields, drifting_fields, worst_drift)`` for one result."""
-
-    decision = []
-    drifting = []
-    worst = 0.0
-    for tile_result in result.get("tiles", []):
-        tile = tile_result.get("tile", {}) or {}
-        tile_metadata = tile.get("metadata", {}) or {}
-        # Tile placement comes from the anchor, which may run on the device; the defect bboxes are
-        # tile-local, so without this a shifted anchor would still compare as identical.
-        decision.append(
-            (
-                tile.get("tile_id"), tile.get("x"), tile.get("y"), tile.get("width"),
-                tile.get("height"), tuple(tile_metadata.get("match_bbox") or ()),
-            )
-        )
-        if isinstance(tile_metadata.get("score"), (int, float)):
-            drifting.append(("anchor_score", float(tile_metadata["score"])))
-        for detector_result in tile_result.get("detectors", []):
-            decision.append(
-                (
-                    tile.get("tile_id"),
-                    detector_result.get("detector_id"),
-                    detector_result.get("pass"),
-                    detector_result.get("defect_count"),
-                )
-            )
-            for defect in detector_result.get("defects", []):
-                metadata = defect.get("metadata", {}) or {}
-                decision.append(
-                    (
-                        defect.get("type"),
-                        tuple(defect.get("bbox_local") or ()),
-                        defect.get("area"),
-                        defect.get("confidence"),
-                    )
-                )
-                for name, value in sorted(metadata.items()):
-                    if name in _DRIFTING_METADATA and isinstance(value, (int, float)):
-                        drifting.append((name, float(value)))
-                    elif name in _BACKEND_PROVENANCE:
-                        continue
-                    else:
-                        decision.append((name, value))
-    return decision, drifting, worst
-
-
-def _compare(cpu_result: dict, gpu_result: dict) -> dict:
-    cpu_decision, cpu_drift, _ = _split_defects(cpu_result)
-    gpu_decision, gpu_drift, _ = _split_defects(gpu_result)
-    decision_equal = cpu_decision == gpu_decision
-    drift_counts = {}
-    worst_drift = 0.0
-    for (name, cpu_value), (gpu_name, gpu_value) in zip(cpu_drift, gpu_drift):
-        if name != gpu_name:
-            decision_equal = False
-            break
-        delta = abs(cpu_value - gpu_value)
-        worst_drift = max(worst_drift, delta)
-        if delta > 0.0:
-            drift_counts[name] = drift_counts.get(name, 0) + 1
-    return {
-        "decision_equal": decision_equal,
-        "drift_counts": drift_counts,
-        "worst_drift": worst_drift,
-        "drifting_field_count": len(cpu_drift),
-    }
+# Decision comparison is shared with the GUI CPU/GPU comparison; keep the historical names.
+_normalised = normalised_result
+_split_defects = split_decision_fields
+_compare = compare_decisions
 
 
 def _timing_summary(samples: list[float]) -> dict:

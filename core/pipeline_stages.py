@@ -27,16 +27,25 @@ class PreparedInspection:
 class RecipeRuntimePreparation:
     """Resolve recipe and backend policy before image/tile execution starts."""
 
-    def __init__(self, recipe_manager, detector_manager, runtime_factory, output_overrides=None):
+    def __init__(
+        self, recipe_manager, detector_manager, runtime_factory, output_overrides=None, gpu_mode_override=None,
+    ):
+        if gpu_mode_override not in (None, "cpu"):
+            raise ValueError("gpu_mode_override only supports 'cpu'")
         self.recipe_manager = recipe_manager
         self.detector_manager = detector_manager
         self.runtime_factory = runtime_factory
         self.output_overrides = output_overrides
+        self.gpu_mode_override = gpu_mode_override
 
     def prepare(self, recipe_path: Path) -> PreparedInspection:
         recipe = self.recipe_manager.load(recipe_path)
         if self.output_overrides:
             recipe["output"] = {**recipe.get("output", {}), **self.output_overrides}
+        if self.gpu_mode_override is not None:
+            # A run-only CPU reference (CPU/GPU comparison); the Recipe file is untouched and the
+            # effective recipe SHA-256 in provenance records the override.
+            recipe["gpu"] = {**(recipe.get("gpu", {}) or {}), "mode": self.gpu_mode_override}
         recipe = RecipeTemplatePathSync.from_recipe(recipe).apply(recipe)
         provenance = inspection_provenance(recipe_path, recipe)
         gpu_config = recipe.get("gpu", {}) or {}
