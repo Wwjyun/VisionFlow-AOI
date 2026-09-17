@@ -6,6 +6,9 @@ param(
 
 $ErrorActionPreference = "Stop"
 
+# Build scripts live in packaging\scripts; the repository root is two levels up.
+$RepoRoot = (Resolve-Path (Join-Path $PSScriptRoot "..\..")).Path
+
 $buildScripts = @(
     "build_ng_tile_area_tool.ps1",
     "build_pattern_grid_tile_exporter.ps1",
@@ -23,8 +26,8 @@ foreach ($buildScript in $buildScripts) {
 }
 
 $bundleName = "VisionFlow-Utility-Tools-v$Version-windows-x64"
-$bundleRoot = Join-Path $PSScriptRoot "dist\$bundleName"
-$releaseRoot = Join-Path $PSScriptRoot "release_artifacts"
+$bundleRoot = Join-Path $RepoRoot "dist\$bundleName"
+$releaseRoot = Join-Path $RepoRoot "release_artifacts"
 $zipPath = Join-Path $releaseRoot "$bundleName.zip"
 if (Test-Path -LiteralPath $bundleRoot) {
     throw "Bundle directory already exists: $bundleRoot"
@@ -57,7 +60,7 @@ $tools = @(
 )
 
 $resolvedTools = foreach ($tool in $tools) {
-    $sourceMatches = @(Get-ChildItem -Path (Join-Path $PSScriptRoot $tool.Source) -File)
+    $sourceMatches = @(Get-ChildItem -Path (Join-Path $RepoRoot $tool.Source) -File)
     if ($sourceMatches.Count -ne 1) {
         throw "Expected exactly one built executable for $($tool.Source), found $($sourceMatches.Count)"
     }
@@ -73,7 +76,7 @@ foreach ($tool in $resolvedTools) {
     Copy-Item -LiteralPath $tool.Source -Destination (Join-Path $bundleRoot $tool.Name)
 }
 
-$readme = Join-Path $PSScriptRoot "docs\packaging\UTILITY_TOOLS_README.txt"
+$readme = Join-Path $RepoRoot "docs\packaging\UTILITY_TOOLS_README.txt"
 if (-not (Test-Path -LiteralPath $readme)) {
     throw "Utility README not found: $readme"
 }

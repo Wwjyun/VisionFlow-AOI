@@ -1,7 +1,15 @@
 # -*- mode: python ; coding: utf-8 -*-
+#
+# This spec lives in packaging\specs. PyInstaller resolves relative paths against
+# the spec directory, so every source path is derived from the repository root.
+from pathlib import Path
+
+SPEC_DIR = Path(SPECPATH).resolve()
+ROOT = SPEC_DIR.parent.parent
+ENTRY_POINT = 'tools/export_pattern_grid_tiles.py'
 
 a = Analysis(
-    ['tools/export_matrix_summary.py'],
+    [str(ROOT / ENTRY_POINT)],
     pathex=[],
     binaries=[],
     datas=[],
@@ -21,7 +29,7 @@ exe = EXE(
     a.binaries,
     a.datas,
     [],
-    name='export_matrix_summary',
+    name='export_pattern_grid_tiles',
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,

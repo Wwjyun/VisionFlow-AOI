@@ -1,18 +1,18 @@
 # -*- mode: python ; coding: utf-8 -*-
+#
+# This spec lives in packaging\specs. PyInstaller resolves relative paths against
+# the spec directory, so every source path is derived from the repository root.
 from pathlib import Path
 
-cuda_dll = Path('gpu/visionflow_cuda.dll')
-cuda_binaries = [(str(cuda_dll), 'gpu')] if cuda_dll.exists() else []
+SPEC_DIR = Path(SPECPATH).resolve()
+ROOT = SPEC_DIR.parent.parent
+ENTRY_POINT = 'tools/export_matrix_summary.py'
 
 a = Analysis(
-    ['gui_launcher.py'],
+    [str(ROOT / ENTRY_POINT)],
     pathex=[],
-    binaries=cuda_binaries,
-    datas=[
-        ('recipes', 'recipes'),
-        ('models/yolox', 'models/yolox'),
-        ('build_provenance.json', '.'),
-    ],
+    binaries=[],
+    datas=[],
     hiddenimports=[],
     hookspath=[],
     hooksconfig={},
@@ -26,26 +26,20 @@ pyz = PYZ(a.pure)
 exe = EXE(
     pyz,
     a.scripts,
+    a.binaries,
+    a.datas,
     [],
-    exclude_binaries=True,
-    name='VisionFlow AOI',
+    name='export_matrix_summary',
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
     upx=True,
+    upx_exclude=[],
+    runtime_tmpdir=None,
     console=False,
     disable_windowed_traceback=False,
     argv_emulation=False,
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
-)
-coll = COLLECT(
-    exe,
-    a.binaries,
-    a.datas,
-    strip=False,
-    upx=True,
-    upx_exclude=[],
-    name='VisionFlow AOI',
 )

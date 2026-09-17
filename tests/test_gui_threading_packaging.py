@@ -10,6 +10,8 @@ from gui_launcher import bundled_recipe_path, run_packaged_gpu_fallback_smoke_te
 
 
 ROOT = Path(__file__).resolve().parents[1]
+SPEC_DIR = ROOT / "packaging" / "specs"
+BUILD_DIR = ROOT / "packaging" / "scripts"
 
 
 class GuiThreadingPackagingContractTests(unittest.TestCase):
@@ -21,7 +23,7 @@ class GuiThreadingPackagingContractTests(unittest.TestCase):
 
     def test_gui_launcher_has_noninteractive_packaged_smoke_mode(self):
         launcher = (ROOT / "gui_launcher.py").read_text(encoding="utf-8")
-        spec = (ROOT / "VisionFlow AOI.spec").read_text(encoding="utf-8")
+        spec = (SPEC_DIR / "VisionFlow AOI.spec").read_text(encoding="utf-8")
 
         self.assertIn('"--smoke-test" in sys.argv[1:]', launcher)
         self.assertIn("run_packaged_yolox_smoke_test", launcher)
@@ -53,8 +55,8 @@ class GuiThreadingPackagingContractTests(unittest.TestCase):
         self.assertIn("self.failed.emit(str(exc))", workers)
 
     def test_pyinstaller_cuda_dll_is_optional_and_keeps_gpu_relative_path(self):
-        spec = (ROOT / "VisionFlow AOI.spec").read_text(encoding="utf-8")
-        build = (ROOT / "build_exe.ps1").read_text(encoding="utf-8")
+        spec = (SPEC_DIR / "VisionFlow AOI.spec").read_text(encoding="utf-8")
+        build = (BUILD_DIR / "build_exe.ps1").read_text(encoding="utf-8")
 
         self.assertIn("if cuda_dll.exists() else []", spec)
         self.assertIn("(str(cuda_dll), 'gpu')", spec)

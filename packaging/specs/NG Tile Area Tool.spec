@@ -1,7 +1,15 @@
 # -*- mode: python ; coding: utf-8 -*-
+#
+# This spec lives in packaging\specs. PyInstaller resolves relative paths against
+# the spec directory, so every source path is derived from the repository root.
+from pathlib import Path
+
+SPEC_DIR = Path(SPECPATH).resolve()
+ROOT = SPEC_DIR.parent.parent
+ENTRY_POINT = 'tools/export_ng_tiles_by_area.py'
 
 a = Analysis(
-    ['tools/export_ng_tiles_by_area.py'],
+    [str(ROOT / ENTRY_POINT)],
     pathex=[],
     binaries=[],
     datas=[],

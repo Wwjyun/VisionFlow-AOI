@@ -11,10 +11,10 @@ Primary entry points:
 - CLI: `python main.py --image <image> --recipe <recipe.yaml> --output <directory>`
 - GUI: `python main.py --gui`
 - Packaged GUI entry/smoke: `gui_launcher.py` and `VisionFlow AOI.exe --smoke-test`
-- Windows package build: `build_exe.ps1` using the tracked `VisionFlow AOI.spec`
-- Traditional-CV tuning reference: `contour_preprocess_tool/` (run with `python -m contour_preprocess_tool`; build the independent EXE with `build_contour_preprocess_tool.ps1`)
+- Windows package build: `packaging/scripts/build_exe.ps1` using the tracked `packaging/specs/VisionFlow AOI.spec`
+- Traditional-CV tuning reference: `contour_preprocess_tool/` (run with `python -m contour_preprocess_tool`; build the independent EXE with `packaging/scripts/build_contour_preprocess_tool.ps1`)
 - Standalone utilities: `tools/export_ng_tiles_by_area.py`, `tools/export_pattern_grid_tiles.py`, `tools/export_matrix_summary.py`, `tools/export_scatter_plots.py`, and `tools/export_tile_defect_distribution.py`
-- Utility bundle build: `build_utility_tools.ps1`; individual utility builds use their dedicated `build_*_exporter.ps1` or `build_ng_tile_area_tool.ps1` entry point
+- Utility bundle build: `packaging/scripts/build_utility_tools.ps1`; individual utility builds use their dedicated `build_*_exporter.ps1` or `build_ng_tile_area_tool.ps1` entry point under `packaging/scripts/`
 - CUDA build: `gpu/build_cuda_dll.ps1`
 - CUDA validation: `gpu/validate_cuda_dll.py`
 - CUDA source/ABI preflight: `gpu/preflight_cuda_build.py`
@@ -37,8 +37,9 @@ The normal development machine may not have `nvcc`, CMake, or an NVIDIA GPU. Nev
 
 ## Module ownership
 
-- Top-level entry points: keep CLI orchestration in `main.py`, packaged startup/smoke in `gui_launcher.py`, and main packaging in `build_exe.ps1` and `VisionFlow AOI.spec`.
-- `tools/`: standalone post-processing and tile-export utility sources; each tool keeps its dedicated root-level spec/build entry point.
+- Top-level entry points: keep CLI orchestration in `main.py`, packaged startup/smoke in `gui_launcher.py`, and main packaging in `packaging/scripts/build_exe.ps1` and `packaging/specs/VisionFlow AOI.spec`.
+- `packaging/`: every PyInstaller build entry point and spec. Keep build scripts in `packaging/scripts/` and specs in `packaging/specs/`; do not add new root-level `build_*.ps1` or `*.spec` files. Specs derive the repository root from `SPECPATH` because PyInstaller resolves relative paths against the spec directory, and build scripts derive it from `$PSScriptRoot`'s grandparent. Keep these files ASCII-only: Windows PowerShell 5.1 reads BOM-less files as ANSI and a non-ASCII comment can swallow the line ending.
+- `tools/`: standalone post-processing and tile-export utility sources; each tool keeps its dedicated spec/build entry point under `packaging/`.
 - `core/`: pipeline, recipe loading/building, tiling, aggregation, reporting, profiling, batch/monitor processing, result schemas/compaction, GPU sessions/bridge, preprocessing plans and executors.
 - `detectors/`: detector-specific feature extraction, geometry, filtering, and result metadata.
 - `gpu/`: CUDA C ABI, kernels, persistent contexts, build scripts, native smoke tests, and CPU/GPU validation.
@@ -171,7 +172,7 @@ $env:QT_QPA_PLATFORM='offscreen'
 .\env\Scripts\python.exe -c "from pathlib import Path; from PySide6.QtWidgets import QApplication; from gui.main_window import MainWindow; app=QApplication([]); w=MainWindow(); w.recipe_panel.load_recipe(Path('recipes/PRODUCT_A_AOI_01.yaml')); print(w.windowTitle(), w.recipe_panel.detector_list.count())"
 ```
 
-For packaging, `gui_launcher.py`, or spec changes, build through `build_exe.ps1` and run the packaged `--smoke-test` when the local environment can support a package build. The smoke must cover bundled recipe/MainWindow startup, CPU-only execution, missing-DLL fallback equivalence with zero GPU calls, and explicit strict-CUDA failure.
+For packaging, `gui_launcher.py`, or spec changes, build through `packaging\scripts\build_exe.ps1` and run the packaged `--smoke-test` when the local environment can support a package build. The smoke must cover bundled recipe/MainWindow startup, CPU-only execution, missing-DLL fallback equivalence with zero GPU calls, and explicit strict-CUDA failure.
 
 For standalone utility or utility spec/build changes, use the matching dedicated build script and run that utility's packaged `--smoke-test`. Keep utility bundle tags (`utility-tools-vX.Y.Z`) and the legacy NG Tile tool tag namespace separate from VisionFlow AOI application tags (`vX.Y.Z`).
 

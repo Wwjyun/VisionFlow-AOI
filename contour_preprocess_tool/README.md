@@ -52,7 +52,7 @@ $env:QT_QPA_PLATFORM='offscreen'
 由 repository 根目錄執行：
 
 ```powershell
-.\build_contour_preprocess_tool.ps1 -Version 1.0.0
+.\packaging\scripts\build_contour_preprocess_tool.ps1 -Version 1.0.0
 ```
 
 完成後執行：

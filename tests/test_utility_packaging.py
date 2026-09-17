@@ -5,6 +5,8 @@ import unittest
 
 
 ROOT = Path(__file__).resolve().parents[1]
+SPEC_DIR = ROOT / "packaging" / "specs"
+BUILD_DIR = ROOT / "packaging" / "scripts"
 
 
 class UtilityPackagingContractTests(unittest.TestCase):
@@ -33,13 +35,52 @@ class UtilityPackagingContractTests(unittest.TestCase):
         }
         for spec_name, (entry_point, build_name) in contracts.items():
             with self.subTest(spec=spec_name):
-                spec = (ROOT / spec_name).read_text(encoding="utf-8")
-                build = (ROOT / build_name).read_text(encoding="utf-8")
-                self.assertIn(f"['{entry_point}']", spec)
+                spec = (SPEC_DIR / spec_name).read_text(encoding="utf-8")
+                build = (BUILD_DIR / build_name).read_text(encoding="utf-8")
+                self.assertIn(f"'{entry_point}'", spec)
+                self.assertIn("str(ROOT / ENTRY_POINT)", spec)
                 self.assertIn("exe = EXE(", spec)
                 self.assertIn("console=False", spec)
                 self.assertIn("-m PyInstaller", build)
                 self.assertIn(spec_name, build)
+
+    def test_specs_and_build_scripts_stay_inside_packaging(self):
+        self.assertEqual([], sorted(path.name for path in ROOT.glob("*.ps1")))
+        self.assertEqual([], sorted(path.name for path in ROOT.glob("*.spec")))
+        self.assertTrue(SPEC_DIR.is_dir())
+        self.assertTrue(BUILD_DIR.is_dir())
+
+    def test_every_spec_resolves_the_repository_root_from_specpath(self):
+        specs = sorted(SPEC_DIR.glob("*.spec"))
+        self.assertTrue(specs)
+        for spec in specs:
+            with self.subTest(spec=spec.name):
+                source = spec.read_text(encoding="utf-8")
+                self.assertIn("SPEC_DIR = Path(SPECPATH).resolve()", source)
+                self.assertIn("ROOT = SPEC_DIR.parent.parent", source)
+
+    def test_every_spec_is_referenced_by_a_build_script(self):
+        build_sources = {
+            path.name: path.read_text(encoding="utf-8")
+            for path in BUILD_DIR.glob("*.ps1")
+        }
+        self.assertTrue(build_sources)
+        for spec in sorted(SPEC_DIR.glob("*.spec")):
+            with self.subTest(spec=spec.name):
+                self.assertTrue(
+                    any(spec.name in source for source in build_sources.values()),
+                    f"no build script references {spec.name}",
+                )
+
+    def test_build_scripts_locate_the_repository_root_from_their_own_location(self):
+        for path in sorted(BUILD_DIR.glob("*.ps1")):
+            with self.subTest(script=path.name):
+                source = path.read_text(encoding="utf-8")
+                self.assertIn(
+                    '(Resolve-Path (Join-Path $PSScriptRoot "..\\..")).Path',
+                    source,
+                )
+                self.assertNotIn('Join-Path $PSScriptRoot "env', source)
 
     def test_all_tools_expose_noninteractive_smoke_mode(self):
         for entry_point in (
@@ -55,7 +96,7 @@ class UtilityPackagingContractTests(unittest.TestCase):
                 self.assertIn("TOOL_VERSION", source)
 
     def test_bundle_builder_refuses_overwrite_and_keeps_cpu_only_scope(self):
-        build = (ROOT / "build_utility_tools.ps1").read_text(encoding="utf-8")
+        build = (BUILD_DIR / "build_utility_tools.ps1").read_text(encoding="utf-8")
         readme = (ROOT / "docs" / "packaging" / "UTILITY_TOOLS_README.txt").read_text(
             encoding="utf-8"
         )
@@ -78,7 +119,7 @@ class UtilityPackagingContractTests(unittest.TestCase):
         self.assertTrue((ROOT / "release_artifacts" / "README.md").is_file())
 
     def test_ng_tile_builder_uses_the_packaging_document_source(self):
-        build = (ROOT / "build_ng_tile_area_tool.ps1").read_text(encoding="utf-8")
+        build = (BUILD_DIR / "build_ng_tile_area_tool.ps1").read_text(encoding="utf-8")
 
         self.assertIn(r"docs\packaging\NG_TILE_AREA_TOOL_README.txt", build)
         self.assertTrue(

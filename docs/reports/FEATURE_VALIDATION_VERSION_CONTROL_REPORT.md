@@ -212,7 +212,7 @@ CPU-only 已驗證為完整支援模式，無 NVIDIA GPU 或 CUDA DLL 時仍可�
 
 ### 5.5 打包驗證
 
-Windows 執行檔使用 PyInstaller 與受版控的 `VisionFlow AOI.spec` 建置。Packaged smoke 包含：
+Windows 執行檔使用 PyInstaller 與受版控的 `packaging/specs/VisionFlow AOI.spec` 建置。Packaged smoke 包含：
 
 - 內含 Recipe 並可建立 MainWindow。
 - CPU-only Pipeline 可執行。
@@ -350,7 +350,7 @@ PASS 結束碼為 `0`，NG 為 `2`，配方、影像或 runtime error 為其他�
 ### 7.4 Windows 打包
 
 ```powershell
-.\build_exe.ps1
+.\packaging\scripts\build_exe.ps1
 .\dist\VisionFlow AOI\VisionFlow AOI.exe --smoke-test
 ```
 

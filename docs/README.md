@@ -38,6 +38,8 @@ Release notes 位於 [`release-notes/`](release-notes/)，檔名同時標示產�
 
 打包時會收錄的純文字說明位於 [`packaging/`](packaging/)。建置腳本會由此處複製到對應的 Windows 發行工件。
 
+PyInstaller 建置入口與 spec 位於根目錄的 [`../packaging/`](../packaging/)：建置腳本在 `scripts/`、spec 在 `specs/`。
+
 ## 仍保留在根目錄的文件
 
 - [`../README.md`](../README.md)：使用者入口與操作說明。

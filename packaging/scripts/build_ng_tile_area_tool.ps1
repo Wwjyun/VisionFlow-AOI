@@ -1,20 +1,24 @@
 $ErrorActionPreference = "Stop"
 
-$python = Join-Path $PSScriptRoot "env\Scripts\python.exe"
+# Build scripts live in packaging\scripts; the repository root is two levels up.
+$RepoRoot = (Resolve-Path (Join-Path $PSScriptRoot "..\..")).Path
+$SpecRoot = Join-Path $RepoRoot "packaging\specs"
+
+$python = Join-Path $RepoRoot "env\Scripts\python.exe"
 if (-not (Test-Path $python)) {
     throw "Virtual environment python not found: $python"
 }
 
-$spec = Join-Path $PSScriptRoot "NG Tile Area Tool.spec"
+$spec = Join-Path $SpecRoot "NG Tile Area Tool.spec"
 if (-not (Test-Path $spec)) {
     throw "PyInstaller spec not found: $spec"
 }
 
-$distRoot = Join-Path $PSScriptRoot "dist\NG-Tile-Area-Tool"
-$workRoot = Join-Path $PSScriptRoot "build\ng_tile_area_tool"
-$readme = Join-Path $PSScriptRoot "docs\packaging\NG_TILE_AREA_TOOL_README.txt"
+$distRoot = Join-Path $RepoRoot "dist\NG-Tile-Area-Tool"
+$workRoot = Join-Path $RepoRoot "build\ng_tile_area_tool"
+$readme = Join-Path $RepoRoot "docs\packaging\NG_TILE_AREA_TOOL_README.txt"
 
-Push-Location $PSScriptRoot
+Push-Location $RepoRoot
 try {
     & $python -m PyInstaller `
         --noconfirm `

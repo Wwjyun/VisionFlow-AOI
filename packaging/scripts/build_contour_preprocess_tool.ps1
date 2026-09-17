@@ -5,20 +5,24 @@ param(
 
 $ErrorActionPreference = "Stop"
 
+# Build scripts live in packaging\scripts; the repository root is two levels up.
+$RepoRoot = (Resolve-Path (Join-Path $PSScriptRoot "..\..")).Path
+$SpecRoot = Join-Path $RepoRoot "packaging\specs"
+
 $expectedVersion = "1.0.0"
 if ($Version -ne $expectedVersion) {
     throw "Requested version $Version does not match source version $expectedVersion"
 }
 
-$python = Join-Path $PSScriptRoot "env\Scripts\python.exe"
-$spec = Join-Path $PSScriptRoot "Traditional CV Tuning Tool.spec"
-$readme = Join-Path $PSScriptRoot "contour_preprocess_tool\README.md"
+$python = Join-Path $RepoRoot "env\Scripts\python.exe"
+$spec = Join-Path $SpecRoot "Traditional CV Tuning Tool.spec"
+$readme = Join-Path $RepoRoot "contour_preprocess_tool\README.md"
 $distRoot = if ($OutputDirectory) {
-    [System.IO.Path]::GetFullPath((Join-Path $PSScriptRoot $OutputDirectory))
+    [System.IO.Path]::GetFullPath((Join-Path $RepoRoot $OutputDirectory))
 } else {
-    Join-Path $PSScriptRoot "dist\Traditional-CV-Tuning-Tool"
+    Join-Path $RepoRoot "dist\Traditional-CV-Tuning-Tool"
 }
-$workRoot = Join-Path $PSScriptRoot "build\traditional_cv_tuning_tool"
+$workRoot = Join-Path $RepoRoot "build\traditional_cv_tuning_tool"
 $exePath = Join-Path $distRoot "Traditional CV Tuning Tool.exe"
 
 foreach ($requiredPath in @($python, $spec, $readme)) {
@@ -30,7 +34,7 @@ if (Test-Path -LiteralPath $exePath) {
     throw "Refusing to overwrite an existing versioned executable: $exePath"
 }
 
-Push-Location $PSScriptRoot
+Push-Location $RepoRoot
 try {
     & $python -m PyInstaller `
         --noconfirm `

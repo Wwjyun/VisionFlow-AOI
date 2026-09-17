@@ -359,7 +359,7 @@ CUDA DLL 建置與驗證：
 獨立打包：
 
 ```powershell
-.\build_contour_preprocess_tool.ps1 -Version 1.0.0
+.\packaging\scripts\build_contour_preprocess_tool.ps1 -Version 1.0.0
 ```
 
 ### 切圖與後處理工具
@@ -385,7 +385,7 @@ CUDA DLL 建置與驗證：
 命令列參數與輸入格式見 [`tools/README.md`](tools/README.md) 及各工具的 `--help`。建立五支 one-file EXE 與合集 ZIP：
 
 ```powershell
-.\build_utility_tools.ps1 -Version 1.1.0
+.\packaging\scripts\build_utility_tools.ps1 -Version 1.1.0
 ```
 
 ## 打包與驗證
@@ -393,7 +393,7 @@ CUDA DLL 建置與驗證：
 ### 建立 Windows 應用程式
 
 ```powershell
-.\build_exe.ps1
+.\packaging\scripts\build_exe.ps1
 ```
 
 成品位於：

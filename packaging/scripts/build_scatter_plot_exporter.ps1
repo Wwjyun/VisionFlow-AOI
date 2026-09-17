@@ -1,19 +1,23 @@
 $ErrorActionPreference = "Stop"
 
-$python = Join-Path $PSScriptRoot "env\Scripts\python.exe"
+# Build scripts live in packaging\scripts; the repository root is two levels up.
+$RepoRoot = (Resolve-Path (Join-Path $PSScriptRoot "..\..")).Path
+$SpecRoot = Join-Path $RepoRoot "packaging\specs"
+
+$python = Join-Path $RepoRoot "env\Scripts\python.exe"
 if (-not (Test-Path -LiteralPath $python)) {
     throw "Virtual environment python not found: $python"
 }
 
-$spec = Join-Path $PSScriptRoot "Scatter Plot Exporter.spec"
+$spec = Join-Path $SpecRoot "Scatter Plot Exporter.spec"
 if (-not (Test-Path -LiteralPath $spec)) {
     throw "PyInstaller spec not found: $spec"
 }
 
-$distRoot = Join-Path $PSScriptRoot "dist\Scatter-Plot-Exporter"
-$workRoot = Join-Path $PSScriptRoot "build\scatter_plot_exporter"
+$distRoot = Join-Path $RepoRoot "dist\Scatter-Plot-Exporter"
+$workRoot = Join-Path $RepoRoot "build\scatter_plot_exporter"
 
-Push-Location $PSScriptRoot
+Push-Location $RepoRoot
 try {
     & $python -m PyInstaller `
         --noconfirm `

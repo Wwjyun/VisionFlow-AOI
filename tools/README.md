@@ -18,4 +18,4 @@
 .\env\Scripts\python.exe -m tools.export_tile_defect_distribution
 ```
 
-個別 PyInstaller 建置仍由根目錄的 `build_*` 腳本負責；五支工具的合集 ZIP 由 `build_utility_tools.ps1` 建立在 `release_artifacts/`。
+個別 PyInstaller 建置由 `packaging/scripts/` 的 `build_*` 腳本負責（spec 在 `packaging/specs/`）；五支工具的合集 ZIP 由 `packaging/scripts/build_utility_tools.ps1` 建立在 `release_artifacts/`。

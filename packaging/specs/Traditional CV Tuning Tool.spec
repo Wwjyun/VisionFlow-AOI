@@ -1,8 +1,17 @@
 # -*- mode: python ; coding: utf-8 -*-
+#
+# This spec lives in packaging\specs. PyInstaller resolves relative paths against
+# the spec directory, so every source path is derived from the repository root.
+from pathlib import Path
+
+SPEC_DIR = Path(SPECPATH).resolve()
+ROOT = SPEC_DIR.parent.parent
+ENTRY_POINT = 'contour_preprocess_tool/launcher.py'
+VERSION_INFO = 'contour_preprocess_tool/version_info.txt'
 
 a = Analysis(
-    ['contour_preprocess_tool/launcher.py'],
-    pathex=['.'],
+    [str(ROOT / ENTRY_POINT)],
+    pathex=[str(ROOT)],
     binaries=[],
     datas=[],
     hiddenimports=[],
@@ -34,5 +43,5 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
-    version='contour_preprocess_tool/version_info.txt',
+    version=str(ROOT / VERSION_INFO),
 )
