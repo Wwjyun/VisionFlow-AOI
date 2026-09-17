@@ -98,6 +98,11 @@ class GpuCapabilities:
         )
 
     @property
+    def host_register(self) -> bool:
+        """Optional page-locking of caller-owned host buffers used as upload sources."""
+        return self.has_exports(("vf_host_register_u8", "vf_host_unregister_u8"))
+
+    @property
     def roi_batch(self) -> bool:
         return bool(
             self.resident_roi

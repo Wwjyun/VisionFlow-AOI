@@ -9,6 +9,7 @@ from pathlib import Path
 from core.ai_runtime import AiModelSessionManager
 from core.detector_manager import DetectorManager
 from core.gpu_runtime import GpuRuntime, GpuRuntimeError
+from core.host_image_buffers import HostImageBufferPool
 from core.logging_system import LogMixin
 from core.recipe_manager import RecipeManager
 
@@ -40,6 +41,8 @@ class GpuExecutionSession(LogMixin):
         )
         self._closed = False
         self._pipeline_lock = threading.RLock()
+        # Runs on this session are serialized, so one reusable decoded-image backing serves them all.
+        self.host_image_buffers = HostImageBufferPool(runtime)
 
     @classmethod
     def from_recipe(cls, recipe: dict, workload: str = "latency") -> "GpuExecutionSession":
@@ -87,6 +90,8 @@ class GpuExecutionSession(LogMixin):
             return
         self._closed = True
         self.ai_session_manager.close()
+        # Unpin the host backing while the CUDA context that registered it still exists.
+        self.host_image_buffers.close()
         self.runtime.close()
 
     # Every artifact a pipeline run can write; a warm-up must leave nothing on disk.

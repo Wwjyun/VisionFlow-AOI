@@ -275,6 +275,7 @@ class InspectionResultAssembler:
         profiler,
         resident_upload_memory: dict | None = None,
         resident_skipped_by_crossover: bool = False,
+        host_image_buffer: dict | None = None,
         tiling_cuda_crop_skipped: bool = False,
         gpu_metrics_baseline: dict | None = None,
     ) -> dict:
@@ -314,6 +315,9 @@ class InspectionResultAssembler:
                         ),
                         "device_memory_before_upload": dict(resident_upload_memory or {}),
                         "skipped_by_crossover": bool(resident_skipped_by_crossover),
+                        # Whether this run decoded into the session's reusable (and possibly pinned)
+                        # host backing; empty when the image was read into a fresh array.
+                        "host_buffer": dict(host_image_buffer or {}),
                     },
                     "tiling": tiling_status,
                     "display_requested": bool(display_requested),

@@ -5,6 +5,7 @@ import struct
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Callable
 
 import cv2
 import numpy as np
@@ -48,7 +49,20 @@ class BmpReader:
     def __init__(self, max_workers: int | None = None):
         self.max_workers = max(1, int(max_workers or min(self.MAX_WORKERS, os.cpu_count() or 1)))
 
-    def read(self, path: Path, *, preserve_file_order: bool = False) -> np.ndarray | None:
+    def read(
+        self,
+        path: Path,
+        *,
+        preserve_file_order: bool = False,
+        backing_provider: Callable[[tuple[int, int]], np.ndarray | None] | None = None,
+    ) -> np.ndarray | None:
+        """Decode ``path``; ``backing_provider`` may supply the file-order backing to fill.
+
+        The provider is only consulted for 24-bit file-order reads and receives the packed
+        ``(rows, stride)`` shape. Every byte of a supplied backing is overwritten, so a reused
+        buffer never leaks pixels from a previous image; anything but an exact writable
+        ``uint8`` array of that shape is ignored and a fresh array is allocated.
+        """
         path = Path(path)
         with open(path, "rb") as handle:
             header = handle.read(1024)
@@ -59,7 +73,15 @@ class BmpReader:
         pixel_bytes = layout.stride * rows
         direct_file_rows = bool(preserve_file_order and layout.bits_per_pixel == 24)
         if direct_file_rows:
-            backing = np.empty((rows, layout.stride), dtype=np.uint8)
+            backing = backing_provider((rows, layout.stride)) if backing_provider is not None else None
+            if not (
+                isinstance(backing, np.ndarray)
+                and backing.dtype == np.uint8
+                and backing.shape == (rows, layout.stride)
+                and backing.flags.c_contiguous
+                and backing.flags.writeable
+            ):
+                backing = np.empty((rows, layout.stride), dtype=np.uint8)
             pixels = backing[:, : layout.width * 3].reshape(rows, layout.width, 3)
             output = pixels[::-1] if layout.bottom_up else pixels
         else:
@@ -169,12 +191,20 @@ class ImageLoader(LogMixin):
         self.supported_extensions = supported_extensions or SUPPORTED_EXTENSIONS
         self.bmp_reader = bmp_reader or BmpReader()
 
-    def load_bgr(self, path: Path, *, preserve_bmp_file_order: bool = False):
+    def load_bgr(
+        self,
+        path: Path,
+        *,
+        preserve_bmp_file_order: bool = False,
+        backing_provider: Callable[[tuple[int, int]], np.ndarray | None] | None = None,
+    ):
         image_path = self._validate_path(path)
         if image_path.suffix.lower() == ".bmp":
             try:
                 image = self.bmp_reader.read(
-                    image_path, preserve_file_order=preserve_bmp_file_order
+                    image_path,
+                    preserve_file_order=preserve_bmp_file_order,
+                    backing_provider=backing_provider,
                 )
             except (OSError, ValueError, ImageLoadError):
                 self.logger.debug("Fast BMP read failed, using OpenCV: %s", image_path, exc_info=True)
@@ -225,7 +255,14 @@ def frame_to_bgr(frame: np.ndarray) -> np.ndarray:
     raise ImageLoadError(f"Camera frame must be HxW or HxWx3, got shape {image.shape}")
 
 
-def load_image(path: Path, *, preserve_bmp_file_order: bool = False):
+def load_image(
+    path: Path,
+    *,
+    preserve_bmp_file_order: bool = False,
+    backing_provider: Callable[[tuple[int, int]], np.ndarray | None] | None = None,
+):
     return ImageLoader().load_bgr(
-        path, preserve_bmp_file_order=preserve_bmp_file_order
+        path,
+        preserve_bmp_file_order=preserve_bmp_file_order,
+        backing_provider=backing_provider,
     )

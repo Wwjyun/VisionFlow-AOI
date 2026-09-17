@@ -49,8 +49,13 @@ class AOIPipeline(LogMixin):
 
     def run(self, image_path: Path) -> InspectionResult:
         if self.gpu_session is not None:
+            pool = getattr(self.gpu_session, "host_image_buffers", None)
             with self.gpu_session.execution_scope():
-                return self._run(image_path)
+                if pool is None:
+                    return self._run(image_path)
+                # The lease closes only after _run has returned and dropped every pixel view.
+                with pool.lease() as host_image_lease:
+                    return self._run(image_path, host_image_lease=host_image_lease)
         return self._run(image_path)
 
     def run_frame(self, frame, source_name: str, source_metadata: dict | None = None) -> InspectionResult:
@@ -67,7 +72,13 @@ class AOIPipeline(LogMixin):
                 return self._run(Path(source_name), frame=frame, source=source)
         return self._run(Path(source_name), frame=frame, source=source)
 
-    def _run(self, image_path: Path, frame=None, source: dict | None = None) -> InspectionResult:
+    def _run(
+        self,
+        image_path: Path,
+        frame=None,
+        source: dict | None = None,
+        host_image_lease=None,
+    ) -> InspectionResult:
         started = time.perf_counter()
         profiler = PipelineProfiler()
         self._active_profiler = profiler
@@ -126,7 +137,9 @@ class AOIPipeline(LogMixin):
         with profiler.measure("image_load"):
             if frame is None:
                 image = load_image(
-                    image_path, preserve_bmp_file_order=preserve_bmp_file_order
+                    image_path,
+                    preserve_bmp_file_order=preserve_bmp_file_order,
+                    backing_provider=host_image_lease if preserve_bmp_file_order else None,
                 )
             else:
                 image = frame_to_bgr(frame)
@@ -263,6 +276,9 @@ class AOIPipeline(LogMixin):
                 resident_image=resident_image,
                 resident_upload_memory=resident_upload_memory,
                 resident_skipped_by_crossover=resident_skipped_by_crossover and detector_gpu_requested,
+                host_image_buffer=(
+                    dict(host_image_lease.details) if host_image_lease is not None else {}
+                ),
                 gpu_metrics_baseline=gpu_metrics_baseline,
                 profiler=profiler,
             )

@@ -138,6 +138,10 @@ VF_CUDA_API int vf_context_upload_u8_file_order(
     void* context,
     const uint8_t* src, int width, int height, int src_stride, int src_channels,
     uint64_t* generation);
+/* Page-lock caller-owned host bytes so later uploads from them skip the driver staging copy.
+ * The caller keeps the memory alive while registered and unregisters it before freeing it. */
+VF_CUDA_API int vf_host_register_u8(void* context, uint8_t* host, uint64_t bytes);
+VF_CUDA_API int vf_host_unregister_u8(void* context, uint8_t* host);
 VF_CUDA_API int vf_roi_batch_create(
     void* context, uint64_t generation,
     const VfRoiV1* rois, int roi_count, void** batch);

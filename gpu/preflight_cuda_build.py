@@ -57,6 +57,7 @@ OPTIONAL_EXPORT_GROUPS = {
         "vf_dag_plan_execute_roi",
     },
     "file_order_upload": {"vf_context_upload_u8_file_order"},
+    "host_register": {"vf_host_register_u8", "vf_host_unregister_u8"},
     "roi_batch": {
         "vf_gpu_memory_info",
         "vf_roi_batch_create",

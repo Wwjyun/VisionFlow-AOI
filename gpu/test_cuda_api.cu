@@ -125,10 +125,18 @@ int main() {
                 static_cast<size_t>(row_bytes));
         }
         uint64_t bottom_up_generation = 0;
-        result = vf_context_upload_u8_file_order(
-            context,
-            bottom_up.data() + static_cast<size_t>(height - 1) * row_bytes,
-            width, height, -row_bytes, 3, &bottom_up_generation);
+        result = vf_host_register_u8(context, bottom_up.data(), bottom_up.size());
+        if (result == VF_CUDA_OK) {
+            result = vf_context_upload_u8_file_order(
+                context,
+                bottom_up.data() + static_cast<size_t>(height - 1) * row_bytes,
+                width, height, -row_bytes, 3, &bottom_up_generation);
+        }
+        int unregister_result = vf_host_unregister_u8(context, bottom_up.data());
+        if (result == VF_CUDA_OK && unregister_result != VF_CUDA_OK) {
+            std::cerr << "pinned host buffer unregister failed\n";
+            return 11;
+        }
         VfRoiV1 full_roi{sizeof(VfRoiV1), 0, 0, width, height};
         void* full_batch = nullptr;
         if (result == VF_CUDA_OK) {

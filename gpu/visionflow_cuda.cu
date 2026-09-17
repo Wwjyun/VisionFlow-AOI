@@ -2905,6 +2905,19 @@ VF_CUDA_API int vf_context_upload_u8_file_order(
         context, src, width, height, src_stride, src_channels, generation, true);
 }
 
+VF_CUDA_API int vf_host_register_u8(void* context, uint8_t* host, uint64_t bytes) {
+    // The DLL is built for x64 only, so every uint64_t byte count fits size_t.
+    if (context == nullptr || host == nullptr || bytes == 0) return VF_CUDA_INVALID_ARGUMENT;
+    cudaError_t error = cudaHostRegister(host, static_cast<size_t>(bytes), cudaHostRegisterDefault);
+    return error == cudaSuccess ? VF_CUDA_OK : cuda_result(error);
+}
+
+VF_CUDA_API int vf_host_unregister_u8(void* context, uint8_t* host) {
+    if (context == nullptr || host == nullptr) return VF_CUDA_INVALID_ARGUMENT;
+    cudaError_t error = cudaHostUnregister(host);
+    return error == cudaSuccess ? VF_CUDA_OK : cuda_result(error);
+}
+
 VF_CUDA_API int vf_roi_batch_create(
     void* context,
     uint64_t generation,

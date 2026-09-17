@@ -185,6 +185,10 @@ class GpuRuntime:
         return self._capabilities.file_order_upload
 
     @property
+    def supports_host_register(self) -> bool:
+        return self._capabilities.host_register
+
+    @property
     def supports_roi_batch(self) -> bool:
         return self._capabilities.roi_batch
 
@@ -244,6 +248,7 @@ class GpuRuntime:
                 "native_dag_plan": self.supports_native_dag_plan,
                 "resident_roi": self.supports_resident_roi,
                 "file_order_upload": self.supports_file_order_upload,
+                "host_register": self.supports_host_register,
                 "roi_batch": self.supports_roi_batch,
                 "fused_401_2": self.supports_fused_401_2,
                 "template_match": self.supports_template_match,
@@ -446,6 +451,37 @@ class GpuRuntime:
         return GpuResidentImage(
             self, int(generation.value), int(source.shape[1]), int(source.shape[0]), channels
         )
+
+    def register_host_buffer(self, buffer: np.ndarray) -> None:
+        """Page-lock a caller-owned contiguous ``uint8`` buffer used as a later upload source.
+
+        The caller must keep ``buffer`` alive and call ``unregister_host_buffer`` before it is
+        released. Registration only changes how uploads copy, never the uploaded pixels.
+        """
+        array = self._host_buffer(buffer)
+        with self._lock:
+            result = int(self._dll.vf_host_register_u8(
+                self._context, array.ctypes.data_as(ctypes.POINTER(ctypes.c_uint8)), int(array.nbytes)
+            ))
+        if result != 0:
+            raise self._native_error("vf_host_register_u8", result)
+
+    def unregister_host_buffer(self, buffer: np.ndarray) -> None:
+        array = self._host_buffer(buffer)
+        with self._lock:
+            result = int(self._dll.vf_host_unregister_u8(
+                self._context, array.ctypes.data_as(ctypes.POINTER(ctypes.c_uint8))
+            ))
+        if result != 0:
+            raise self._native_error("vf_host_unregister_u8", result)
+
+    def _host_buffer(self, buffer: np.ndarray) -> np.ndarray:
+        if not self.supports_host_register:
+            raise GpuRuntimeError("CUDA DLL has no host buffer registration exports")
+        array = buffer if isinstance(buffer, np.ndarray) else None
+        if array is None or array.dtype != np.uint8 or array.size == 0 or not array.flags.c_contiguous:
+            raise GpuRuntimeError("Host buffer registration requires a non-empty contiguous uint8 array")
+        return array
 
     def match_template_gray(
         self,
@@ -1553,6 +1589,14 @@ class GpuRuntime:
                 ctypes.POINTER(ctypes.c_uint64),
             ]
             file_order_upload.restype = ctypes.c_int
+        host_register = getattr(self._dll, "vf_host_register_u8", None)
+        host_unregister = getattr(self._dll, "vf_host_unregister_u8", None)
+        if host_register is not None:
+            host_register.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_uint8), ctypes.c_uint64]
+            host_register.restype = ctypes.c_int
+        if host_unregister is not None:
+            host_unregister.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_uint8)]
+            host_unregister.restype = ctypes.c_int
         if linear is not None:
             linear.argtypes = [
                 ctypes.c_void_p, ctypes.c_uint64, ctypes.c_int, ctypes.c_int,

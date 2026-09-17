@@ -691,6 +691,45 @@ provenance 冷路徑也由兩個 Git subprocess 合併成一次 `git status --po
 重編；C++ native smoke、完整 CUDA validator、ROI batch、resize pipeline、crossover、morphology 與
 10/100/1000 次 stress 均通過。
 
+### 2026-09-17 Session 重用 host 影像緩衝與 pinned 註冊
+
+上一節列的「分段 BMP read 與分段 H2D 重疊」先以原型量測上限：讀圖同時上傳另一張已解碼影像，讀取＋上傳
+196.3→164.7 ms，上傳本身因搶記憶體頻寬 88→164 ms；實際分段版本必須讀完一段才能上傳該段，收益只會更低，
+且需要 begin/chunk/commit native contract，因此**不採用**。同輪量測發現每張圖新配置 639 MB 陣列本身就有成本：
+讀檔時的 page fault，以及檢測結束釋放陣列約 28 ms（profiler `memory_release`）。
+
+改為由 `GpuExecutionSession` 擁有一個 `HostImageBufferPool`（`core/host_image_buffers.py`）：GPU resident
+路徑的 24-bit file-order BMP 直接讀進同一塊 `(rows, stride)` backing，每張圖覆寫全部 bytes（含列 padding）。
+同一 session 的檢測本來就序列化，所以一次只借出一塊；借出中、shape 不同、關閉後或 `off` 模式都退回新配置。
+歸還時若影像 view 仍被引用（例如例外 traceback 保留了區域變數），backing 會被脫離並解除 pinned，不會在舊 view
+底下被下一張圖覆寫。新增 additive optional export `vf_host_register_u8`／`vf_host_unregister_u8`
+（`cudaHostRegister`／`cudaHostUnregister`），`auto` 模式在第一次配置時把 backing 註冊為 pinned memory；
+舊 DLL 沒有這兩個 export 時只做 pageable 重用。session 關閉時先解除註冊再關閉 CUDA context。
+`AOI_HOST_IMAGE_BUFFER=auto|pageable|off` 可覆寫，結果記錄在
+`execution.gpu.resident_image.host_buffer`（`reused`、`pinned`、`nbytes`）。
+
+RTX 3090、16384×13000 BMP、202-CS-SN-1 六個 12000×2000 ROI，同 process 三個 session 交錯 11 輪（median）：
+
+| host backing | image load | initialization（整圖 H2D） | memory_release | 端到端 median／P95 |
+|---|---:|---:|---:|---:|
+| 每張新配置（原行為） | 95.5 ms | 74.9 ms | 26.8 ms | 279.1／343.9 ms |
+| session 重用 pageable | 83.2 ms | 74.1 ms | 0.0 ms | 240.7／255.0 ms |
+| **session 重用 pinned（`auto`）** | 83.7 ms | **58.8 ms** | 0.0 ms | **224.7／230.6 ms** |
+
+三種模式判定欄位全部相同，pool 只配置 1 次、重用 12 次、脫離 0 次。正式基準
+（`tools/benchmark_pipeline_production.py --profile production --warmup 1 --repetitions 5`，CPU／GPU 交錯）：
+CPU 5392.9 ms、GPU **271.5 ms**（median，**19.86×**），5/5 輪判定欄位相同，非判定 `anchor_score` 最大漂移
+6.557e-7；每輪仍只有一次 638,976,000-byte H2D 與 22,340 bytes D2H。GPU P95 520.7 ms 來自 5 個樣本中兩個
+與 CPU 輪交錯時的離群值，單獨連續 100 張的 warm median／P95 為 226.8／232.1 ms，判定 0 筆不同，
+RSS 768.2→771.5 MiB、VRAM 2919 MiB 維持平台，pool 1 次配置／99 次重用／0 次脫離、無 fallback。
+
+代價：session 存活期間常駐一塊影像大小的 host 記憶體（`auto` 時為鎖定的 pinned memory，正式尺寸約 609 MiB）。
+批量與監控結束即關閉 session；GUI 單張檢測的 session 在 Recipe 不變時保留。記憶體吃緊的機台可設
+`AOI_HOST_IMAGE_BUFFER=pageable` 或 `off`。本輪修改 `.cu`、header 與 native smoke，DLL 已以 CUDA 13.3、`sm_86`
+重編，`build_cuda_dll.ps1 -RunTests` 的 native smoke 與完整 validator 通過，`dumpbin /dependents` 與前一版相同。
+證據：`outputs_validation/host_image_buffer_ab/`（`ab_off_vs_pageable.json`、`ab_off_vs_pageable_vs_auto.json`、
+`production_final.json`、`stability_100.json`）。
+
 ### v1.6.2 CUDA-enabled 發行範圍
 
 v1.6.2 收錄本頁「CCL＋ring CNR 留在 device」、「ring 統計平行化」、「BMP 平行 reader」、profiler／
