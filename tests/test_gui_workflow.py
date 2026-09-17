@@ -607,6 +607,32 @@ class GuiWorkflowTests(unittest.TestCase):
         self.assertEqual(built["203-AS-SN-1"]["params"]["blur_size"], 5)
         self.assertEqual(built["203-AS-SN-1"]["params"]["adaptive_c"], 2.5)
 
+    def test_flow_test_recipe_mode_is_admin_only_and_round_trips(self):
+        detector_id = "999-FLOW-TEST"
+        recipe = RecipeManager().load(Path("recipes/FLOW_TEST_AOI_01.yaml"))
+        recipe["detectors"][detector_id]["params"].update(
+            {"mode": "ng", "defect_x": 7, "defect_width": 40}
+        )
+        screen = DesignerScreen()
+        screen.set_recipe(recipe)
+        screen._select_detector(detector_id)
+        widgets = screen._param_widgets[detector_id]
+
+        self.assertIsNone(screen.param_form.labelForField(widgets["mode"]))
+        built = screen.build_recipe()["detectors"][detector_id]["params"]
+        self.assertEqual((built["mode"], built["defect_x"], built["defect_width"]), ("ng", 7, 40))
+
+        screen.set_mode("admin")
+        screen._select_detector(detector_id)
+        mode = screen._param_widgets[detector_id]["mode"]
+        self.assertIsNotNone(screen.param_form.labelForField(mode))
+        screen._set_dirty(False)
+        mode.setCurrentIndex(mode.findData("error"))
+        self.assertTrue(screen.is_dirty())
+        self.assertEqual(
+            screen.build_recipe()["detectors"][detector_id]["params"]["mode"], "error"
+        )
+
     def test_yolox_model_file_dialog_validates_and_switches_registry_model(self):
         model_root = Path("models/yolox")
         with tempfile.TemporaryDirectory(prefix="visionflow_yolox_file_") as temporary:

@@ -261,7 +261,10 @@ CPU 切圖預設會依 ROI 數量與總裁切量選擇序列或小型 worker poo
 | `505-AS-SN-1` | 固定反相多邊形 | — |
 | `506-CS-SN-1` | 固定二值化多邊形 | — |
 | `900-CS-AP-1` | 雙框間距 | `900` |
+| `999-FLOW-TEST` | 流程驗證（不檢測產品，依 `mode` 固定回傳 PASS／NG／錯誤） | — |
 | `yolox` | ONNX Runtime YOLOX 物件偵測 | — |
+
+`999-FLOW-TEST` 只跑共用 Gray plan，再依 `mode` 回傳固定結果：`pass` 全部 PASS、`ng` 每個 Tile 回報一個固定 NG 框（位置為內參、寬高為外參，超出 Tile 時裁到 Tile 內）、`error` 丟出錯誤。搭配 [`recipes/FLOW_TEST_AOI_01.yaml`](recipes/FLOW_TEST_AOI_01.yaml) 可驗證 CLI、批量、GUI 的輸出、報表與 ERROR 處理，不可用於產線判定。
 
 `RecipeManager` 會將表中的舊 ID 正規化為正式 ID；同時出現新舊 ID 時會拒絕載入，避免設定互相覆蓋。已移除的 `202` 不提供相容別名。
 

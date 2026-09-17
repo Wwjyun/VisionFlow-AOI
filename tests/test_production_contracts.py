@@ -122,6 +122,7 @@ class StrictRecipeContractTests(unittest.TestCase):
                 "inner_target_height", "inner_height_tolerance",
                 "max_edge_gap", "roi_inset_px",
             },
+            "999-FLOW-TEST": {"defect_width", "defect_height"},
             "yolox": {"min_box_area_px"},
         }
         expected_inner = {
@@ -186,6 +187,7 @@ class StrictRecipeContractTests(unittest.TestCase):
                 "outer_contour_mode", "inner_adaptive_block_size",
                 "inner_adaptive_c", "inner_invert", "inner_contour_mode",
             },
+            "999-FLOW-TEST": {"mode", "defect_x", "defect_y"},
             "yolox": {
                 "model_id", "confidence_threshold", "nms_iou_threshold",
                 "target_class_ids", "max_detections", "inference_backend",

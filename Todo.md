@@ -140,6 +140,7 @@
 - [x] Detector 505-AS-SN-1：固定執行 Gray → 一般反相二值化（預設門檻 120）→ 四邊屏蔽 → LIST contours → 多邊形近似；接受面積 100～100000 且至少 3 頂點的候選，抓到即 NG、未抓到即 PASS。
 - [x] 900-CS-AP-1（舊 ID：900）遷移成 cached CPU DAG plan，共用一次 gray 產生 outer global 與 inner adaptive masks。
 - [x] 900-CS-AP-1 DAG 接上 CUDA/native executor，共用 device gray 並只下載必要 masks。
+- [x] 流程驗證 Detector `999-FLOW-TEST` 與 `recipes/FLOW_TEST_AOI_01.yaml`：只跑共用 Gray plan，依 `mode` 固定回傳 PASS、每 Tile 一個固定 NG 框或錯誤，用來驗證 CLI／批量／GUI 流程；不可用於產線判定。
 - [x] 401/401-1/401-2 的 `findContours` 與少量幾何分析暫留 CPU，只下載 binary mask。
 - [x] 401-2 contour mask 改為局部 bbox mask，避免每個 contour 配置整張 ROI mask。
 - [ ] 評估 401-2 white-pixel reduction 移至 GPU，只下載統計值與必要 mask。（2026-09-14 依使用者指示暫緩：401-CS-AP-2 可能不再使用、目前僅保留，除非恢復使用否則不投入 GPU 化；已拆出 `white_ratio_analysis` profiler；CPU bbox-local counting 改用 OpenCV countNonZero/bitwise_and，512² synthetic median 0.0343→0.0151 ms；GPU 搬移待 RTX/production 佔比證明）
@@ -900,6 +901,8 @@ vs 原本 `[255,255,20,20]`）。因此「標籤編號順序」對 202 的最終
 - [ ] 加速不得犧牲 GUI 回應、打包啟動、結果追溯、錯誤訊息或 CPU fallback。
 
 ## 完成紀錄
+
+- [x] 2026-09-17：**流程驗證 Detector `999-FLOW-TEST`。** 新增 `detectors/detector_999_flow_test.py`，註冊於 `DetectorManager`、GUI 中文名稱「流程驗證（不檢測）」與缺陷類型標籤。偵測器只跑 cached 共用 `Gray` plan（CPU 參考與 CUDA／native plan／缺 primitive fallback／失敗整顆 CPU 重跑都走既有路徑），再依內參 `mode` 回傳固定結果：`pass` 無缺陷、`ng` 每個 Tile 回報一個 tile-local 固定矩形（位置 `defect_x`／`defect_y` 為內參、`defect_width`／`defect_height` 為外參，超出 Tile 時裁到 Tile 內，metadata 含要求框與框內灰階平均）、`error` 丟出 `FlowTestDetectorError`。新增 `recipes/FLOW_TEST_AOI_01.yaml`（512 grid、無 overlap、預設 `pass`，檔頭註明不可用於產線）。新增 `tests/test_detector_999_flow_test.py`（14 項：註冊與內外參、Recipe 驗證、Gray 與 OpenCV 等價及 plan cache、三種模式與裁切、native plan／缺 primitive 與 strict CUDA／GPU 失敗 CPU 重跑、CLI PASS=0／NG=2 exit code 與 overlay／NG tile／CSV／JSON 及 6 個 `bbox_global`、CLI error 傳出、批量 PASS／NG／ERROR 摘要與輸出順序），`test_production_contracts` 內外參清單與 `test_gui_workflow`（Engineer 隱藏 `mode` 且保留值、Admin 修改後寫回 Recipe）同步更新；README Detector 表補上說明。未修改 CUDA source／header／ABI／DLL。
 
 - [x] 2026-09-17：重整根目錄 `README.md` 為專案入口文件；將快速開始、操作入口、架構、Recipe、切圖／Detector、GUI 權限、CCD 實際完成度、輸出、CUDA、獨立工具、打包驗證與文件導覽重新分層，刪除首頁內過度細碎且容易過期的 Detector 公式與歷代 GPU 實驗敘述，改連結至 `gpu/README.md`、`tools/README.md`、`docs/` 與 `Todo.md`。同步更正 Sapera LT 相機 binding 仍待實作與相機機台驗證的狀態，保留 v1.6.2 已有 RTX 3090 數據但明確限制其適用範圍；未修改 runtime、Recipe、CUDA source／header／ABI／DLL。
 

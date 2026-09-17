@@ -14,6 +14,7 @@ from detectors.detector_503_cs_sn_1 import Detector503CsSn1
 from detectors.detector_505_as_sn_1 import Detector505AsSn1
 from detectors.detector_506_cs_sn_1 import Detector506CsSn1
 from detectors.detector_900 import Detector900
+from detectors.detector_999_flow_test import Detector999FlowTest
 from detectors.detector_yolox import DetectorYolox
 
 
@@ -30,6 +31,7 @@ class DetectorManager:
             Detector505AsSn1.detector_id: Detector505AsSn1,
             Detector506CsSn1.detector_id: Detector506CsSn1,
             Detector900.detector_id: Detector900,
+            Detector999FlowTest.detector_id: Detector999FlowTest,
             DetectorYolox.detector_id: DetectorYolox,
         }
         self._ai_session_manager = ai_session_manager
