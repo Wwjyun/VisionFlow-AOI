@@ -73,6 +73,7 @@ class FolderMonitorProcessor(LogMixin):
         item_callback: MonitorItemCallback | None = None,
         stop_callback: MonitorStopCallback | None = None,
         warmup_image_path: Path | None = None,
+        gpu_session: GpuExecutionSession | None = None,
     ):
         self.input_dir = Path(input_dir)
         self.recipe_path = Path(recipe_path)
@@ -85,6 +86,7 @@ class FolderMonitorProcessor(LogMixin):
         self.item_callback = item_callback
         self.stop_callback = stop_callback
         self.warmup_image_path = Path(warmup_image_path) if warmup_image_path else None
+        self.gpu_session = gpu_session
         self._seen: set[Path] = set()
         self._pending: list[Path] = []
         self._file_states: dict[Path, tuple[int, int, int]] = {}
@@ -114,7 +116,7 @@ class FolderMonitorProcessor(LogMixin):
             len(self._seen),
         )
         session_started = time.perf_counter()
-        with GpuExecutionSession.from_recipe_path(self.recipe_path, workload="throughput") as gpu_session:
+        with GpuExecutionSession.scoped(self.recipe_path, self.gpu_session) as gpu_session:
             session_ms = round((time.perf_counter() - session_started) * 1000.0, 1)
             gpu_warmup = self._warm_up_gpu(gpu_session, session_ms)
             self._progress(0, f"{GpuExecutionSession.warm_up_notice(gpu_warmup)}正在監控 {self.input_dir}")

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from contextlib import contextmanager
 from pathlib import Path
 
 from PySide6.QtCore import QObject, Signal, Slot
@@ -20,6 +21,16 @@ from core.performance import PipelineProfiler
 from core.pipeline import AOIPipeline
 from core.recipe_manager import RecipeManager
 from core.tiler import create_tiler
+
+
+@contextmanager
+def _shared_session(cache: GpuExecutionSessionCache | None, recipe_path: Path):
+    """Hold the GUI session for one run, or yield ``None`` so the processor builds its own."""
+    if cache is None:
+        yield None
+        return
+    with cache.use(recipe_path) as session:
+        yield session
 
 
 class ImagePreviewWorker(QObject, LogMixin):
@@ -110,19 +121,15 @@ class InspectionWorker(QObject, LogMixin):
     def run(self) -> None:
         try:
             self.logger.info("GUI inspection worker started: image=%s recipe=%s", self.image_path, self.recipe_path)
-            gpu_session = (
-                self.gpu_session_cache.session_for(self.recipe_path)
-                if self.gpu_session_cache is not None
-                else None
-            )
-            pipeline = AOIPipeline(
-                recipe_path=self.recipe_path,
-                output_dir=self.output_dir,
-                progress_callback=self.progress.emit,
-                output_overrides=self.output_overrides,
-                gpu_session=gpu_session,
-            )
-            result = pipeline.run(self.image_path)
+            with _shared_session(self.gpu_session_cache, self.recipe_path) as gpu_session:
+                pipeline = AOIPipeline(
+                    recipe_path=self.recipe_path,
+                    output_dir=self.output_dir,
+                    progress_callback=self.progress.emit,
+                    output_overrides=self.output_overrides,
+                    gpu_session=gpu_session,
+                )
+                result = pipeline.run(self.image_path)
             CsvSummaryExporter.finalize_result(self.output_dir, result)
         except Exception as exc:
             self.logger.exception("GUI inspection worker failed: image=%s recipe=%s", self.image_path, self.recipe_path)
@@ -178,6 +185,7 @@ class BatchInspectionWorker(QObject, LogMixin):
         output_dir: Path,
         output_overrides: dict | None = None,
         recursive: bool = False,
+        gpu_session_cache: GpuExecutionSessionCache | None = None,
     ):
         super().__init__()
         self.input_dir = Path(input_dir)
@@ -185,20 +193,23 @@ class BatchInspectionWorker(QObject, LogMixin):
         self.output_dir = Path(output_dir)
         self.output_overrides = output_overrides
         self.recursive = recursive
+        self.gpu_session_cache = gpu_session_cache
 
     @Slot()
     def run(self) -> None:
         try:
             self.logger.info("GUI batch worker started: input=%s recipe=%s", self.input_dir, self.recipe_path)
-            processor = BatchInspectionProcessor(
-                input_dir=self.input_dir,
-                recipe_path=self.recipe_path,
-                output_dir=self.output_dir,
-                output_overrides=self.output_overrides,
-                recursive=self.recursive,
-                progress_callback=self.progress.emit,
-            )
-            result = processor.run()
+            with _shared_session(self.gpu_session_cache, self.recipe_path) as gpu_session:
+                processor = BatchInspectionProcessor(
+                    input_dir=self.input_dir,
+                    recipe_path=self.recipe_path,
+                    output_dir=self.output_dir,
+                    output_overrides=self.output_overrides,
+                    recursive=self.recursive,
+                    progress_callback=self.progress.emit,
+                    gpu_session=gpu_session,
+                )
+                result = processor.run()
         except Exception as exc:
             self.logger.exception("GUI batch worker failed: input=%s recipe=%s", self.input_dir, self.recipe_path)
             self.failed.emit(str(exc))
@@ -222,6 +233,7 @@ class FolderMonitorWorker(QObject, LogMixin):
         output_overrides: dict | None = None,
         processed_move_dir: Path | None = None,
         warmup_image_path: Path | None = None,
+        gpu_session_cache: GpuExecutionSessionCache | None = None,
     ):
         super().__init__()
         self.input_dir = Path(input_dir)
@@ -230,6 +242,7 @@ class FolderMonitorWorker(QObject, LogMixin):
         self.output_overrides = output_overrides
         self.processed_move_dir = Path(processed_move_dir) if processed_move_dir else None
         self.warmup_image_path = Path(warmup_image_path) if warmup_image_path else None
+        self.gpu_session_cache = gpu_session_cache
         self._stop_requested = False
 
     def stop(self) -> None:
@@ -239,18 +252,20 @@ class FolderMonitorWorker(QObject, LogMixin):
     def run(self) -> None:
         try:
             self.logger.info("GUI monitor worker started: input=%s recipe=%s", self.input_dir, self.recipe_path)
-            processor = FolderMonitorProcessor(
-                input_dir=self.input_dir,
-                recipe_path=self.recipe_path,
-                output_dir=self.output_dir,
-                output_overrides=self.output_overrides,
-                processed_move_dir=self.processed_move_dir,
-                progress_callback=self.progress.emit,
-                item_callback=self.image_processed.emit,
-                stop_callback=lambda: self._stop_requested,
-                warmup_image_path=self.warmup_image_path,
-            )
-            result = processor.run()
+            with _shared_session(self.gpu_session_cache, self.recipe_path) as gpu_session:
+                processor = FolderMonitorProcessor(
+                    input_dir=self.input_dir,
+                    recipe_path=self.recipe_path,
+                    output_dir=self.output_dir,
+                    output_overrides=self.output_overrides,
+                    processed_move_dir=self.processed_move_dir,
+                    progress_callback=self.progress.emit,
+                    item_callback=self.image_processed.emit,
+                    stop_callback=lambda: self._stop_requested,
+                    warmup_image_path=self.warmup_image_path,
+                    gpu_session=gpu_session,
+                )
+                result = processor.run()
         except Exception as exc:
             self.logger.exception("GUI monitor worker failed: input=%s recipe=%s", self.input_dir, self.recipe_path)
             self.failed.emit(str(exc))
@@ -273,6 +288,7 @@ class CameraMonitorWorker(QObject, LogMixin):
         output_dir: Path,
         output_overrides: dict | None = None,
         warmup_image_path: Path | None = None,
+        gpu_session_cache: GpuExecutionSessionCache | None = None,
     ):
         super().__init__()
         self.frame_queue = frame_queue
@@ -280,6 +296,7 @@ class CameraMonitorWorker(QObject, LogMixin):
         self.output_dir = Path(output_dir)
         self.output_overrides = output_overrides
         self.warmup_image_path = Path(warmup_image_path) if warmup_image_path else None
+        self.gpu_session_cache = gpu_session_cache
         self._stop_requested = False
 
     def stop(self) -> None:
@@ -289,17 +306,19 @@ class CameraMonitorWorker(QObject, LogMixin):
     def run(self) -> None:
         try:
             self.logger.info("GUI camera monitor worker started: recipe=%s", self.recipe_path)
-            processor = CameraMonitorProcessor(
-                frame_queue=self.frame_queue,
-                recipe_path=self.recipe_path,
-                output_dir=self.output_dir,
-                output_overrides=self.output_overrides,
-                progress_callback=self.progress.emit,
-                item_callback=self.image_processed.emit,
-                stop_callback=lambda: self._stop_requested,
-                warmup_image_path=self.warmup_image_path,
-            )
-            result = processor.run()
+            with _shared_session(self.gpu_session_cache, self.recipe_path) as gpu_session:
+                processor = CameraMonitorProcessor(
+                    frame_queue=self.frame_queue,
+                    recipe_path=self.recipe_path,
+                    output_dir=self.output_dir,
+                    output_overrides=self.output_overrides,
+                    progress_callback=self.progress.emit,
+                    item_callback=self.image_processed.emit,
+                    stop_callback=lambda: self._stop_requested,
+                    warmup_image_path=self.warmup_image_path,
+                    gpu_session=gpu_session,
+                )
+                result = processor.run()
         except Exception as exc:
             self.logger.exception("GUI camera monitor worker failed: recipe=%s", self.recipe_path)
             self.frame_queue.close()

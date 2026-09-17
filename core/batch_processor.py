@@ -66,6 +66,7 @@ class BatchInspectionProcessor(LogMixin):
         recursive: bool = False,
         progress_callback: BatchProgressCallback | None = None,
         max_workers: int | None = None,
+        gpu_session: GpuExecutionSession | None = None,
     ):
         self.input_dir = Path(input_dir)
         self.recipe_path = Path(recipe_path)
@@ -74,6 +75,8 @@ class BatchInspectionProcessor(LogMixin):
         self.recursive = recursive
         self.progress_callback = progress_callback
         self.max_workers = max_workers
+        # A GUI-owned session outlives this batch so its context, buffers and warm-up are reused.
+        self.gpu_session = gpu_session
         self._gc_interval = self._resolve_gc_interval()
         self._gc_lock = threading.Lock()
         self._gc_counter = 0
@@ -120,8 +123,8 @@ class BatchInspectionProcessor(LogMixin):
         completed = 0
         worker_count = self._worker_count(total)
         session_started = time.perf_counter()
-        with self._opencv_thread_budget(worker_count), GpuExecutionSession.from_recipe_path(
-            self.recipe_path, workload="throughput"
+        with self._opencv_thread_budget(worker_count), GpuExecutionSession.scoped(
+            self.recipe_path, self.gpu_session
         ) as gpu_session:
             # The DLL and CUDA context exist once the session is built, before any image is timed.
             # No sample run: it would cost a full inspection to save a one-time allocation.

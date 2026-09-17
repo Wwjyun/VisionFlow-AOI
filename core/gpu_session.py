@@ -44,19 +44,43 @@ class GpuExecutionSession(LogMixin):
         # Runs on this session are serialized, so one reusable decoded-image backing serves them all.
         self.host_image_buffers = HostImageBufferPool(runtime)
 
-    @classmethod
-    def from_recipe(cls, recipe: dict, workload: str = "latency") -> "GpuExecutionSession":
+    @staticmethod
+    def cuda_requested(recipe: dict) -> bool:
+        """Whether a pipeline run of ``recipe`` can use the CUDA runtime at all."""
         gpu_config = recipe.get("gpu", {}) or {}
         manager = RecipeManager()
-        detector_configs = manager.enabled_detectors(recipe)
-        requested = manager.gpu_feature_requested(gpu_config, "tiling") or (
+        return bool(manager.gpu_feature_requested(gpu_config, "tiling") or (
             manager.gpu_mode(gpu_config) != "cpu"
             and any(
                 bool(config.get("use_gpu", False))
                 and DetectorManager.uses_native_cuda_runtime(detector_id)
-                for detector_id, config in detector_configs.items()
+                for detector_id, config in manager.enabled_detectors(recipe).items()
             )
+        ))
+
+    @staticmethod
+    def identity(recipe: dict, workload: str = "latency") -> tuple:
+        """Every recipe value a session is built from; equal identities can share one session.
+
+        Detector parameters, tiling geometry, decisions and outputs are read per pipeline run, so
+        editing them (for example an area limit saved from the Designer) keeps the warm session.
+        """
+        gpu_config = recipe.get("gpu", {}) or {}
+        manager = RecipeManager()
+        return (
+            str(GpuRuntime._resolve_path(str(gpu_config.get("dll_path", GpuRuntime.DEFAULT_DLL)))),
+            manager.gpu_mode(gpu_config),
+            bool(manager.gpu_fallback_enabled(gpu_config)),
+            1 if workload == "latency" else int(gpu_config.get("queue_depth", 8)),
+            GpuExecutionSession.cuda_requested(recipe),
+            str(workload),
         )
+
+    @classmethod
+    def from_recipe(cls, recipe: dict, workload: str = "latency") -> "GpuExecutionSession":
+        gpu_config = recipe.get("gpu", {}) or {}
+        manager = RecipeManager()
+        requested = cls.cuda_requested(recipe)
         runtime = GpuRuntime(
             gpu_config.get("dll_path", GpuRuntime.DEFAULT_DLL),
             fallback_to_cpu=manager.gpu_fallback_enabled(gpu_config),
@@ -69,6 +93,16 @@ class GpuExecutionSession(LogMixin):
     @classmethod
     def from_recipe_path(cls, recipe_path: Path, workload: str = "latency") -> "GpuExecutionSession":
         return cls.from_recipe(RecipeManager().load(Path(recipe_path)), workload=workload)
+
+    @classmethod
+    @contextmanager
+    def scoped(cls, recipe_path: Path, injected: "GpuExecutionSession | None" = None, workload: str = "throughput"):
+        """Yield ``injected`` untouched (its owner closes it) or a session closed when the run ends."""
+        if injected is not None:
+            yield injected
+            return
+        with cls.from_recipe_path(Path(recipe_path), workload=workload) as session:
+            yield session
 
     def runtime_for(self, gpu_config: dict, requested: bool) -> GpuRuntime:
         if self._closed:
@@ -251,41 +285,65 @@ class GpuExecutionSession(LogMixin):
 
 
 class GpuExecutionSessionCache:
-    """Lazily reuse one GUI-style session until the recipe identity changes."""
+    """Keep one GUI-owned session shared by single, warm-up, batch and monitor runs.
 
-    def __init__(self, workload: str = "latency"):
+    The session is rebuilt only when ``GpuExecutionSession.identity`` changes (DLL path, mode,
+    fallback, queue depth, whether CUDA is requested), so saving Detector or geometry edits keeps
+    the CUDA context, device buffers, pinned host image buffer and warm-up. Long runs hold the
+    session through ``use``; a session replaced or invalidated while in use is closed only after
+    its last user returns it, never under a running batch or monitor.
+    """
+
+    def __init__(self, workload: str = "latency", recipe_manager: RecipeManager | None = None):
         self.workload = workload
+        self._recipe_manager = recipe_manager or RecipeManager()
         self._lock = threading.RLock()
-        self._key: tuple[str, int, int] | None = None
+        self._key: tuple | None = None
         self._session: GpuExecutionSession | None = None
-
-    @staticmethod
-    def _recipe_key(recipe_path: Path) -> tuple[str, int, int]:
-        resolved = Path(recipe_path).resolve()
-        stat = resolved.stat()
-        return str(resolved), int(stat.st_mtime_ns), int(stat.st_size)
+        self._users: dict[int, int] = {}
+        self._retired: dict[int, GpuExecutionSession] = {}
 
     def session_for(self, recipe_path: Path) -> GpuExecutionSession:
-        key = self._recipe_key(recipe_path)
+        """Return the current compatible session without holding it; prefer ``use`` for runs."""
         with self._lock:
-            if self._session is not None and self._key == key:
-                return self._session
-            self._close_locked()
-            session = GpuExecutionSession.from_recipe_path(
-                Path(recipe_path), workload=self.workload
-            )
-            self._session = session
-            self._key = key
-            return session
+            return self._session_for_locked(Path(recipe_path))
+
+    @contextmanager
+    def use(self, recipe_path: Path):
+        with self._lock:
+            session = self._session_for_locked(Path(recipe_path))
+            self._users[id(session)] = self._users.get(id(session), 0) + 1
+        try:
+            yield session
+        finally:
+            with self._lock:
+                remaining = self._users.get(id(session), 1) - 1
+                if remaining > 0:
+                    self._users[id(session)] = remaining
+                else:
+                    self._users.pop(id(session), None)
+                    retired = self._retired.pop(id(session), None)
+                    if retired is not None:
+                        retired.close()
+
+    def _session_for_locked(self, recipe_path: Path) -> GpuExecutionSession:
+        recipe = self._recipe_manager.load(recipe_path)
+        key = GpuExecutionSession.identity(recipe, self.workload)
+        if self._session is not None and self._key == key:
+            return self._session
+        self._close_locked()
+        self._session = GpuExecutionSession.from_recipe(recipe, workload=self.workload)
+        self._key = key
+        return self._session
 
     def warm_up(self, recipe_path: Path, image_path: Path | None = None, progress_callback=None) -> dict:
         """Create (or reuse) the session for ``recipe_path`` and warm it; see ``GpuExecutionSession.warm_up``."""
         if progress_callback is not None:
             progress_callback(0, "正在建立 GPU session")
         started = time.perf_counter()
-        session = self.session_for(Path(recipe_path))
-        session_ms = round((time.perf_counter() - started) * 1000.0, 1)
-        summary = session.warm_up(Path(recipe_path), image_path, progress_callback=progress_callback)
+        with self.use(Path(recipe_path)) as session:
+            session_ms = round((time.perf_counter() - started) * 1000.0, 1)
+            summary = session.warm_up(Path(recipe_path), image_path, progress_callback=progress_callback)
         return {"session_ms": session_ms, **summary}
 
     def invalidate(self) -> None:
@@ -299,5 +357,9 @@ class GpuExecutionSessionCache:
         session = self._session
         self._session = None
         self._key = None
-        if session is not None:
+        if session is None:
+            return
+        if self._users.get(id(session), 0) > 0:
+            self._retired[id(session)] = session
+        else:
             session.close()

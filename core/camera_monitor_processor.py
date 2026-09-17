@@ -111,6 +111,7 @@ class CameraMonitorProcessor(LogMixin):
         item_callback: MonitorItemCallback | None = None,
         stop_callback: MonitorStopCallback | None = None,
         warmup_image_path: Path | None = None,
+        gpu_session: GpuExecutionSession | None = None,
     ):
         self.frame_queue = frame_queue
         self.recipe_path = Path(recipe_path)
@@ -120,6 +121,7 @@ class CameraMonitorProcessor(LogMixin):
         self.item_callback = item_callback
         self.stop_callback = stop_callback
         self.warmup_image_path = Path(warmup_image_path) if warmup_image_path else None
+        self.gpu_session = gpu_session
         self._processed_count = 0
         self._dropped_count = 0
 
@@ -129,7 +131,7 @@ class CameraMonitorProcessor(LogMixin):
         monitor_output_dir.mkdir(parents=True, exist_ok=True)
         self.logger.info("Camera monitor started: recipe=%s output=%s", self.recipe_path, monitor_output_dir)
         session_started = time.perf_counter()
-        with GpuExecutionSession.from_recipe_path(self.recipe_path, workload="throughput") as gpu_session:
+        with GpuExecutionSession.scoped(self.recipe_path, self.gpu_session) as gpu_session:
             session_ms = round((time.perf_counter() - session_started) * 1000.0, 1)
             gpu_warmup = {
                 "session_ms": session_ms,

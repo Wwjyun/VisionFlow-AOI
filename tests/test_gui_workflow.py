@@ -5,7 +5,7 @@ import os
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import Mock, patch
+from unittest.mock import MagicMock, Mock, patch
 
 import yaml
 
@@ -175,8 +175,8 @@ class GuiWorkflowTests(unittest.TestCase):
 
     def test_single_inspection_worker_injects_cached_gpu_session(self):
         session = Mock()
-        cache = Mock()
-        cache.session_for.return_value = session
+        cache = MagicMock()
+        cache.use.return_value.__enter__.return_value = session
         pipeline = Mock()
         pipeline.run.return_value = {"final_result": "PASS"}
         worker = InspectionWorker(
@@ -187,7 +187,8 @@ class GuiWorkflowTests(unittest.TestCase):
         with patch("gui.workers.AOIPipeline", return_value=pipeline) as pipeline_type:
             worker.run()
 
-        cache.session_for.assert_called_once_with(Path("recipe.yaml"))
+        cache.use.assert_called_once_with(Path("recipe.yaml"))
+        cache.use.return_value.__exit__.assert_called_once()
         self.assertIs(pipeline_type.call_args.kwargs["gpu_session"], session)
         pipeline.run.assert_called_once_with(Path("input.png"))
 
@@ -251,6 +252,30 @@ class GuiWorkflowTests(unittest.TestCase):
 
                 window._on_gpu_warmup_finished({"status": "not_requested", "reason": "此 Recipe 未啟用 CUDA，不需要預熱"})
                 self.assertIn("不需要預熱", window.notice_bar.label.text())
+            finally:
+                window._inspection_gpu_sessions.close()
+                window.deleteLater()
+
+    def test_batch_and_folder_monitor_share_the_window_gpu_session_cache(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            settings = QSettings(str(Path(temp_dir) / "shared_session.ini"), QSettings.Format.IniFormat)
+            window = MainWindow(settings=settings)
+            try:
+                self.assertEqual(window._inspection_gpu_sessions.workload, "throughput")
+                window.recipe_path = Path("recipes/PRODUCT_A_AOI_01.yaml")
+                window.batch_dir = Path(temp_dir)
+                window._batch_controller.start = Mock()
+                window._run_batch_inspection()
+                batch_worker = window._batch_controller.start.call_args.args[0]
+                self.assertIs(batch_worker.gpu_session_cache, window._inspection_gpu_sessions)
+                window.batch_running = False
+
+                window.monitor_dir = Path(temp_dir)
+                window._monitor_controller.start = Mock()
+                window._start_monitoring()
+                monitor_worker = window._monitor_controller.start.call_args.args[0]
+                self.assertIs(monitor_worker.gpu_session_cache, window._inspection_gpu_sessions)
+                window.monitor_running = False
             finally:
                 window._inspection_gpu_sessions.close()
                 window.deleteLater()

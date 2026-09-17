@@ -231,7 +231,10 @@ class MainWindow(QMainWindow, LogMixin):
         self._preview_started_at: float | None = None
         self._inspection_thread: QThread | None = None
         self._inspection_worker: InspectionWorker | None = None
-        self._inspection_gpu_sessions = GpuExecutionSessionCache(workload="latency")
+        # One GPU session for single inspection, warm-up, batch and monitor, so a warm-up or an earlier
+        # run also prepares the next batch/monitor. Runs on it are serialized; throughput queue depth
+        # only bounds concurrent requests inside one run.
+        self._inspection_gpu_sessions = GpuExecutionSessionCache(workload="throughput")
         self._batch_thread: QThread | None = None
         self._batch_worker: BatchInspectionWorker | None = None
         self._monitor_thread: QThread | None = None
@@ -725,6 +728,7 @@ class MainWindow(QMainWindow, LogMixin):
             output_dir=Path(self.output_dir or "outputs"),
             output_overrides=dict(self.output_opts),
             recursive=self.run_screen.batch_recursive(),
+            gpu_session_cache=self._inspection_gpu_sessions,
         )
         self._batch_controller.start(
             worker,
@@ -888,6 +892,7 @@ class MainWindow(QMainWindow, LogMixin):
                 output_dir=Path(self.output_dir or "outputs"),
                 output_overrides=dict(self.output_opts),
                 warmup_image_path=self.image_path,
+                gpu_session_cache=self._inspection_gpu_sessions,
             )
         else:
             worker = FolderMonitorWorker(
@@ -897,6 +902,7 @@ class MainWindow(QMainWindow, LogMixin):
                 output_overrides=dict(self.output_opts),
                 processed_move_dir=self.monitor_move_dir,
                 warmup_image_path=self.image_path,
+                gpu_session_cache=self._inspection_gpu_sessions,
             )
         self._monitor_controller.start(
             worker,

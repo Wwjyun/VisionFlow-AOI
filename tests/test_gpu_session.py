@@ -8,6 +8,7 @@ from unittest.mock import Mock, patch
 
 import cv2
 import numpy as np
+import yaml
 
 from core.batch_processor import BatchImageResult, BatchInspectionProcessor
 from core.gpu_runtime import GpuResidentImage, GpuRuntime, GpuRuntimeError
@@ -19,6 +20,15 @@ from core.tiler import Tile
 
 
 ROOT = Path(__file__).resolve().parents[1]
+
+
+def _write_recipe(path: Path, edit=None) -> Path:
+    """Write a valid copy of a production recipe, optionally edited, for session-cache identity tests."""
+    recipe = yaml.safe_load((ROOT / "recipes" / "PRODUCT_A_NEGATIVE_401_AOI_01.yaml").read_text(encoding="utf-8"))
+    if edit is not None:
+        edit(recipe)
+    path.write_text(yaml.safe_dump(recipe, allow_unicode=True, sort_keys=False), encoding="utf-8")
+    return path
 
 
 class _CloseTrackingRuntime:
@@ -154,35 +164,105 @@ class GpuExecutionSessionTests(unittest.TestCase):
         finally:
             session.close()
 
-    def test_gui_session_cache_reuses_unchanged_recipe_and_invalidates_changed_recipe(self):
-        first_session = Mock()
-        second_session = Mock()
+    def test_gui_session_cache_keeps_session_for_non_gpu_edits_and_rebuilds_for_gpu_changes(self):
+        sessions = [Mock(name="first"), Mock(name="second"), Mock(name="third")]
         with tempfile.TemporaryDirectory(prefix="visionflow_gui_session_") as temporary:
-            recipe_path = Path(temporary) / "recipe.yaml"
-            recipe_path.write_text("name: first\n", encoding="utf-8")
-            cache = GpuExecutionSessionCache()
-            with patch.object(
-                GpuExecutionSession,
-                "from_recipe_path",
-                side_effect=[first_session, second_session],
-            ) as factory:
-                self.assertIs(cache.session_for(recipe_path), first_session)
-                self.assertIs(cache.session_for(recipe_path), first_session)
-                recipe_path.write_text("name: second-and-longer\n", encoding="utf-8")
-                self.assertIs(cache.session_for(recipe_path), second_session)
+            root = Path(temporary)
+
+            def enable_gpu(recipe):
+                recipe["gpu"] = {"mode": "auto", "dll_path": "gpu/visionflow_cuda.dll", "fallback_to_cpu": True}
+                recipe["detectors"]["401-AS-SN-1"]["use_gpu"] = True
+
+            recipe_path = _write_recipe(root / "recipe.yaml", enable_gpu)
+            cache = GpuExecutionSessionCache(workload="throughput")
+            with patch.object(GpuExecutionSession, "from_recipe", side_effect=sessions) as factory:
+                self.assertIs(cache.session_for(recipe_path), sessions[0])
+                self.assertIs(cache.session_for(recipe_path), sessions[0])
+
+                # Outer Detector parameters, tiling and another recipe file with the same GPU identity
+                # keep the warm session instead of closing the CUDA context.
+                def edit_outer(recipe):
+                    enable_gpu(recipe)
+                    recipe["detectors"]["401-AS-SN-1"]["params"]["max_area"] = 123456
+                    recipe["tile"]["width"] = int(recipe["tile"].get("width", 512)) + 16
+
+                _write_recipe(recipe_path, edit_outer)
+                self.assertIs(cache.session_for(recipe_path), sessions[0])
+                other_path = _write_recipe(root / "other.yaml", edit_outer)
+                self.assertIs(cache.session_for(other_path), sessions[0])
+                sessions[0].close.assert_not_called()
+
+                def strict(recipe):
+                    edit_outer(recipe)
+                    recipe["gpu"]["fallback_to_cpu"] = False
+
+                _write_recipe(recipe_path, strict)
+                self.assertIs(cache.session_for(recipe_path), sessions[1])
+                sessions[0].close.assert_called_once_with()
+
+                def cpu_only(recipe):
+                    strict(recipe)
+                    recipe["detectors"]["401-AS-SN-1"]["use_gpu"] = False
+
+                _write_recipe(recipe_path, cpu_only)
+                self.assertIs(cache.session_for(recipe_path), sessions[2])
                 cache.close()
 
-        self.assertEqual(factory.call_count, 2)
-        first_session.close.assert_called_once_with()
-        second_session.close.assert_called_once_with()
+        self.assertEqual(factory.call_count, 3)
+        self.assertEqual([call.kwargs["workload"] for call in factory.call_args_list], ["throughput"] * 3)
+        for session in sessions:
+            session.close.assert_called_once_with()
+
+    def test_session_identity_covers_every_session_constructor_input(self):
+        recipe = yaml.safe_load((ROOT / "recipes" / "PRODUCT_A_NEGATIVE_401_AOI_01.yaml").read_text(encoding="utf-8"))
+        recipe["gpu"] = {"mode": "auto", "dll_path": "gpu/visionflow_cuda.dll", "fallback_to_cpu": True, "queue_depth": 4}
+        recipe["detectors"]["401-AS-SN-1"]["use_gpu"] = True
+        base = GpuExecutionSession.identity(recipe, "throughput")
+        variants = {
+            "dll_path": lambda r: r["gpu"].update(dll_path="other/visionflow_cuda.dll"),
+            "mode": lambda r: r["gpu"].update(mode="cuda"),
+            "fallback": lambda r: r["gpu"].update(fallback_to_cpu=False),
+            "queue_depth": lambda r: r["gpu"].update(queue_depth=2),
+            "requested": lambda r: r["detectors"]["401-AS-SN-1"].update(use_gpu=False),
+        }
+        for name, edit in variants.items():
+            changed = deepcopy(recipe)
+            edit(changed)
+            self.assertNotEqual(GpuExecutionSession.identity(changed, "throughput"), base, name)
+        self.assertNotEqual(GpuExecutionSession.identity(recipe, "latency"), base)
+        # The latency queue depth is fixed at 1, so gpu.queue_depth does not split latency sessions.
+        depth = deepcopy(recipe)
+        depth["gpu"]["queue_depth"] = 2
+        self.assertEqual(GpuExecutionSession.identity(depth, "latency"), GpuExecutionSession.identity(recipe, "latency"))
+        same = deepcopy(recipe)
+        same["detectors"]["401-AS-SN-1"]["params"]["min_area"] = 7
+        same["decision"] = {**same.get("decision", {}), "max_ng_count": 3}
+        self.assertEqual(GpuExecutionSession.identity(same, "throughput"), base)
+
+    def test_session_in_use_is_closed_only_after_its_last_user_returns(self):
+        sessions = [Mock(name="running"), Mock(name="replacement")]
+        with tempfile.TemporaryDirectory(prefix="visionflow_gui_session_use_") as temporary:
+            recipe_path = _write_recipe(Path(temporary) / "recipe.yaml")
+            cache = GpuExecutionSessionCache()
+            with patch.object(GpuExecutionSession, "from_recipe", side_effect=sessions):
+                with cache.use(recipe_path) as batch_session, cache.use(recipe_path) as single_session:
+                    self.assertIs(batch_session, sessions[0])
+                    self.assertIs(single_session, sessions[0])
+                    cache.invalidate()
+                    sessions[0].close.assert_not_called()
+                    self.assertIs(cache.session_for(recipe_path), sessions[1])
+                sessions[0].close.assert_called_once_with()
+                sessions[1].close.assert_not_called()
+                cache.close()
+        sessions[1].close.assert_called_once_with()
+        self.assertEqual((cache._users, cache._retired), ({}, {}))
 
     def _warm_up_with(self, session, image_path=None, pipeline=None):
         with tempfile.TemporaryDirectory(prefix="visionflow_warmup_cache_") as temporary:
-            recipe_path = Path(temporary) / "recipe.yaml"
-            recipe_path.write_text("name: warm\n", encoding="utf-8")
+            recipe_path = _write_recipe(Path(temporary) / "recipe.yaml")
             cache = GpuExecutionSessionCache()
             progress = []
-            with patch.object(GpuExecutionSession, "from_recipe_path", return_value=session) as factory, \
+            with patch.object(GpuExecutionSession, "from_recipe", return_value=session) as factory, \
                     patch("core.pipeline.AOIPipeline", return_value=pipeline) as pipeline_type:
                 summary = cache.warm_up(recipe_path, image_path, progress_callback=lambda *args: progress.append(args))
                 reused = cache.session_for(recipe_path)
@@ -264,11 +344,10 @@ class GpuExecutionSessionTests(unittest.TestCase):
     def test_gui_session_cache_explicit_invalidation_closes_once(self):
         fake_session = Mock()
         with tempfile.TemporaryDirectory(prefix="visionflow_gui_session_close_") as temporary:
-            recipe_path = Path(temporary) / "recipe.yaml"
-            recipe_path.write_text("name: recipe\n", encoding="utf-8")
+            recipe_path = _write_recipe(Path(temporary) / "recipe.yaml")
             cache = GpuExecutionSessionCache()
             with patch.object(
-                GpuExecutionSession, "from_recipe_path", return_value=fake_session
+                GpuExecutionSession, "from_recipe", return_value=fake_session
             ):
                 cache.session_for(recipe_path)
                 cache.invalidate()

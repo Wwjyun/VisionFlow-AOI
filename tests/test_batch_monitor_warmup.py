@@ -233,5 +233,85 @@ class BatchWarmupTests(unittest.TestCase):
         self.assertNotIn("gpu_warmup", result)
 
 
+class InjectedSessionTests(unittest.TestCase):
+    """A GUI-owned session is reused by batch and monitor runs and survives them."""
+
+    def test_batch_and_monitor_use_the_injected_session_without_building_or_closing_one(self):
+        with tempfile.TemporaryDirectory(prefix="visionflow_injected_session_") as temporary:
+            root = Path(temporary)
+            session = _fake_session({"status": "context_only", "image_used": False})
+            used = []
+            batch = BatchInspectionProcessor(
+                root, root / "recipe.yaml", root / "output", max_workers=1, gpu_session=session,
+            )
+            batch.discover_images = lambda: [root / "image0.png"]
+            monitor = FolderMonitorProcessor(
+                root, root / "recipe.yaml", root / "output", stop_callback=lambda: True, gpu_session=session,
+            )
+
+            def process_image(image_path, _output_dir, gpu_session):
+                used.append(gpu_session)
+                return BatchImageResult(image_path, "PASS", 0, 0, 1, 0.01, {}, {})
+
+            with patch("core.gpu_session.GpuExecutionSession.from_recipe_path") as factory, \
+                    patch.object(batch, "_process_image", side_effect=process_image), \
+                    patch("core.batch_processor.CsvSummaryExporter.write_summary", return_value=None):
+                batch_result = batch.run()
+                monitor_result = monitor.run()
+
+        factory.assert_not_called()
+        self.assertEqual(used, [session])
+        self.assertEqual(session.warm_up_before_run.call_count, 2)
+        session.__exit__.assert_not_called()
+        session.close.assert_not_called()
+        self.assertEqual(batch_result["summary"]["total"], 1)
+        self.assertEqual(monitor_result["gpu_warmup"]["status"], "context_only")
+
+    def test_gui_batch_and_monitor_workers_hold_the_shared_session_for_the_whole_run(self):
+        from gui.workers import BatchInspectionWorker, CameraMonitorWorker, FolderMonitorWorker
+
+        session = object()
+        cache = MagicMock()
+        cache.use.return_value.__enter__.return_value = session
+        workers = (
+            ("gui.workers.BatchInspectionProcessor",
+             BatchInspectionWorker(Path("images"), Path("recipe.yaml"), Path("output"), gpu_session_cache=cache)),
+            ("gui.workers.FolderMonitorProcessor",
+             FolderMonitorWorker(Path("watch"), Path("recipe.yaml"), Path("output"), gpu_session_cache=cache)),
+            ("gui.workers.CameraMonitorProcessor",
+             CameraMonitorWorker(MagicMock(), Path("recipe.yaml"), Path("output"), gpu_session_cache=cache)),
+        )
+        for target, worker in workers:
+            cache.use.reset_mock()
+            with patch(target) as processor_type:
+                exits_before_run = []
+                processor_type.return_value.run.side_effect = lambda: (
+                    exits_before_run.append(cache.use.return_value.__exit__.call_count) or {"summary": {}}
+                )
+                worker.run()
+            self.assertIs(processor_type.call_args.kwargs["gpu_session"], session, target)
+            cache.use.assert_called_once_with(Path("recipe.yaml"))
+            self.assertEqual(exits_before_run, [0], f"{target} released the session before its run ended")
+            cache.use.return_value.__exit__.assert_called_once()
+
+        # A strict CUDA failure raised by the run still returns the session to the cache.
+        cache.use.reset_mock()
+        failing = BatchInspectionWorker(Path("images"), Path("recipe.yaml"), Path("output"), gpu_session_cache=cache)
+        failures = []
+        failing.failed.connect(failures.append)
+        with patch("gui.workers.BatchInspectionProcessor") as processor_type:
+            processor_type.return_value.run.side_effect = GpuRuntimeError("嚴格 CUDA 模式無法開始檢測：no DLL")
+            failing.run()
+        self.assertEqual(failures, ["嚴格 CUDA 模式無法開始檢測：no DLL"])
+        cache.use.return_value.__exit__.assert_called_once()
+
+        # Without a GUI cache the processors still build and close their own session.
+        worker = BatchInspectionWorker(Path("images"), Path("recipe.yaml"), Path("output"))
+        with patch("gui.workers.BatchInspectionProcessor") as processor_type:
+            processor_type.return_value.run.return_value = {"summary": {}}
+            worker.run()
+        self.assertIsNone(processor_type.call_args.kwargs["gpu_session"])
+
+
 if __name__ == "__main__":
     unittest.main()

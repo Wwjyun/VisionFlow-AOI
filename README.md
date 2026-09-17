@@ -335,7 +335,7 @@ GPU 執行資訊會記錄 requested／actual backend、fallback reason、device/
 
 Detector 是否請求 GPU 仍由各自的 `use_gpu` 控制。`gpu.tiling` 是另一個獨立開關；執行結果會列出實際使用的路徑。
 
-GUI、批量與監控共用的 GPU session 會重用一塊 host 影像緩衝讀取 BMP，CUDA DLL 支援時註冊為 pinned memory 以加快整圖上傳；session 存活期間會常駐一張影像大小的記憶體（16384×13000 約 609 MiB）。可用環境變數 `AOI_HOST_IMAGE_BUFFER=auto|pageable|off` 調整，實際是否重用記錄在 `execution.gpu.resident_image.host_buffer`。
+GUI 的單張檢測、GPU 預熱、批量與監控共用同一個 GPU session，只有 Recipe 的 `gpu` 設定（DLL 路徑、mode、fallback、queue depth）或是否有 Detector 請求 CUDA 改變時才重建；Designer 儲存 Detector 參數不會讓預熱失效，執行中的批量／監控也不會因換 Recipe 被關閉 session。該 session 會重用一塊 host 影像緩衝讀取 BMP，CUDA DLL 支援時註冊為 pinned memory 以加快整圖上傳；session 存活期間會常駐一張影像大小的記憶體（16384×13000 約 609 MiB）。可用環境變數 `AOI_HOST_IMAGE_BUFFER=auto|pageable|off` 調整，實際是否重用記錄在 `execution.gpu.resident_image.host_buffer`。
 
 CUDA DLL 建置與驗證：
 

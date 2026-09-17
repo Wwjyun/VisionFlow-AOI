@@ -730,6 +730,27 @@ RSS 768.2→771.5 MiB、VRAM 2919 MiB 維持平台，pool 1 次配置／99 次�
 證據：`outputs_validation/host_image_buffer_ab/`（`ab_off_vs_pageable.json`、`ab_off_vs_pageable_vs_auto.json`、
 `production_final.json`、`stability_100.json`）。
 
+### 2026-09-17 GUI／批量／監控共用 GPU session
+
+`GpuExecutionSessionCache` 原本以 Recipe 路徑＋mtime＋size 為 key，Designer 存任何 Detector 參數都會重建
+CUDA session；批量與監控每次啟動又各自建立並關閉 session，GUI 預熱對它們無效。現在 key 是
+`GpuExecutionSession.identity()`：解析後 DLL 路徑、`gpu.mode`、`fallback_to_cpu`、queue depth 與是否請求
+CUDA，這是建構 runtime、AI session manager 與 host 影像緩衝的全部輸入；Detector 參數、切圖與判定每次執行才
+讀取，不影響 session。`MainWindow` 只保留一個 `throughput` 快取，單張、預熱、批量、資料夾與相機監控都透過
+`cache.use()` 借用；借用中的 session 被換掉時延後到最後一位使用者歸還才關閉。未注入 session 的 CLI／處理器
+維持每次建立並關閉。
+
+RTX 3090 正式尺寸（202-CS-SN-1，4 張批量各 3 次，median）：
+
+| 情境 | 第一張 | 其餘張 | 整批／單張 |
+|---|---:|---:|---:|
+| 批量自建 session（原行為） | 381.0 ms | 228.0 ms | 1127.1 ms |
+| 批量共用已預熱 GUI session | 227.0 ms | 227.0 ms | 912.9 ms |
+| Designer 存 Detector 參數後第一張（原：重建） | — | — | 358.3 ms |
+| Designer 存 Detector 參數後第一張（保留 session） | — | — | 236.7 ms |
+
+判定與缺陷數全部相同。證據：`outputs_validation/shared_gpu_session/`。未修改 CUDA source／header／ABI。
+
 ### v1.6.2 CUDA-enabled 發行範圍
 
 v1.6.2 收錄本頁「CCL＋ring CNR 留在 device」、「ring 統計平行化」、「BMP 平行 reader」、profiler／
