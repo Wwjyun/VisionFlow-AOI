@@ -716,15 +716,13 @@ vs 原本 `[255,255,20,20]`）。因此「標籤編號順序」對 202 的最終
   - External Trigger arm 檢查同時看 EXT_LINE 與 EXT_FRAME。
 - [ ] 診斷：`last_requested_settings`／`last_apply_params`、Live Features、Acq Params 報告寫到 `outputs/logs/camera/`，GUI 提供管理模式「匯出診斷」。
 
-### 取像、預覽、存圖與分析工具
+### 取像、預覽與存圖
 
 - [ ] Sapera callback 只做最少交接：把 `SapBuffer` 複製到預先配置的 `uint8` 全解析度 frame，放入有界佇列；背景 worker 產生降採樣預覽，UI 只畫最新一張，允許丟棄舊預覽；不得每張建立全解析度 `QPixmap`（與 P6「大圖預覽記憶體與 LOD」共用實作，不另做一套）。預覽解析度文字顯示原始 frame 尺寸。（GUI 端已完成：frame listener 只交接，`PreviewFrameConverter` 單一背景 thread 只轉最新一張、`INTER_AREA` 降到 2048 px 內，UI 只建立預覽大小的 pixmap 並顯示原始／預覽尺寸；Sapera buffer 複製待綁定。）
 - [ ] 取像狀態機：`capture_in_progress` 期間不得第二次 `Snap()` 或開始 preview；Stop 在擷取中不呼叫 `Freeze()`，停止後續觸發並讓目前 frame 收完；stop 後短暫 cooldown；連線／斷線清除上述狀態。按鈕 enable 跟隨連線、預覽與忙碌狀態。（介面契約、模擬相機與按鈕 enable 已完成並有測試；Sapera `Freeze()` 語意與 stop cooldown 待綁定。）
 - [x] 狀態呈現遵守 GUI 契約：TopBar 只放標題與全域狀態，CCD 頁「相機狀態」顯示連線／相機／解析度／觸發／訊號／累計線數／狀態／設定寫入狀態，錯誤走 inline notice、status bar 只放短事件；狀態全部有文字，CCD 按鈕有鍵盤操作測試。（2026-09-17）
 - [ ] 存圖：BMP（檢測交接）與 PNG／TIF／TIF 不壓縮（保存），先寫 `.tmp` 再 rename；有界存圖佇列，最大並行數可設定（C# 固定 5，需在實機比較 2／3／5）；進度顯示在頁內，不另開 modal 視窗。手動保留影像存到可設定資料夾。（已完成：四種格式無損、`.tmp`→rename、失敗清除暫存、`SnapshotSaveQueue` 上限 16 筆、預設 2 workers、頁內進度與失敗計數、存圖未完成阻止關窗、可設定資料夾；待完成：GUI 調整並行數與實機 2／3／5 比較。）
 - [x] 自動存圖依模式分開（2026-09-17）：External Trigger One Frame 在觸發事件時計數、Software Trigger 在每張 frame 到達時計數，每張 frame 只消耗一次；模式依連線時實際寫入相機的觸發設定判斷，同一張 frame 不會存兩次，佇列滿時提示未保存。
-- [ ] 滾動式拍照：張數上限 100、上到下／下到上方向；存圖前先 snapshot 目前 frames，背景存完整合成圖。
-- [ ] 灰階波形：在 viewer 上拖線，Shift 依 0–30°水平、31–59°45°、60–90°垂直吸附；相機影像取全解析度 frame 而非預覽，大圖依 tile 分組批次取樣；波形視窗 Y 固定 0–255、每 16 灰階一條輔助線、滾輪縮放、左鍵框選、右鍵重設、可調整大小。一般載入影像也可使用。
 
 ### 米輪（LSI-8181）
 
@@ -750,7 +748,7 @@ vs 原本 `[255,255,20,20]`）。因此「標籤編號順序」對 202 的最終
 
 ### 測試、打包與實機驗收
 
-- [ ] 自動測試（fake backend，無硬體）：設定 round trip 與預設值、載入不觸發寫入、Trigger 互斥矩陣、Software Trigger 狀態機、忙碌／Stop 語意、自動存圖不重複、滾動合成順序、`.tmp` 存檔、波形吸附與取樣、缺 Sapera／缺 DLL 時主程式可啟動且 CCD 頁顯示不可用、OP／工程／管理可見性、GUI offscreen smoke。（`tests/test_ccd_devices.py`、`tests/test_ccd_gui.py` 已涵蓋設定 round trip／損毀檔、載入不寫入、Trigger 16 種組合、忙碌／Stop、`.tmp` 與四格式無損、存圖佇列上限、米輪保存與寫入、不可用後端、權限可見性、鍵盤、監控來源與關窗；`tests/test_ccd_trigger_automation.py` 涵蓋 Software Trigger 狀態機、外部觸發規則矩陣、自動存圖不重複、監控前置條件與停止；待補：滾動、波形。）
+- [ ] 自動測試（fake backend，無硬體）：設定 round trip 與預設值、載入不觸發寫入、Trigger 互斥矩陣、Software Trigger 狀態機、忙碌／Stop 語意、自動存圖不重複、`.tmp` 存檔、缺 Sapera／缺 DLL 時主程式可啟動且 CCD 頁顯示不可用、OP／工程／管理可見性、GUI offscreen smoke。（`tests/test_ccd_devices.py`、`tests/test_ccd_gui.py` 已涵蓋設定 round trip／損毀檔、載入不寫入、Trigger 16 種組合、忙碌／Stop、`.tmp` 與四格式無損、存圖佇列上限、米輪保存與寫入、不可用後端、權限可見性、鍵盤、監控來源與關窗；`tests/test_ccd_trigger_automation.py` 涵蓋 Software Trigger 狀態機、外部觸發規則矩陣、自動存圖不重複、監控前置條件與停止。）
 - [ ] 打包：Sapera runtime、`LSI8181_64.dll` 與驅動由現場安裝、不打包；若採 pythonnet 則打包其 runtime。packaged `--smoke-test` 增加「無相機環境 CPU 檢測正常、CCD 顯示不可用」；README 補 Sapera 版本對齊的部署說明。
 - [ ] 相機機台有 `LSI8181_64.dll` 時，建立預設 `MainWindow` 的 unit tests 可能在事件迴圈中觸發米輪自動連線並寫入已存設定；評估測試環境預設以 `VISIONFLOW_LSI8181_DLL` 指向不存在路徑隔離硬體。
 - [ ] 實機驗收（在相機機台執行，未實測不得勾選）：連線／斷線重複；Exposure、Gain、Length、Internal Line Rate 讀回與畫面效果；Continuous 沒有 Sapera 警告視窗；External Trigger 一個脈衝一條線、湊滿 Length 才顯示；One Frame；Software Trigger 監控與擷取中 Stop；米輪自動連線、重開後設定保留、Encoder 正反向計數與倍頻、Compare 自動遞增、錯誤卡片 ID 的狀態碼訊息、示波器確認 CMP_OUT 脈寬與 CMP0–7；16384×50000 各格式存圖時間；連續取像＋存圖＋檢測長時間穩定、記憶體平台與 GUI 回應。
@@ -759,6 +757,8 @@ vs 原本 `[255,255,20,20]`）。因此「標籤編號順序」對 202 的最終
 
 - `xx_ccd` 本身也未完成的連續長影像 recorder queue／chunk writer（`EndOfNLines` 等 line 事件），待需求確認後另列。
 - 原廠 LSI-8181 完整測試程式，只移植上述需要的 API。
+- 滾動式拍照（2026-09-17 使用者決定不移植）：原功能把最近最多 100 張 frame 上下拼成一張長圖供回看與存圖，只是顯示／保存用途；VisionFlow 每張 frame 各自檢測，不需要。若日後產品長度超過單張 frame、缺陷可能跨 frame 邊界，應另列為檢測流程的 frame 拼接與跨邊界切圖需求，不以移植此顯示功能處理。原規格：張數上限 100、上到下／下到上方向、存圖前 snapshot 目前 frames。
+- 灰階波形（2026-09-17 使用者決定不移植）：原功能在影像上拖線畫灰階曲線，用於調光源均勻度、曝光飽和與對焦，不影響檢測結果，裝機調整可用 Sapera CamExpert。若工程人員需要在 VisionFlow 內調相機，建議改做簡化版：CCD 預覽顯示游標位置的原始灰階值，以及整張 frame 的飽和（255）像素比例。原規格：Shift 角度吸附、取全解析度 frame、依 tile 批次取樣、Y 軸 0–255、每 16 灰階輔助線、縮放／框選／重設。
 
 ## RTX 3090 編譯與實機驗收
 
@@ -900,6 +900,8 @@ vs 原本 `[255,255,20,20]`）。因此「標籤編號順序」對 202 的最終
 - [ ] 加速不得犧牲 GUI 回應、打包啟動、結果追溯、錯誤訊息或 CPU fallback。
 
 ## 完成紀錄
+
+- [x] 2026-09-17：依使用者決定，P11 的滾動式拍照與灰階波形從待辦移到「暫不移植」並寫明理由：兩者都是 `xx_ccd` 的顯示／調光輔助功能，不影響檢測；跨 frame 缺陷若日後出現，改列為檢測流程的 frame 拼接需求；灰階需求改建議簡化為預覽游標灰階值與飽和像素比例。自動測試項目同步移除滾動與波形。僅文件變更。
 
 - [x] 2026-09-17：**P11 觸發自動化。** 新增 `devices/trigger_automation.py`，移植 `xx_ccd` `MainForm` 的 `ApplyMeterWheelActionsOnExternalTrigger`、`QueueExternalTriggerAutoSave`／`QueueSoftwareTriggerAutoSave` 與 `RunSoftwareTriggerMeterWheelMonitor`：`external_trigger_actions` 決定外部觸發時要寫入的已存 Compare／Encoder 與是否自動存圖，`AutoSaveRequests` 為執行緒安全的存圖計數，`SoftwareTriggerMonitor` 以 50 ms 輪詢 encoder、低於 compare 時寫 compare 並要求擷取、回到 compare 以上才重新 arm。`LineScanCamera` 新增外部觸發 listener（模擬相機提供 `emit_external_trigger()`）。`CcdController` 以連線時實際寫入相機的觸發設定判斷所有自動化，driver／監控 thread 只以 queued signal 交給 GUI thread 執行相機與米輪命令；「開始預覽」在軟體觸發時改為啟動監控並檢查相機待機、米輪連線與觸發模式，擷取請求去重，Stop／相機斷線／米輪斷線或讀值失敗／關窗都會停止監控但不中止擷取中的 frame；frame 到達時依模式計數並只保存一次。CCD 頁新增「軟體觸發監控」狀態欄、按鈕文字與 enable 規則，狀態列顯示觸發事件訊息。新增 `tests/test_ccd_trigger_automation.py`（12 項，含逐步 encoder 序列、背景 thread、外部觸發規則矩陣與模擬器端到端）。Sapera 外部觸發事件接線與實機驗收仍待相機綁定。
 
