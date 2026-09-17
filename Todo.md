@@ -674,13 +674,14 @@ vs 原本 `[255,255,20,20]`）。因此「標籤編號順序」對 202 的最終
 
 2026-09-17 使用者需求：在 GUI 左側 NavRail 新增「CCD 控制」頁，把 `xx_ccd`（C# WinForms、.NET Framework 4.7.2 x64、Teledyne DALSA Sapera LT＋JS Automation LSI-8181 米輪卡）已在實機確認的功能擷取出來，以 Python／PySide6 在 VisionFlow 內重新實作。`xx_ccd` 只當行為參考（`PROJECT_HANDOFF.md`、`Services/CameraService.cs`、`Services/Lsi8181MeterWheelService.cs`、`Native/Lsi8181Native.cs`、`Models/CameraSettings.cs`），不嵌入 WinForms、不以 C# EXE／子行程當執行期相依，也不提交進本 repository（它屬於另一個 repository）。相機與米輪是選配硬體能力，比照 CUDA DLL：沒有 Sapera runtime、`LSI8181_64.dll`、驅動或擷取卡時，GUI、CLI、batch、monitor 照常啟動，CCD 頁顯示不可用原因。
 
-### 待使用者決定（實作前）
+### 已確認決策（2026-09-17 使用者同意規劃建議）
 
-- [ ] **Sapera 綁定方式**：建議以 `pythonnet`（目前 `env` 未安裝）載入 `DALSA.SaperaLT.SapClassBasic.dll`，類別與參數名稱可和 C# 參考逐行對照，移植風險最低；替代方案是 ctypes 呼叫 Sapera C API。先做 spike 驗證：x64 與 .NET Framework runtime 載入、`SapAcquisition`／`SapAcqDevice`／`SapBuffer`／`SapAcqToBuf` 建立與釋放、`EndOfFrame` callback 從非 UI thread 進入 Python、`SapBuffer` 直接複製成 numpy（不經 `Bitmap`）、PyInstaller 打包可行性；結果記錄後由使用者確認方案。
-- [ ] **設定歸屬**：建議分兩層，取代 `settings.ini`。機台層（server／resource index、CCF 路徑、AcqDevice 位置、米輪 card ID、倍頻、反向、CMP Out Width、CMP0–7）存機台設定檔，不進 Recipe；產品層（Exposure、Gain、Length、Internal Line Rate、Trigger Mode、自動存圖）是否進 Recipe `camera` 區段需確認。若進 Recipe，須參與 dirty tracking 與 `RecipeManager` 驗證，舊 Recipe 沒有 `camera` 區段時不得改動相機設定。另提供一次性從 `xx_ccd` `settings.ini` 匯入。
-- [ ] **權限分級**：建議 OP 看不到 CCD 頁（Monitor 只顯示唯讀相機／米輪連線與取像狀態）；工程模式可連線／斷線、預覽、停止、擷取、存圖、查看米輪讀值；管理模式才可改相機參數、Sapera 位置／CCF、Trigger、米輪與 CMP0–7、匯出診斷。新增控制項比照 Detector 參數 fail-closed，未分類一律只給管理模式。
-- [ ] **存圖格式與 AOI 交接**：`xx_ccd` 因大型 BMP 在一般看圖軟體開啟慢而移除 BMP，但 VisionFlow 產線格式是 BMP，且 `BmpReader`／BMP file-order resident upload 是目前最快的讀圖路徑。需決定 CCD→檢測交接用 BMP（檔案交接）或直接記憶體交接，PNG／TIF 只作保存用途。
-- [ ] 確認 `TriggerMode.SingleFrame`（C# enum 有、handoff 未描述）是否需要移植。
+- [x] **Sapera 綁定方式採 `pythonnet`**：載入 `DALSA.SaperaLT.SapClassBasic.dll`，類別與參數名稱和 C# 參考逐行對照，移植風險最低；ctypes 呼叫 Sapera C API 只在 spike 證明 pythonnet 不可行時才改用。
+- [ ] **pythonnet spike**（目前 `env` 未安裝，需在裝有 Sapera 的相機機台執行）：x64 與 .NET Framework runtime 載入、`SapAcquisition`／`SapAcqDevice`／`SapBuffer`／`SapAcqToBuf` 建立與釋放、`EndOfFrame` callback 從非 UI thread 進入 Python、`SapBuffer` 直接複製成 numpy（不經 `Bitmap`）、PyInstaller 打包可行性；結果記錄於本節後才開始正式移植。
+- [x] **設定歸屬分兩層，取代 `settings.ini`**：機台層（server／resource index、CCF 路徑、AcqDevice 位置、米輪 card ID、倍頻、反向、CMP Out Width、CMP0–7）存機台設定檔，不進 Recipe；產品層（Exposure、Gain、Length、Internal Line Rate、Trigger Mode、自動存圖）放 Recipe 選用 `camera` 區段，參與 dirty tracking 與 `RecipeManager` 驗證，舊 Recipe 沒有 `camera` 區段時不得改動相機設定。另提供一次性從 `xx_ccd` `settings.ini` 匯入。
+- [x] **權限分級**：OP 看不到 CCD 頁（Monitor 只顯示唯讀相機／米輪連線與取像狀態）；工程模式可連線／斷線、預覽、停止、擷取、存圖、查看米輪讀值；管理模式才可改相機參數、Sapera 位置／CCF、Trigger、米輪與 CMP0–7、匯出診斷。新增控制項比照 Detector 參數 fail-closed，未分類一律只給管理模式。
+- [x] **存圖格式與 AOI 交接**：`xx_ccd` 因大型 BMP 在一般看圖軟體開啟慢而移除 BMP，但 VisionFlow 產線格式是 BMP，且 `BmpReader`／BMP file-order resident upload 是目前最快的讀圖路徑。因此第一階段 CCD→檢測的檔案交接使用 BMP；第二階段評估記憶體直接交接；PNG／TIF／TIF 不壓縮只作保存用途。
+- [x] **`TriggerMode.SingleFrame` 暫不移植**：C# enum 有，但 handoff 未描述行為也未實機確認；需要時再另列。
 
 ### 架構與模組邊界
 
@@ -714,7 +715,7 @@ vs 原本 `[255,255,20,20]`）。因此「標籤編號順序」對 202 的最終
 - [ ] Sapera callback 只做最少交接：把 `SapBuffer` 複製到預先配置的 `uint8` 全解析度 frame，放入有界佇列；背景 worker 產生降採樣預覽，UI 只畫最新一張，允許丟棄舊預覽；不得每張建立全解析度 `QPixmap`（與 P6「大圖預覽記憶體與 LOD」共用實作，不另做一套）。預覽解析度文字顯示原始 frame 尺寸。
 - [ ] 取像狀態機：`capture_in_progress` 期間不得第二次 `Snap()` 或開始 preview；Stop 在擷取中不呼叫 `Freeze()`，停止後續觸發並讓目前 frame 收完；stop 後短暫 cooldown；連線／斷線清除上述狀態。按鈕 enable 跟隨連線、預覽與忙碌狀態。
 - [ ] 狀態呈現遵守 GUI 契約：TopBar 只放全域狀態，CCD 頁顯示 Connection／Camera／Resolution／Trigger／Signal／Lines／State，status bar 只放短事件；狀態不得只靠顏色，並補鍵盤操作測試。
-- [ ] 存圖：PNG／TIF／TIF 不壓縮（依上方決定是否加 BMP），先寫 `.tmp` 再 rename；有界存圖佇列，最大並行數可設定（C# 固定 5，需在實機比較 2／3／5）；進度顯示在頁內，不另開 modal 視窗。手動保留影像存到可設定資料夾。
+- [ ] 存圖：BMP（檢測交接）與 PNG／TIF／TIF 不壓縮（保存），先寫 `.tmp` 再 rename；有界存圖佇列，最大並行數可設定（C# 固定 5，需在實機比較 2／3／5）；進度顯示在頁內，不另開 modal 視窗。手動保留影像存到可設定資料夾。
 - [ ] 自動存圖依模式分開：External Trigger One Frame 與 Software Trigger 各自 gating，同一張 frame 不得存兩次。
 - [ ] 滾動式拍照：張數上限 100、上到下／下到上方向；存圖前先 snapshot 目前 frames，背景存完整合成圖。
 - [ ] 灰階波形：在 viewer 上拖線，Shift 依 0–30°水平、31–59°45°、60–90°垂直吸附；相機影像取全解析度 frame 而非預覽，大圖依 tile 分組批次取樣；波形視窗 Y 固定 0–255、每 16 灰階一條輔助線、滾輪縮放、左鍵框選、右鍵重設、可調整大小。一般載入影像也可使用。
@@ -735,7 +736,7 @@ vs 原本 `[255,255,20,20]`）。因此「標籤編號順序」對 202 的最終
 
 ### 與檢測流程整合
 
-- [ ] 第一階段（低耦合）：CCD 自動存圖寫到 Monitor 資料夾，由既有 `FolderMonitorProcessor` 檢測；確認 `.tmp`→rename 不會被半檔讀取，並保留 stable checks。
+- [ ] 第一階段（低耦合）：CCD 自動存 BMP 到 Monitor 資料夾，由既有 `FolderMonitorProcessor` 檢測；確認 `.tmp`→rename 不會被半檔讀取，並保留 stable checks。
 - [ ] 第二階段（記憶體交接）：`AOIPipeline.run()` 目前只收影像路徑；新增 ndarray＋來源 metadata（相機、trigger mode、encoder 值、時間）的入口，檔案路徑語意不變。GPU mode 把相機 frame 視為已解碼影像，只上傳一次。相機是單通道，pipeline 以 BGR `uint8` 為主，16384×50000 單通道約 819 MB、轉 BGR 約 2.4 GB，須先量測轉換成本並評估灰階直通，不得改變 Detector 判定。結果追溯保存取像 metadata，並可選擇保存原圖。以量測決定是否取代第一階段。
 - [ ] 檢測與取像並行時，相機 callback、存圖佇列、檢測 worker 與 GPU session 互不阻塞；GUI 保持可回應。
 
@@ -890,6 +891,8 @@ vs 原本 `[255,255,20,20]`）。因此「標籤編號順序」對 202 的最終
 - [ ] 加速不得犧牲 GUI 回應、打包啟動、結果追溯、錯誤訊息或 CPU fallback。
 
 ## 完成紀錄
+
+- [x] 2026-09-17：P11 CCD 規劃定案：使用者同意全部建議，將「待使用者決定」改為「已確認決策」——Sapera 採 `pythonnet`（spike 仍待相機機台執行）、機台層設定存機台設定檔而產品層參數放 Recipe 選用 `camera` 區段、OP 不可見／工程操作／管理改參數的權限分級、第一階段以 BMP 交接檢測、`SingleFrame` 暫不移植；同步修正存圖與第一階段整合項目的格式描述。`xx_ccd/` 依使用者指示維持不進版控，登錄於 `ARTIFACTS.md` 未追蹤產物地圖。尚未修改程式，僅文件變更。
 
 - [x] 2026-09-17：新增 Phase 2 方向評估〈GPU 模式 × 相機影像來源〉，交付 Markdown 報告、兩張 Archify 架構圖與 21 頁 PPTX。**方向一（GPU 模式）**：整理 `gpu.mode` 三態契約的不變項（`cpu` 不載入 CUDA、`auto` 可回退、`cuda` 禁止隱性回退、失敗整顆 detector 回 CPU、如實回報 device/host split），並列出四個未定義空白（多張 in-flight、記憶體來源的上傳生命週期、吞吐決策、觀測面）與 A～D 工作包（基準重建 1 週／多張 in-flight 4–7 週／吞吐語意 3–6 週／明確不做清單），合計 8–14 週。**方向二（相機影像來源）**：以 `xx_ccd`（`PROJECT_HANDOFF.md`、`CameraService.cs`、`CameraSettings.cs`）為證據，盤點線掃相機、Sapera LT、`EndOfFrame`、三種觸發、Mono8、存檔與 Sapera 9.12／8.6 部署風險；確認 AOI 端切口只有 `core/pipeline.py:111` 的 `load_image()`，與檔名有關的只有四個紀錄點，且 `upload_image()` 已支援 1／3 通道、`preprocess_plan.py` 明文接受 2D gray，因此相機的單通道影像可直通（16384×13000 mono 203.1 MiB 為 BGR 的三分之一；16384×50000 mono 819,200,000 bytes、轉 BGR 2,457,600,000 bytes，與 P11 記載的 819 MB／2.4 GB 一致）；唯一需要 3 通道的是 overlay／NG tile 繪圖（`core/report_artifacts.py:121-173`）。提出 A（落地檔＋monitor，0 行改動）→ B（共享記憶體直入 CPU mode）→ C（pinned＋GPU 直入＋mono）三階段與 D（P11 內嵌 Sapera）路線，說明 B／C 與 D 互斥、須先做 P11 的 Sapera spike，並把方向二對齊 `Todo.md` §P11 第一／第二階段。另以 v1.6.2（2026-09-15 BMP file-order 與 202 device-resident CCL／ring）指出改動二報告的「GPU 較慢」與「約 1.2 倍」兩個數字均已失效，列出「9 顆全開 12,145/13,091 ms（0.93×）」與「單顆重運算 5,453.3/397.7 ms（13.71×）」兩個不可混用的口徑，並把基準重建列為第一順位。架構圖 `架構圖/11_image_source_current`、`12_image_source_target` 以 Archify showcase 交付（9/9 檢查、0 error、0 warning，`visual-check` pass）；PPTX 為 `簡報/phase2/Phase2_方向_GPU模式與相機影像來源.pptx`（21 頁、21 份備忘稿，側錄 `.inspect.ndjson` 同名相鄰）。驗證：完整 470 tests OK、compileall、CUDA source/ABI preflight、`git diff --check` 通過。本次未修改任何執行期程式、Recipe、GUI 或 CUDA source／ABI／DLL，也未執行實機量測；報告與簡報內所有估算皆標明「評估假設」或「推算」。
 - [x] 2026-09-17：新增 P11「CCD 線掃相機與米輪控制（移植 `xx_ccd` 功能）」規劃。盤點 `xx_ccd`（C# WinForms、Sapera LT、LSI-8181）已實機確認的相機連線、Exposure／Gain／Length／Internal Line Rate 寫入路徑、Continuous／External／One Frame／Software Trigger、取像狀態機、存圖、滾動式拍照、灰階波形、米輪與 CMP0–7、外部觸發自動化，改以 Python／PySide6 在 VisionFlow 內重新實作，`xx_ccd` 只作行為參考、不提交進本 repository。列出實作前需使用者決定的事項（Sapera 綁定方式、設定歸屬、權限分級、BMP 交接格式、SingleFrame），以及模組邊界、檢測流程兩階段整合、fake backend 測試、打包與實機驗收項目。尚未修改程式，僅文件變更。

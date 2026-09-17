@@ -29,6 +29,8 @@
 
 cuda_course/                           30 天 CUDA 自學課程（Markdown，含練習題說明）
 interview_prep/                        面試準備教材 L00–L05＋README
+xx_ccd/                                線掃相機擷取 C# WinForms 專案（Sapera LT＋LSI-8181 米輪）
+                                       另一個 repository 的複本，只作 Todo.md P11 移植的行為參考
 .codex_ppt_build/                      產生 `簡報/` 的 Node 工作區
   interview_deck.mjs / interview_deck_v2.mjs / arch_interview_deck.mjs / vp_decision_deck.mjs
                                        deck 產生腳本，輸出路徑已指向 `簡報/`
