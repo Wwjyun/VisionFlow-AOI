@@ -605,6 +605,7 @@ vs 原本 `[255,255,20,20]`）。因此「標籤編號順序」對 202 的最終
 
 ### GUI 後續優化（2026-09-15 v1.6.0 發行後盤點）
 
+- [ ] **批量完成填表卡頓**（2026-09-17 壓測發現）：1000 張批量完成時 GUI 執行緒約卡 0.64～0.67 s。cProfile 顯示 `resizeColumnsToContents` 共 1.11 s（`BatchDashboardScreen._populate_table` 0.72 s、Run 側欄 `BatchDataPanel.set_batch_result` 0.40 s），逐列呼叫 `RowTableModel.data` 11.2 萬次。改為限制欄寬量測取樣列數（例如 `QHeaderView.setResizeContentsPrecision`）或固定／依表頭估算欄寬，並以 1000 筆結果量測填表時間與事件迴圈延遲；不得改變表格內容、篩選與排序。
 - [x] **檢測效能分析面板**（2026-09-17 完成，見完成紀錄）：GUI 目前只在 viewer tooltip 顯示預覽的 QImage／QPixmap 時間，`execution.performance` 的各階段耗時、Detector 子階段、`device_host_split`、H2D／D2H bytes 與 native call 數都沒有呈現。在 Results（或 Run 側欄摺疊區）新增唯讀面板，資料一律取自本次執行結果 metadata，不得由 Recipe 推論；hybrid 步驟與 fallback 原因以文字標示。需測試 CPU-only、CUDA、fallback 三種結果的顯示。
 - [x] **執行進度訊息繁中化**（2026-09-17 完成，見完成紀錄）：`core/pipeline.py` 的 `Starting inspection`、`Recipe loaded`、`Tiles prepared`、`Inspecting tile n/m`、`Writing overlay, CSV, and JSON` 等英文訊息直接顯示在 Run 面板，違反操作文字繁中契約。改為繁中（保留 ROI、NG 等縮寫），並補 GUI 訊息測試；log 可維持英文。
 - [ ] **大圖預覽記憶體與 LOD**：`ImagePreviewWorker` 對 16384×13000 影像會建立全解析 RGB `QImage.copy()`（約 639 MB），`set_qimage` 再轉成全尺寸 `QPixmap`，同一張圖在 GUI 行程內至少佔兩份大型記憶體。改為依 viewport 顯示降採樣金字塔或分塊，放大後才載入原解析度區塊；overlay 座標、縮放與游標座標仍以原圖像素為準。需量測記憶體峰值與顯示時間前後對照。
@@ -805,7 +806,7 @@ vs 原本 `[255,255,20,20]`）。因此「標籤編號順序」對 202 的最終
 - [ ] 【實物】比較 tiles、PASS/NG、defect count、bbox、area、confidence、metadata 與 fallback log。
 - [ ] GUI 的 recipe 儲存/載入、viewer backend、status、overlay、輸出與 fallback 正確。
 - [ ] 打包版在有 NVIDIA GPU 與無 NVIDIA GPU 電腦均完成驗證。（目前無 GPU 電腦已完成 CPU-compatible package build 與 bundled recipe/MainWindow smoke；有 GPU 電腦待驗收）
-- [ ] warm-up 5 張後測 10、100、1000 張；VRAM 穩定、GUI 可回應、無 crash/error。（validator/workflow 已加入 checkpoints、allocation/VRAM/median/P95；待 RTX 執行）
+- [ ] warm-up 5 張後測 10、100、1000 張；VRAM 穩定、GUI 可回應、無 crash/error。（validator/workflow 已加入 checkpoints、allocation/VRAM/median/P95；待 RTX 執行）（2026-09-17 以合成正式尺寸圖在 GUI 批量完成 1000 張：VRAM 持平、0 error、無 crash、檢測中事件迴圈 p99 約 27 ms；但批量完成瞬間仍有約 0.65 s 卡頓，見 P6「批量完成填表卡頓」，修正前不勾選）
 
 ## 未來 AI Detector
 
@@ -897,12 +898,14 @@ vs 原本 `[255,255,20,20]`）。因此「標籤編號順序」對 202 的最終
 - [ ] 【實物】五個 production recipes 通過 CPU/GPU 等價規則，沒有未解釋的 fallback。
 - [x] 每個 GPU plan 原則上每張輸入最多一次 upload 與一次必要 download；resident ROI plan 額外 H2D 為零。
 - [x] native plan/context 預留並重用 operator buffers，相同 shape warm-up 後不再逐 operator `cudaMalloc/cudaFree`。
-- [ ] 連續 1000 張後 VRAM 位於穩定平台，沒有資源洩漏或程序崩潰。
+- [x] 連續 1000 張後 VRAM 位於穩定平台，沒有資源洩漏或程序崩潰。（2026-09-17 RTX 3090 以合成正式尺寸 202-CS-SN-1 與 401-AS-SN-1 GUI 批量各 1000 張、401 同一 process 連續 4 批驗證，見完成紀錄；真實產品影像仍依【實物】項目）
 - [ ] 【實物】GPU 純檢測 median 與 P95 在目標資料集均優於 CPU；目標加速門檻為至少 1.5 倍。
 - [x] 未達 RTX 效能門檻的 production recipe/operator 保持 CPU、GPU 預設關閉。
 - [ ] 加速不得犧牲 GUI 回應、打包啟動、結果追溯、錯誤訊息或 CPU fallback。
 
 ## 完成紀錄
+
+- [x] 2026-09-17：**GUI 1000 張批量壓測與 worker 結果 signal 修正。** 以 offscreen `MainWindow` 走真實 GUI 批量路徑（自動背景預熱＋5 張單張暖機後，hard link 1000 張合成圖，輸出關閉，50 ms QTimer 量測事件迴圈延遲、每批 checkpoint 記 RSS／VRAM）。第一次壓測發現批量完成時 GUI 凍結約 3.8～4.0 s、RSS 另增約 530 MiB：根因是 `gui/workers.py` 的結果 signal 宣告為 `Signal(dict)`，PySide 在跨執行緒送出時把整份 1000 筆摘要轉成 QVariantMap 再轉回，且持有 GIL。全部 8 個 worker 結果 signal 改為 `Signal(object)`，只傳 Python 物件參照（worker 送出後不再修改）；新增 `tests/test_worker_signal_payloads.py`（真實 QThread 下收到的是同一物件、改動前程式會失敗；worker 檔案不得再有 `Signal(dict)`／`Signal(list)`）。另發現量測腳本若以 lambda 取代 `MainWindow` 處理函式，PySide 會以 DirectConnection 在 worker 執行緒執行而使 GUI 存取崩潰（0xC0000005，faulthandler 堆疊確認）；產品程式所有 worker signal 均連到 `MainWindow` bound method，已逐一檢查，腳本改為觀察 `batch_result` 狀態後重測。修正後結果（`outputs_validation/gui_batch_stress/*_final/report.json`、`negative_401_repeat4/repeat_report.json`）：202-CS-SN-1 正式尺寸 1000 張 0 error、全部 NG／558，單張 median／P95 226／234 ms，VRAM 2820～2871 MiB 無成長，事件迴圈 median／p99 12.9／27.1 ms；401-AS-SN-1 4000×3000 1000 張 0 error、全部 NG／243，119／135 ms，VRAM 1176～1186 MiB；批量結束後 RSS 不再跳增（+0.3 MiB）。批量中 RSS 每張約 +0.32 MiB 為保留的批量結果列（compact detail 每筆約 77～111 KB 加表格模型），401 同一 process 連續 4 批 RSS 557.9→865.1→865.1→865.7 MiB、private 1277.8→1586.2→1585.4→1586.4 MiB、VRAM 1168 MiB，第 2 批後持平（上一批結果保留到下一批取代），無洩漏、無崩潰。仍存在批量完成瞬間約 0.64～0.67 s 卡頓（`resizeColumnsToContents`），已列 P6 待辦，warm-up＋10／100／1000 張驗收項因此暫不勾選。完整 616 tests、compileall、CUDA preflight、`git diff --check`、GUI offscreen smoke 通過。
 
 - [x] 2026-09-17：**GUI CPU／GPU 對照執行（工程／管理模式）。** 把 `tools/benchmark_pipeline_production.py` 的判定比較（`_normalised`／`_split_defects`／`_compare`，含 Tile 位置、PASS/NG、缺陷數、type、bbox、area、confidence、metadata，4 個 residual 衍生診斷值與 `anchor_score` 另列尾數漂移、backend 來源欄位不比）移到 `core/backend_comparison.py`，工具以原名稱別名沿用；比較另加 `final_result` 與漂移欄位數量一致檢查，並回報第一個不同的判定欄位。`AOIPipeline`／`RecipeRuntimePreparation` 新增只接受 `cpu` 的 `gpu_mode_override`，只改本次執行的 `gpu.mode`（provenance 的 effective recipe SHA-256 如實反映），Recipe 檔不變。`BackendComparison` 依序執行 Recipe 原設定（使用 GUI 共用 session）與強制 CPU（不帶 session、不載入 CUDA），兩次都關閉 overlay／NG tile／CSV／matrix CSV／JSON／debug 輸出，回傳判定是否一致、尾數漂移、端到端／各流程階段／各 Detector 的 CPU、GPU 設定耗時與倍數；GPU 設定本次未實際啟用 CUDA 時明確說明「兩次都是 CPU 結果」與原因。GUI「檢測控制」面板新增「CPU／GPU 對照」按鈕（OP 模式整個面板隱藏，且處理函式在 OP 模式直接略過），需影像與 Recipe，執行中鎖住檢測／預熱並顯示進度，關窗保護；完成時以 inline notice 摘要，另開非 modal、唯讀的對照結果視窗（標題、兩側判定、第一個不同欄位、各階段表）。不修改 Recipe、不產生 dirty 狀態。RTX 3090 實測（`outputs_validation/backend_comparison/rtx_comparison.json`）：202-CS-SN-1 正式尺寸判定一致（NG／558，`anchor_score` 最大漂移 6.557e-7），端到端 CPU 5202.2 ms／GPU 404.6 ms（12.86×，session 未預熱）；401-AS-SN-1 GPU auto 4000×3000 合成圖判定一致（NG／243），1.27×。新增 `tests/test_backend_comparison.py`（執行順序與參數、不輸出檔案、CPU 參考不帶 session、漂移與 backend 欄位處理、第一個不同欄位、摘要等級、strict CUDA＋缺 DLL 的 Recipe 以 CPU 覆寫可執行且檔案不變、非 cpu 覆寫拒絕、OP 不可用、工程模式共用快取與鎖定、notice 與非 modal 視窗、失敗訊息）。完整 614 tests、compileall、CUDA preflight、`git diff --check`、GUI offscreen smoke、CLI smoke 通過。
 

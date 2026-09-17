@@ -24,6 +24,9 @@ from core.recipe_manager import RecipeManager
 from core.tiler import create_tiler
 
 
+# Worker results cross threads as `Signal(object)`: a `dict` signature makes PySide convert the whole
+# result to a QVariantMap and back on the GUI thread (a 1000-image batch summary froze the UI ~3.9 s).
+
 PREVIEW_DISPLAY_GPU_NOTE = "預覽色彩轉換固定在 CPU 執行（整圖往返 GPU 較慢），Recipe 的「GUI 預覽使用 GPU」不再生效。"
 
 
@@ -93,7 +96,7 @@ class ImagePreviewWorker(QObject, LogMixin):
 
 
 class InspectionWorker(QObject, LogMixin):
-    finished = Signal(dict)
+    finished = Signal(object)
     failed = Signal(str)
     progress = Signal(int, str)
 
@@ -138,7 +141,7 @@ class InspectionWorker(QObject, LogMixin):
 class GpuWarmupWorker(QObject, LogMixin):
     """Warm the shared single-image GPU session off the UI thread."""
 
-    finished = Signal(dict)
+    finished = Signal(object)
     failed = Signal(str)
     progress = Signal(int, str)
 
@@ -171,7 +174,7 @@ class GpuWarmupWorker(QObject, LogMixin):
 class BackendComparisonWorker(QObject, LogMixin):
     """Run the CPU/GPU comparison off the UI thread on the shared GUI GPU session."""
 
-    finished = Signal(dict)
+    finished = Signal(object)
     failed = Signal(str)
     progress = Signal(int, str)
 
@@ -208,7 +211,7 @@ class BackendComparisonWorker(QObject, LogMixin):
 
 
 class BatchInspectionWorker(QObject, LogMixin):
-    finished = Signal(dict)
+    finished = Signal(object)
     failed = Signal(str)
     progress = Signal(int, str)
 
@@ -254,10 +257,10 @@ class BatchInspectionWorker(QObject, LogMixin):
 
 
 class FolderMonitorWorker(QObject, LogMixin):
-    finished = Signal(dict)
+    finished = Signal(object)
     failed = Signal(str)
     progress = Signal(int, str)
-    image_processed = Signal(dict)
+    image_processed = Signal(object)
 
     def __init__(
         self,
@@ -310,10 +313,10 @@ class FolderMonitorWorker(QObject, LogMixin):
 
 
 class CameraMonitorWorker(QObject, LogMixin):
-    finished = Signal(dict)
+    finished = Signal(object)
     failed = Signal(str)
     progress = Signal(int, str)
-    image_processed = Signal(dict)
+    image_processed = Signal(object)
 
     def __init__(
         self,
