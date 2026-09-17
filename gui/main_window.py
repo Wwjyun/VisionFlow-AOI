@@ -777,6 +777,7 @@ class MainWindow(QMainWindow, LogMixin):
             output_dir=Path(self.output_dir or "outputs"),
             output_overrides=dict(self.output_opts),
             processed_move_dir=self.monitor_move_dir,
+            warmup_image_path=self.image_path,
         )
         self._monitor_controller.start(
             worker,

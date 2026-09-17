@@ -20,7 +20,7 @@
   1. ~~CCL＋ring CNR 留在 device~~ **已完成（2026-09-15，見完成紀錄）**：`vf_cnr_candidates_u8_roi` 接入，正式尺寸 GPU 端到端 1957.5 → 1467.7 ms（4.58×），每輪 D2H 288 MB → 0.022 MB。小 ROI 平行化亦已完成：ring 統計全部資料平行後 256×256 起快於既有路徑，已移除尺寸界線，GPU 端到端再降為 1111.2 ms（5.80×）。
   2. ~~影像解碼與 BMP file-order upload~~ **已完成（2026-09-15，見完成紀錄）**：`BmpReader` 先以平行分段讀取把正式尺寸 826 → 223 ms；GPU resident 路徑再保留 BMP 底向上列序，省掉 CPU 全圖翻轉，正式尺寸 GPU 端到端降至 397.7 ms、CPU/GPU 13.71×。PNG／JPEG 未處理。
   3. 分段 BMP read/H2D overlap：目前 GPU median 的 image load 102.6 ms、初始化／整圖上傳 173.5 ms 仍循序；先做 bounded pinned staging buffer 的雙緩衝原型，只在逐像素／判定等價且端到端穩定勝出時採用。整張 609 MiB pinned buffer 與 mmap 原型已量測無足夠收益，不採用。
-  4. 初始化預熱：預熱按鈕已完成（第一張 2075.5 → 1859.2 ms）；剩 session 重建條件與自動預熱（見 P6）。
+  4. 初始化預熱：預熱按鈕已完成（第一張 2075.5 → 1859.2 ms）；監控模式已自動預熱（2026-09-17）；剩 session 重建條件、批量／監控共用 session 與批量預建 context（見 P6）。
   5. findContours／鏈間並行：等 CCL 重做時順路處理，不單獨投入。
 
 - [x] 2026-09-15 新 GPU mode 目標：CPU 解碼後整圖只做一次 resident upload，6 個高 12000×寬 2000 ROI 從切 tile起直接在 GPU 執行 202 detector CNR；保持 CPU fallback 與判定等價，並以 RTX 3090 的 median/P95/倍數/傳輸量驗收。正式 benchmark 已修正為 16384×13000 原圖與一列 6 ROI。最終重編成品 CPU 6504.0/6665.2 ms、GPU 2097.0/2123.5 ms（皆 median/P95），端到端 **3.10×**、detector **5.61×**、automatic CNR **8.81×**；每輪只有一次 638.976 MB 整圖 H2D、288 MB D2H、13 calls，3/3 判定欄位相同。GPU CCL 實驗在完整 pipeline 只改善 8.2 ms／0.4%，卻增加 144 MB H2D、576.011 MB D2H 與 6 次 native call，因此已撤回接線；正式版本維持 CPU CCL/ring，未來只有在 mask、CCL、ring 全部 device-resident 且只下載候選統計時才重做。RTX native smoke、15-case resident 等價、完整 CUDA validator、1000 次 stress、fault injection、435 tests、compileall、preflight 與 CLI 合成圖 smoke 全部通過；完整交接紀錄與表格在 `gpu/README.md`。
@@ -610,6 +610,10 @@ vs 原本 `[255,255,20,20]`）。因此「標籤編號順序」對 202 的最終
 - [ ] **預覽不再逐張建立 GpuRuntime**：`ImagePreviewWorker.run` 每次預覽都建立新的 `GpuRuntime`（載入 DLL／建立 context）只為做 BGR→RGB，與「GUI 共用單一 runtime／session」原則不一致。改用 GUI 共用 session 或直接走 CPU（先量測 GPU 轉換是否真的有收益），並測試 strict CUDA 與 fallback 行為不變。
 - [x] **GPU 預熱按鈕**（2026-09-15）：`GpuExecutionSessionCache.warm_up()` 建立 session 並以目前影像試跑一次（輸出全關、暫存目錄事後刪除）；GUI「檢測控制」面板「GPU 預熱」背景執行並鎖住檢測／換圖／換 Recipe／關窗。RTX 3090 正式尺寸冷啟動第一張 median 2075.5 ms → 預熱後 1859.2 ms（各 3 輪全新 process）。
 - [ ] **GPU session 重建條件與自動預熱**：`GpuExecutionSessionCache` 以 Recipe 路徑＋mtime＋size 當 key，Designer 儲存任何外參（例如面積上限）都會關閉並重建 CUDA session，預熱失效。改為只在 `gpu` 區段、DLL 路徑或影響 plan 的設定變更時重建；評估載入 GPU Recipe 與影像後自動背景預熱（OP 模式看不到預熱按鈕）。需測試 Recipe 快取失效語意不變。
+- [ ] **批量／監控與單張檢測的 GPU session 不共用**（2026-09-17 盤點）：「GPU 預熱」按鈕與單張檢測使用 GUI 的 `GpuExecutionSessionCache`（`latency`），`BatchInspectionProcessor`／`FolderMonitorProcessor` 每次啟動各自以 `throughput` 建立新 session、結束即關閉，所以按鈕預熱對批量與監控無效。評估由 GUI 快取依 workload 各保留一個 session 並注入批量／監控（須與上一項的重建條件一起設計，且仍維持批量與監控單次執行共用一個 session、GPU 路徑單一序列化），並測試關窗、換 Recipe 與 strict CUDA 失敗時的釋放行為。
+- [x] **監控模式自動 GPU 預熱**（2026-09-17）：`FolderMonitorProcessor` 建立 `throughput` session 後、進入監控迴圈前，呼叫 `GpuExecutionSession.warm_up()`；GUI 以目前載入的影像當樣本試跑一次（輸出全關、不計數、不搬移、不進歷史），沒有樣本圖或檔案不存在時只建立 CUDA context。`gpu.mode: auto` 預熱失敗或 CUDA 不可用時記錄原因並繼續監控；strict CUDA 在監控開始前直接失敗；CPU Recipe 不預熱。預熱結果寫入監控摘要 `gpu_warmup` 並顯示在監控進度文字。
+- [ ] 在 RTX 3090 以正式尺寸圖與 Recipe 量測監控模式第一張的端到端耗時（有樣本預熱／只建 context／無預熱），確認第一張接近後續張數的 warm median，且預熱不產生輸出檔、不影響 PASS/NG。
+- [ ] **批量模式預先建立 CUDA context**：批量不以整張圖試跑（試跑成本高於省下的約 250 ms），只在開始計時前完成 session 建立，避免第一張耗時統計被冷啟動拉高；需測試 `gpu.mode` 三種語意與批量輸出順序不變。
 - [x] **GPU 模式選擇重新設計**（2026-09-15 使用者回報表達不明確）：Designer 原本以「Auto／CPU only／CUDA required」下拉加「失敗回退 CPU」開關表達，四種組合只有三種行為（`auto`＋關閉回退等同 `cuda`），且 CPU 模式下 GPU 進階開關仍可操作。改為「僅 CPU」「GPU 優先，失敗改用 CPU」「僅 GPU（嚴格）」三個含行為說明的選項；舊 Recipe `auto`＋關閉回退顯示為嚴格並標示，未變更時原值保存、不產生 dirty；CPU 時停用進階設定；狀態列顯示 CUDA 可用性、啟用 GPU 的 Detector 數，以及「切小圖使用 GPU」無效組合警示。
 - [x] **v1.6.0 在另一台電腦「同參數同一張實際照片 GPU 比 CPU 慢約 1 秒」已確認原因**（2026-09-15 使用者回報；同日使用者確認：當時 Detector 的 GPU 開關未開啟，開啟後耗時降為原本約 1/3。v1.6.1 已修正此組合下逐張重傳整圖的切圖變慢，並在 Designer 狀態列警示）。原始調查紀錄：需取得該電腦 `outputs\logs\aoi.log` 對應檢測的 `Inspection performance`／`CUDA host metrics`、GPU 型號與 Recipe `gpu` 區段及各 Detector `use_gpu`。已在 RTX 3090 重現一個量級吻合的 GUI 可觸發原因（GPU mode＋切小圖使用 GPU＋Detector GPU 關 → 每張 tile 重傳整張原圖，切圖 85 → 872 ms），`main` 已修正；其他候選：非 `sm_86` 相容 GPU、冷啟動第一張、預覽使用 GPU。
 - [ ] **VRAM 與整圖上傳狀態**：runtime 已回報 `resident_image.device_memory_before_upload`（可用 VRAM、上傳大小、`dedicated_vram_low`）與 crossover 略過上傳，但 GUI 未顯示。於 TopBar backend chip tooltip 或效能面板顯示，VRAM 不足時以 inline notice 提示，狀態不得只依賴顏色。
@@ -891,6 +895,8 @@ vs 原本 `[255,255,20,20]`）。因此「標籤編號順序」對 202 的最終
 - [ ] 加速不得犧牲 GUI 回應、打包啟動、結果追溯、錯誤訊息或 CPU fallback。
 
 ## 完成紀錄
+
+- [x] 2026-09-17：監控模式自動 GPU 預熱：將預熱邏輯由 `GpuExecutionSessionCache.warm_up()` 移到 `GpuExecutionSession.warm_up()`（快取版改為建立 session 後委派，行為與回傳欄位不變），`FolderMonitorProcessor` 在自己的 `throughput` session 建立後、監控迴圈前預熱；GUI 監控傳入目前載入的影像當樣本，無樣本時只建 CUDA context。`auto` 預熱失敗繼續監控、strict CUDA 在開始前失敗、CPU Recipe 不預熱，結果記入摘要 `gpu_warmup` 與進度文字。同時在 Todo 登錄批量／監控與單張 session 不共用（按鈕預熱對批量／監控無效）、批量預建 context 與 RTX 3090 第一張實測。新增 `tests/test_monitor_warmup.py`；本機無 CUDA，未做實機驗證。
 
 - [x] 2026-09-17：P11 CCD 規劃定案：使用者同意全部建議，將「待使用者決定」改為「已確認決策」——Sapera 採 `pythonnet`（spike 仍待相機機台執行）、機台層設定存機台設定檔而產品層參數放 Recipe 選用 `camera` 區段、OP 不可見／工程操作／管理改參數的權限分級、第一階段以 BMP 交接檢測、`SingleFrame` 暫不移植；同步修正存圖與第一階段整合項目的格式描述。`xx_ccd/` 依使用者指示維持不進版控，登錄於 `ARTIFACTS.md` 未追蹤產物地圖。尚未修改程式，僅文件變更。
 

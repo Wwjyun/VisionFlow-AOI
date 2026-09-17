@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Callable
 
 from core.csv_summary import CsvSummaryExporter
+from core.gpu_runtime import GpuRuntimeError
 from core.gpu_session import GpuExecutionSession
 from core.image_loader import SUPPORTED_EXTENSIONS
 from core.logging_system import LogMixin
@@ -72,6 +73,7 @@ class FolderMonitorProcessor(LogMixin):
         progress_callback: MonitorProgressCallback | None = None,
         item_callback: MonitorItemCallback | None = None,
         stop_callback: MonitorStopCallback | None = None,
+        warmup_image_path: Path | None = None,
     ):
         self.input_dir = Path(input_dir)
         self.recipe_path = Path(recipe_path)
@@ -83,6 +85,7 @@ class FolderMonitorProcessor(LogMixin):
         self.progress_callback = progress_callback
         self.item_callback = item_callback
         self.stop_callback = stop_callback
+        self.warmup_image_path = Path(warmup_image_path) if warmup_image_path else None
         self._seen: set[Path] = set()
         self._pending: list[Path] = []
         self._file_states: dict[Path, tuple[int, int, int]] = {}
@@ -111,9 +114,11 @@ class FolderMonitorProcessor(LogMixin):
             monitor_output_dir,
             len(self._seen),
         )
-        self._progress(0, f"正在監控 {self.input_dir}")
-
+        session_started = time.perf_counter()
         with GpuExecutionSession.from_recipe_path(self.recipe_path, workload="throughput") as gpu_session:
+            session_ms = round((time.perf_counter() - session_started) * 1000.0, 1)
+            gpu_warmup = self._warm_up_gpu(gpu_session, session_ms)
+            self._progress(0, f"{self._warmup_notice(gpu_warmup)}正在監控 {self.input_dir}")
             while not self._should_stop():
                 self._enqueue_new_stable_images()
                 while self._pending and not self._should_stop():
@@ -140,12 +145,60 @@ class FolderMonitorProcessor(LogMixin):
             "duration_sec": round((finished_at - started_at).total_seconds(), 2),
             "output_dir": str(monitor_output_dir),
             "processed": self._processed_count,
+            "gpu_warmup": gpu_warmup,
         }
         csv_summary_path = CsvSummaryExporter.write_summary(monitor_output_dir / "csv")
         if csv_summary_path is not None:
             summary["csv_summary"] = str(csv_summary_path)
         self.logger.info("Folder monitor stopped: summary=%s", summary)
         return summary
+
+    def _warm_up_gpu(self, gpu_session: GpuExecutionSession, session_ms: float) -> dict:
+        """Warm the monitor's own session before the first product arrives.
+
+        Monitoring waits for the first image anyway, so the CUDA context and, with a sample image,
+        the production-size device buffers are paid here instead of on the first real result. The
+        sample run writes no outputs and is not counted, moved or reported as a monitor item.
+        ``gpu.mode: cuda`` must fail before monitoring starts; ``auto`` logs and keeps monitoring.
+        """
+        image_path = self.warmup_image_path
+        if image_path is not None and not image_path.is_file():
+            self.logger.warning("Monitor GPU warm-up image is missing, using context only: %s", image_path)
+            image_path = None
+        strict = gpu_session.requested and not gpu_session.fallback_to_cpu
+        try:
+            summary = gpu_session.warm_up(
+                self.recipe_path,
+                image_path,
+                progress_callback=lambda pct, msg: self._progress(pct, msg),
+            )
+        except Exception as exc:
+            if strict:
+                self.logger.exception("Monitor GPU warm-up failed in strict CUDA mode: image=%s", image_path)
+                raise
+            self.logger.warning("Monitor GPU warm-up failed, monitoring continues: %s", exc, exc_info=True)
+            summary = {"status": "failed", "image_used": image_path is not None, "reason": str(exc)}
+        summary = {"session_ms": session_ms, **summary}
+        if strict and summary.get("status") == "unavailable":
+            raise GpuRuntimeError(f"嚴格 CUDA 模式無法開始監控：{summary.get('reason', '')}")
+        self.logger.info("Monitor GPU warm-up: %s", summary)
+        return summary
+
+    @staticmethod
+    def _warmup_notice(summary: dict) -> str:
+        status = summary.get("status", "")
+        reason = str(summary.get("reason", "") or "")
+        if status == "warmed":
+            return "GPU 預熱完成；"
+        if status == "context_only":
+            return "已建立 CUDA context（未載入影像，第一張仍需配置裝置記憶體）；"
+        if status == "fallback":
+            return f"GPU 預熱時 Detector 改用 CPU：{reason}；"
+        if status == "unavailable":
+            return f"CUDA 不可用，改用 CPU：{reason}；"
+        if status == "failed":
+            return f"GPU 預熱失敗，繼續監控：{reason}；"
+        return ""
 
     def _enqueue_new_stable_images(self) -> None:
         scan_wall = time.time()

@@ -220,6 +220,7 @@ class FolderMonitorWorker(QObject, LogMixin):
         output_dir: Path,
         output_overrides: dict | None = None,
         processed_move_dir: Path | None = None,
+        warmup_image_path: Path | None = None,
     ):
         super().__init__()
         self.input_dir = Path(input_dir)
@@ -227,6 +228,7 @@ class FolderMonitorWorker(QObject, LogMixin):
         self.output_dir = Path(output_dir)
         self.output_overrides = output_overrides
         self.processed_move_dir = Path(processed_move_dir) if processed_move_dir else None
+        self.warmup_image_path = Path(warmup_image_path) if warmup_image_path else None
         self._stop_requested = False
 
     def stop(self) -> None:
@@ -245,6 +247,7 @@ class FolderMonitorWorker(QObject, LogMixin):
                 progress_callback=self.progress.emit,
                 item_callback=self.image_processed.emit,
                 stop_callback=lambda: self._stop_requested,
+                warmup_image_path=self.warmup_image_path,
             )
             result = processor.run()
         except Exception as exc:
