@@ -23,6 +23,7 @@ from PySide6.QtWidgets import (
     QApplication,
 )
 
+from core.camera_monitor_processor import CameraFrameQueue
 from core.logging_system import LogMixin, configure_logging
 from core.gpu_session import GpuExecutionSessionCache
 from core.recipe_manager import RecipeError, RecipeManager
@@ -59,6 +60,7 @@ from gui.workflow_controllers import (
 )
 from gui.workers import (
     BatchInspectionWorker,
+    CameraMonitorWorker,
     FolderMonitorWorker,
     GpuWarmupWorker,
     ImagePreviewWorker,
@@ -74,7 +76,10 @@ SCREEN_INDEX = {"run": 0, "monitor": 1, "designer": 2, "results": 3, "batch_dash
 ALL_SCREENS = set(SCREEN_INDEX)
 HISTORY_LIMIT = 6
 METER_WHEEL_AUTO_CONNECT_DELAY_MS = 1000
-CAMERA_MONITOR_PENDING_MESSAGE = "相機直連檢測尚未實作（P11），目前請改用監控資料夾模式。"
+CAMERA_MONITOR_READY_MESSAGE = "相機直連已就緒：按「啟動」後會檢測每張觸發完成的影像。"
+CAMERA_MONITOR_NO_ORIGINAL_MESSAGE = (
+    "相機直連影像沒有另存原圖；需要原圖時請在 Recipe 相機設定開啟自動存圖，影像會存到 CCD 控制的存圖資料夾。"
+)
 
 OUTPUT_TOGGLE_LABELS = {
     "save_overlay": "儲存 overlay 影像",
@@ -586,8 +591,7 @@ class MainWindow(QMainWindow, LogMixin):
         monitor_source = str(self.preferences.value("monitor/source", MONITOR_SOURCE_FOLDER) or "")
         self.monitor_source = monitor_source if monitor_source in MONITOR_SOURCES else MONITOR_SOURCE_FOLDER
         self.monitor_screen.set_source(self.monitor_source)
-        if self.monitor_source == MONITOR_SOURCE_CAMERA:
-            self.monitor_screen.set_progress(0, CAMERA_MONITOR_PENDING_MESSAGE)
+        self._update_monitor_ready()
 
         recipe_path = self.preferences.existing_path("paths/recipe")
         if recipe_path is not None:
@@ -795,13 +799,14 @@ class MainWindow(QMainWindow, LogMixin):
         self.monitor_screen.set_move_folder(str(self.monitor_move_dir))
 
     def _update_monitor_ready(self) -> None:
-        # Camera-direct inspection is selectable but not runnable until its pipeline handoff exists.
-        ready = (
-            self.monitor_source == MONITOR_SOURCE_FOLDER
-            and self.monitor_dir is not None
-            and self.recipe_path is not None
-            and not self.monitor_running
-        )
+        if self.monitor_source == MONITOR_SOURCE_CAMERA:
+            blocker = self.ccd_controller.camera_monitor_blocker()
+            ready = self.recipe_path is not None and not blocker and not self.monitor_running
+            if not self.monitor_running:
+                idle_message = blocker or ("請先載入 Recipe。" if self.recipe_path is None else CAMERA_MONITOR_READY_MESSAGE)
+                self.monitor_screen.set_progress(0, idle_message)
+        else:
+            ready = self.monitor_dir is not None and self.recipe_path is not None and not self.monitor_running
         self.monitor_screen.set_ready(ready, self.monitor_running)
         self._update_monitor_source_selectable()
 
@@ -814,24 +819,24 @@ class MainWindow(QMainWindow, LogMixin):
             return
         self.monitor_source = source
         self.monitor_screen.set_source(source)
-        self._update_monitor_ready()
-        if source == MONITOR_SOURCE_CAMERA:
-            self.monitor_screen.set_progress(0, CAMERA_MONITOR_PENDING_MESSAGE)
-        else:
+        if source == MONITOR_SOURCE_FOLDER:
             self.monitor_screen.set_progress(0, "監控已就緒" if self.monitor_dir else "等待選擇資料夾與 Recipe")
+        self._update_monitor_ready()
 
     def _on_ccd_camera_status_changed(self, status: CameraStatus) -> None:
         camera_availability = self.ccd_controller.devices.camera.availability()
         if not camera_availability.available:
             text = "相機：不可用（請至 CCD 控制查看原因）"
         else:
-            trigger = self.ccd_controller.product_settings.trigger
+            trigger = self.ccd_controller.hardware_trigger() or self.ccd_controller.product_settings.trigger
             parts = [f"相機：{CAMERA_STATE_LABELS[status.state]}"]
             if status.camera_name:
                 parts.append(status.camera_name)
             parts.append(f"觸發：{TRIGGER_MODE_LABELS[trigger.mode]}")
             text = " · ".join(parts)
         self.monitor_screen.set_camera_status_text(text)
+        if self.monitor_source == MONITOR_SOURCE_CAMERA:
+            self._update_monitor_ready()
 
     def _on_ccd_product_settings_applied(self, settings: CameraRecipeSettings) -> None:
         if self.ccd_controller.pending_hardware_write():
@@ -847,10 +852,13 @@ class MainWindow(QMainWindow, LogMixin):
             self._notice(f"相機參數與 Recipe 設計內容相同；{write_text}", "success")
 
     def _start_monitoring(self) -> None:
-        if self.monitor_source == MONITOR_SOURCE_CAMERA:
-            self._notice(CAMERA_MONITOR_PENDING_MESSAGE, "warning")
-            return
-        if not self.monitor_dir:
+        camera_source = self.monitor_source == MONITOR_SOURCE_CAMERA
+        if camera_source:
+            blocker = self.ccd_controller.camera_monitor_blocker()
+            if blocker:
+                self._notice(blocker, "warning")
+                return
+        elif not self.monitor_dir:
             self._notice("請先選擇監控資料夾。", "warning")
             return
         if not self.recipe_path:
@@ -871,14 +879,25 @@ class MainWindow(QMainWindow, LogMixin):
         self.topbar.set_running(True, 0)
         self.statusBar().showMessage("監控模式中")
 
-        worker = FolderMonitorWorker(
-            input_dir=self.monitor_dir,
-            recipe_path=self.recipe_path,
-            output_dir=Path(self.output_dir or "outputs"),
-            output_overrides=dict(self.output_opts),
-            processed_move_dir=self.monitor_move_dir,
-            warmup_image_path=self.image_path,
-        )
+        if camera_source:
+            frame_queue = CameraFrameQueue()
+            self.ccd_controller.attach_inspection_queue(frame_queue)
+            worker = CameraMonitorWorker(
+                frame_queue=frame_queue,
+                recipe_path=self.recipe_path,
+                output_dir=Path(self.output_dir or "outputs"),
+                output_overrides=dict(self.output_opts),
+                warmup_image_path=self.image_path,
+            )
+        else:
+            worker = FolderMonitorWorker(
+                input_dir=self.monitor_dir,
+                recipe_path=self.recipe_path,
+                output_dir=Path(self.output_dir or "outputs"),
+                output_overrides=dict(self.output_opts),
+                processed_move_dir=self.monitor_move_dir,
+                warmup_image_path=self.image_path,
+            )
         self._monitor_controller.start(
             worker,
             signal_handlers=(
@@ -892,6 +911,8 @@ class MainWindow(QMainWindow, LogMixin):
         )
 
     def _stop_monitoring(self) -> None:
+        # New camera frames stop at once; frames already queued are still inspected by the worker.
+        self.ccd_controller.detach_inspection_queue()
         self._monitor_controller.stop()
         self.monitor_screen.set_progress(0, "正在停止監控")
         self.statusBar().showMessage("停止監控中")
@@ -912,6 +933,9 @@ class MainWindow(QMainWindow, LogMixin):
         self.statusBar().showMessage(f"監控完成：{item.get('image_name', '')} → {final}")
 
     def _open_monitor_original_image(self, item: dict) -> None:
+        if item.get("source") == "camera":
+            self._notice(CAMERA_MONITOR_NO_ORIGINAL_MESSAGE, "info")
+            return
         image_path = Path(str(item.get("image_path") or item.get("moved_image_path") or item.get("source_image_path") or ""))
         if not image_path.exists():
             self._notice(f"找不到原圖：{image_path}", "warning")
@@ -921,14 +945,17 @@ class MainWindow(QMainWindow, LogMixin):
     def _on_monitor_finished(self, result: dict) -> None:
         self.monitor_result = result
         processed = result.get("processed", 0)
-        self.monitor_screen.set_progress(0, f"監控已停止，共處理 {processed} 張")
-        self._notice(f"監控模式已停止，共處理 {processed} 張。", "success")
+        dropped = int(result.get("dropped", 0) or 0)
+        dropped_text = f"，另有 {dropped} 張因檢測佇列已滿未檢測" if dropped else ""
+        self.monitor_screen.set_progress(0, f"監控已停止，共處理 {processed} 張{dropped_text}")
+        self._notice(f"監控模式已停止，共處理 {processed} 張{dropped_text}。", "warning" if dropped else "success")
 
     def _on_monitor_failed(self, message: str) -> None:
         self.monitor_screen.set_progress(0, "監控模式失敗")
         self._notice(f"監控模式失敗：{message}", "error")
 
     def _on_monitor_thread_finished(self) -> None:
+        self.ccd_controller.detach_inspection_queue()
         self.monitor_running = False
         self._monitor_controller.clear()
         self.topbar.set_running(False, 0)

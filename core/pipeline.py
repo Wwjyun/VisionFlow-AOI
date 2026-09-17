@@ -9,7 +9,7 @@ from typing import Callable
 
 from core.aggregator import Aggregator
 from core.detector_manager import DetectorManager
-from core.image_loader import load_image
+from core.image_loader import frame_to_bgr, load_image
 from core.gpu_runtime import GpuRuntime, GpuRuntimeError
 from core.gpu_session import GpuExecutionSession
 from core.logging_system import LogMixin
@@ -52,7 +52,21 @@ class AOIPipeline(LogMixin):
                 return self._run(image_path)
         return self._run(image_path)
 
-    def _run(self, image_path: Path) -> InspectionResult:
+    def run_frame(self, frame, source_name: str, source_metadata: dict | None = None) -> InspectionResult:
+        """Inspect an already-acquired camera frame without writing it to disk first.
+
+        ``source_name`` stands in for the image file name in results and report file names. The
+        frame is converted exactly as the same pixels saved to an 8-bit BMP would load, and in GPU
+        mode it is uploaded once like a decoded file. ``source_metadata`` is kept under ``source``
+        in the result for traceability.
+        """
+        source = {"type": "camera", **dict(source_metadata or {})}
+        if self.gpu_session is not None:
+            with self.gpu_session.execution_scope():
+                return self._run(Path(source_name), frame=frame, source=source)
+        return self._run(Path(source_name), frame=frame, source=source)
+
+    def _run(self, image_path: Path, frame=None, source: dict | None = None) -> InspectionResult:
         started = time.perf_counter()
         profiler = PipelineProfiler()
         self._active_profiler = profiler
@@ -108,9 +122,12 @@ class AOIPipeline(LogMixin):
             and str(tile_config.get("mode", "grid")).lower() == "grid"
         )
         with profiler.measure("image_load"):
-            image = load_image(
-                image_path, preserve_bmp_file_order=preserve_bmp_file_order
-            )
+            if frame is None:
+                image = load_image(
+                    image_path, preserve_bmp_file_order=preserve_bmp_file_order
+                )
+            else:
+                image = frame_to_bgr(frame)
         self.logger.info("Image loaded: image=%s shape=%s", image_path, getattr(image, "shape", None))
         self._progress(10, "Image loaded")
         with profiler.measure("initialization"):
@@ -246,6 +263,8 @@ class AOIPipeline(LogMixin):
                 resident_skipped_by_crossover=resident_skipped_by_crossover and detector_gpu_requested,
                 profiler=profiler,
             )
+            if source is not None:
+                result["source"] = source
 
         with profiler.measure("result_sanitization"):
             serializable_result = self._without_runtime_images(result)

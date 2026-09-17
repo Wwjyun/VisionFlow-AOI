@@ -34,7 +34,7 @@ from devices.ccd_settings_store import CcdMachineSettingsStore
 from devices.factory import CcdDevices
 from devices.simulated import SimulatedLineScanCamera, SimulatedMeterWheel
 from gui.ccd_controller import CcdCameraSettingsView, CcdController, preview_qimage
-from gui.main_window import CAMERA_MONITOR_PENDING_MESSAGE, MainWindow
+from gui.main_window import CAMERA_MONITOR_READY_MESSAGE, MainWindow
 from gui.screens.ccd_screen import ACCESS_ADMIN, ACCESS_ENGINEER, AccessGate, CcdScreen
 from gui.widgets.rail import NAV_ITEMS
 
@@ -406,14 +406,23 @@ class CcdGuiTests(unittest.TestCase):
         self.assertFalse(panel.start_button.isEnabled())
         self.assertTrue(panel.choose_button.isHidden())
         self.assertFalse(panel.camera_status_label.isHidden())
-        self.assertEqual(panel.message_label.text(), CAMERA_MONITOR_PENDING_MESSAGE)
+        self.assertIn("相機未連線", panel.message_label.text())
         window._start_monitoring()
         self.assertFalse(window.monitor_running)
-        self.assertEqual(window.notice_bar.label.text(), CAMERA_MONITOR_PENDING_MESSAGE)
+        self.assertIn("相機未連線", window.notice_bar.label.text())
 
         window.ccd_controller.connect_camera()
         self.assertIn("待機", panel.camera_status_label.text())
         self.assertIn("模擬線掃相機", panel.camera_status_label.text())
+        self.assertIn("連續取像", panel.message_label.text(), "free-run frames are never inspected")
+        self.assertFalse(panel.start_button.isEnabled())
+        window.ccd_controller.disconnect_camera()
+        window.ccd_controller.apply_camera_settings(
+            CameraConnectionSettings(), CameraRecipeSettings(trigger=TriggerSettings(TriggerMode.SOFTWARE))
+        )
+        window.ccd_controller.connect_camera()
+        self.assertEqual(panel.message_label.text(), CAMERA_MONITOR_READY_MESSAGE)
+        self.assertTrue(panel.start_button.isEnabled())
 
         window.monitor_running = True
         window._on_monitor_source_changed("folder")

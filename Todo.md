@@ -740,11 +740,11 @@ vs 原本 `[255,255,20,20]`）。因此「標籤編號順序」對 202 的最終
 
 ### 與檢測流程整合
 
-- [x] **監控模式影像來源選擇**（2026-09-17 使用者需求）：Monitor「監控來源」可選「監控資料夾」（原模式）或「相機直連」；工程／管理模式可切換，OP 與監控執行中不可切換；選擇以 QSettings 保存；相機直連時隱藏資料夾控制、顯示唯讀相機狀態與觸發模式，因檢測後端尚未完成而停用「啟動」並以文字說明。
-- [ ] **相機直連監控的檢測後端**：相機觸發完成的 frame 自動送入檢測並顯示在監控表格；依下方第一／第二階段決定實作方式，完成後移除「尚未實作」阻擋。只檢測觸發完成的 frame，不檢測預覽 frame。
-- [ ] 第一階段（低耦合）：CCD 自動存 BMP 到 Monitor 資料夾，由既有 `FolderMonitorProcessor` 檢測；確認 `.tmp`→rename 不會被半檔讀取，並保留 stable checks。
-- [ ] 第二階段（記憶體交接）：`AOIPipeline.run()` 目前只收影像路徑；新增 ndarray＋來源 metadata（相機、trigger mode、encoder 值、時間）的入口，檔案路徑語意不變。GPU mode 把相機 frame 視為已解碼影像，只上傳一次。相機是單通道，pipeline 以 BGR `uint8` 為主，16384×50000 單通道約 819 MB、轉 BGR 約 2.4 GB，須先量測轉換成本並評估灰階直通，不得改變 Detector 判定。結果追溯保存取像 metadata，並可選擇保存原圖。以量測決定是否取代第一階段。
-- [ ] 檢測與取像並行時，相機 callback、存圖佇列、檢測 worker 與 GPU session 互不阻塞；GUI 保持可回應。
+- [x] **監控模式影像來源選擇**（2026-09-17 使用者需求）：Monitor「監控來源」可選「監控資料夾」（原模式）或「相機直連」；工程／管理模式可切換，OP 與監控執行中不可切換；選擇以 QSettings 保存；相機直連時隱藏資料夾控制、顯示唯讀相機狀態與觸發模式，並依相機狀態說明能否啟動。
+- [x] **相機直連監控的檢測後端**（2026-09-17）：直接採記憶體交接，不走「存 BMP 到監控資料夾」的第一階段（同一行程內寫出再讀回大型 BMP 沒有好處）。`AOIPipeline.run_frame(frame, source_name, source_metadata)` 以 `frame_to_bgr` 轉成與 8-bit BMP 解碼逐像素相同的 BGR 影像，檔案路徑入口與結果欄位不變；相機 frame 結果多一個 `source`（type=camera、frame 序號、擷取時間、觸發模式、尺寸）並寫入 JSON。`CcdController` 只在相機以外部觸發或軟體觸發連線時，把完成的 frame 交給有界 `CameraFrameQueue`（預設 4 張，滿了記為未檢測），連續取像的 frame 一律不檢測；`CameraMonitorProcessor` 共用一個 GPU session 依序檢測，產生與資料夾監控相同格式的表格項目（`source=camera`、`camera` metadata、佇列等待／檢測／端到端時間），停止時新 frame 立即停止交接、佇列中已收到的 frame 仍會檢測完，輸出到 `outputs/monitor/<時間>_camera/`。GPU mode 下 frame 視為已解碼影像，與檔案相同只上傳一次。
+- 原「第一階段：CCD 自動存 BMP 到 Monitor 資料夾」已由記憶體交接取代，不實作；需要原圖時使用 Recipe 相機設定的自動存圖。
+- [ ] 相機直連大 frame 的記憶體與耗時量測：16384×50000 單通道 819 MB，`frame_to_bgr` 轉 BGR 約 2.4 GB，加上佇列最多 4 張；需在相機機台量測轉換耗時、峰值記憶體與佇列上限，並評估灰階直通（不得改變 Detector 判定）。encoder 值目前未寫入 frame metadata，需確認從 driver thread 讀米輪的時機。
+- [ ] 檢測與取像並行時，相機 callback、存圖佇列、檢測 worker 與 GPU session 互不阻塞；GUI 保持可回應。（結構已分離：callback 只交接 frame、檢測在 worker thread；需在相機機台以實際 frame 速率與尺寸壓測。）
 
 ### 測試、打包與實機驗收
 
@@ -900,6 +900,8 @@ vs 原本 `[255,255,20,20]`）。因此「標籤編號順序」對 202 的最終
 - [ ] 加速不得犧牲 GUI 回應、打包啟動、結果追溯、錯誤訊息或 CPU fallback。
 
 ## 完成紀錄
+
+- [x] 2026-09-17：**P11 相機直連監控的檢測後端。** 採記憶體交接：`core/image_loader.py` 新增 `frame_to_bgr`（灰階 frame 轉三通道，與 8-bit BMP 解碼逐像素相同，永遠回傳可寫入的新陣列）；`AOIPipeline.run_frame` 以虛擬影像名稱檢測 frame，檔案路徑 `run()` 與其結果 schema 不變，frame 結果加上 `source` metadata 並寫入 JSON，`compact_inspection_result` 保留 `source`。新增 `core/camera_monitor_processor.py`：`CameraFrameQueue`（有界、執行緒安全、記錄未能排入的 frame 名稱而不保留像素）與 `CameraMonitorProcessor`（共用 GPU session 與預熱、依序檢測、輸出與資料夾監控相同格式的項目與 CSV 彙總、停止時完成佇列中的 frame、未檢測 frame 以 ERROR 回報）；`gui/workers.py` 新增 `CameraMonitorWorker`。`CcdController` 新增 `camera_monitor_blocker`、`attach_inspection_queue`／`detach_inspection_queue`，只在外部觸發或軟體觸發連線時把 frame 與序號、擷取時間、觸發模式、尺寸交給佇列。`MainWindow` 移除「尚未實作」阻擋：相機直連依相機狀態顯示可否啟動、啟動時建立佇列與 worker、停止時立即停止交接，相機項目的「開啟原始影像」改為說明需使用自動存圖。新增 `tests/test_camera_monitor.py`（8 項：BMP 逐像素等價、`run_frame` 與檔案檢測判定等價且含實際缺陷、佇列上限與關閉、處理順序／未檢測回報／停止排空、worker 失敗、只交接觸發 frame、MainWindow 端到端），更新監控來源測試。大 frame 記憶體與實機壓測仍待相機機台。
 
 - [x] 2026-09-17：依使用者決定，P11 的滾動式拍照與灰階波形從待辦移到「暫不移植」並寫明理由：兩者都是 `xx_ccd` 的顯示／調光輔助功能，不影響檢測；跨 frame 缺陷若日後出現，改列為檢測流程的 frame 拼接需求；灰階需求改建議簡化為預覽游標灰階值與飽和像素比例。自動測試項目同步移除滾動與波形。僅文件變更。
 

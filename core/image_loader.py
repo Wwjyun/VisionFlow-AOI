@@ -208,6 +208,23 @@ class ImageLoader(LogMixin):
         return image_path
 
 
+def frame_to_bgr(frame: np.ndarray) -> np.ndarray:
+    """Convert an acquired camera frame to the BGR ``uint8`` image the pipeline inspects.
+
+    A grayscale frame becomes three equal channels, which is pixel-identical to decoding the same
+    frame after saving it as an 8-bit BMP. The returned array is always a new, writable copy, so the
+    camera's read-only frame buffer is never shared with inspection.
+    """
+    image = np.asarray(frame)
+    if image.dtype != np.uint8:
+        raise ImageLoadError(f"Camera frame must be uint8, got {image.dtype}")
+    if image.ndim == 2:
+        return cv2.cvtColor(image, cv2.COLOR_GRAY2BGR)
+    if image.ndim == 3 and image.shape[2] == 3:
+        return np.array(image, dtype=np.uint8, copy=True, order="C")
+    raise ImageLoadError(f"Camera frame must be HxW or HxWx3, got shape {image.shape}")
+
+
 def load_image(path: Path, *, preserve_bmp_file_order: bool = False):
     return ImageLoader().load_bgr(
         path, preserve_bmp_file_order=preserve_bmp_file_order

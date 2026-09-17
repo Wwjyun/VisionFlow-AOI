@@ -9,6 +9,7 @@ import cv2
 import numpy as np
 
 from core.batch_processor import BatchInspectionProcessor
+from core.camera_monitor_processor import CameraFrameQueue, CameraMonitorProcessor
 from core.csv_summary import CsvSummaryExporter
 from core.gpu_runtime import GpuRuntime, GpuRuntimeError
 from core.gpu_session import GpuExecutionSessionCache
@@ -256,6 +257,56 @@ class FolderMonitorWorker(QObject, LogMixin):
             return
 
         self.logger.info("GUI monitor worker stopped: result=%s", result)
+        self.finished.emit(result)
+
+
+class CameraMonitorWorker(QObject, LogMixin):
+    finished = Signal(dict)
+    failed = Signal(str)
+    progress = Signal(int, str)
+    image_processed = Signal(dict)
+
+    def __init__(
+        self,
+        frame_queue: CameraFrameQueue,
+        recipe_path: Path,
+        output_dir: Path,
+        output_overrides: dict | None = None,
+        warmup_image_path: Path | None = None,
+    ):
+        super().__init__()
+        self.frame_queue = frame_queue
+        self.recipe_path = Path(recipe_path)
+        self.output_dir = Path(output_dir)
+        self.output_overrides = output_overrides
+        self.warmup_image_path = Path(warmup_image_path) if warmup_image_path else None
+        self._stop_requested = False
+
+    def stop(self) -> None:
+        self._stop_requested = True
+
+    @Slot()
+    def run(self) -> None:
+        try:
+            self.logger.info("GUI camera monitor worker started: recipe=%s", self.recipe_path)
+            processor = CameraMonitorProcessor(
+                frame_queue=self.frame_queue,
+                recipe_path=self.recipe_path,
+                output_dir=self.output_dir,
+                output_overrides=self.output_overrides,
+                progress_callback=self.progress.emit,
+                item_callback=self.image_processed.emit,
+                stop_callback=lambda: self._stop_requested,
+                warmup_image_path=self.warmup_image_path,
+            )
+            result = processor.run()
+        except Exception as exc:
+            self.logger.exception("GUI camera monitor worker failed: recipe=%s", self.recipe_path)
+            self.frame_queue.close()
+            self.failed.emit(str(exc))
+            return
+
+        self.logger.info("GUI camera monitor worker stopped: result=%s", result)
         self.finished.emit(result)
 
 

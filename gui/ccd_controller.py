@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import datetime
 import threading
+import time
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -10,6 +12,7 @@ import numpy as np
 from PySide6.QtCore import QObject, Qt, QTimer, Signal
 from PySide6.QtGui import QImage
 
+from core.camera_monitor_processor import CameraFrameQueue, CapturedFrame
 from core.logging_system import LogMixin
 from devices.ccd_models import (
     CAMERA_STATE_LABELS,
@@ -159,6 +162,8 @@ class CcdController(QObject, LogMixin):
         self._software_monitor: SoftwareTriggerMonitor | None = None
         self._software_capture_lock = threading.Lock()
         self._software_capture_queued = False
+        self._inspection_queue: CameraFrameQueue | None = None
+        self._inspection_sequence = 0
 
         self._converter = PreviewFrameConverter(self.preview_image_ready.emit)
         self._save_queue = self._create_save_queue()
@@ -276,6 +281,25 @@ class CcdController(QObject, LogMixin):
     def pending_auto_saves(self) -> int:
         return self._auto_save_requests.pending
 
+    def camera_monitor_blocker(self) -> str:
+        """Why camera-direct inspection cannot start now, or an empty string when it can."""
+        availability = self.devices.camera.availability()
+        if not availability.available:
+            return f"相機不可用：{availability.reason}"
+        hardware = self.hardware_trigger()
+        if hardware is None or not self.camera_status().connected:
+            return "相機未連線，請先到 CCD 控制連線相機。"
+        if hardware.mode == TriggerMode.CONTINUOUS:
+            return "相機以連續取像連線；相機直連檢測只檢測觸發影像，請改用外部觸發或軟體觸發並重新連線。"
+        return ""
+
+    def attach_inspection_queue(self, queue: CameraFrameQueue) -> None:
+        self._inspection_sequence = 0
+        self._inspection_queue = queue
+
+    def detach_inspection_queue(self) -> None:
+        self._inspection_queue = None
+
     def has_pending_saves(self) -> bool:
         return self._save_queue.stats().pending > 0
 
@@ -385,7 +409,32 @@ class CcdController(QObject, LogMixin):
             saved = self._save_queue.submit(frame, self.snapshot_directory(), self._machine.save.image_format)
             if saved is None:
                 self._auto_save_rejected.emit()
+        self._hand_off_for_inspection(frame)
         self._frame_arrived.emit()
+
+    def _hand_off_for_inspection(self, frame: np.ndarray) -> None:
+        # Driver thread. Only trigger frames are inspected; continuous free-run frames are preview only.
+        queue = self._inspection_queue
+        hardware = self.hardware_trigger()
+        if queue is None or hardware is None or hardware.mode == TriggerMode.CONTINUOUS:
+            return
+        self._inspection_sequence += 1
+        sequence = self._inspection_sequence
+        now = datetime.datetime.now()
+        queue.put(
+            CapturedFrame(
+                image=frame,
+                source_name=f"camera_{now:%Y%m%d_%H%M%S}_{now.microsecond // 1000:03d}_{sequence:06d}",
+                received_at=time.perf_counter(),
+                metadata={
+                    "frame_index": sequence,
+                    "captured_at": now.isoformat(timespec="milliseconds"),
+                    "trigger_mode": hardware.mode.value,
+                    "frame_width": int(frame.shape[1]),
+                    "frame_height": int(frame.shape[0]),
+                },
+            )
+        )
 
     def _on_auto_save_rejected(self) -> None:
         self.notice.emit("自動存圖佇列已滿，這張影像未保存。", "warning")
@@ -647,6 +696,7 @@ class CcdController(QObject, LogMixin):
         if self._closed:
             return
         self._closed = True
+        self.detach_inspection_queue()
         self.stop_software_trigger_monitor()
         self._meter_wheel_timer.stop()
         self.devices.camera.set_frame_listener(None)
