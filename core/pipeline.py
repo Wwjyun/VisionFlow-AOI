@@ -90,7 +90,7 @@ class AOIPipeline(LogMixin):
             self.output_dir,
             self.debug,
         )
-        self._progress(0, "Starting inspection")
+        self._progress(0, "開始檢測")
         with profiler.measure("recipe_setup"):
             prepared = RecipeRuntimePreparation(
                 self.recipe_manager,
@@ -120,7 +120,7 @@ class AOIPipeline(LogMixin):
         elif gpu_requested:
             self.logger.warning("CUDA requested; falling back to CPU: %s", gpu_runtime.unavailable_reason)
         self.logger.info("Recipe loaded: name=%s version=%s", recipe.get("recipe_name"), recipe.get("version"))
-        self._progress(5, "Recipe loaded")
+        self._progress(5, "Recipe 已載入")
         tile_config = recipe["tile"]
         detector_gpu_requested = detector_gpu_allowed and any(
             bool(config.get("use_gpu", False))
@@ -150,7 +150,7 @@ class AOIPipeline(LogMixin):
             else:
                 image = frame_to_bgr(frame)
         self.logger.info("Image loaded: image=%s shape=%s", image_path, getattr(image, "shape", None))
-        self._progress(10, "Image loaded")
+        self._progress(10, "影像已載入")
         with profiler.measure("initialization"):
             resident_image = None
             resident_upload_memory = {}
@@ -192,7 +192,7 @@ class AOIPipeline(LogMixin):
             detectors = self.detector_manager.create_enabled(detector_configs, gpu_runtime=gpu_runtime)
             self._apply_debug_flag(detectors, debug_images_requested)
         self.logger.info("Detectors initialized: count=%s ids=%s", len(detectors), [d.detector_id for d in detectors])
-        self._progress(15, "Detectors initialized")
+        self._progress(15, "Detector 已初始化")
 
         with profiler.measure("tiling"):
             tiles = list(tiler.iter_tiles(image))
@@ -214,7 +214,7 @@ class AOIPipeline(LogMixin):
                     crop_metrics["host_to_device_bytes"],
                 )
             self.logger.info("Tiles prepared: count=%s mode=%s", len(tiles), tile_config.get("mode", "grid"))
-            self._progress(20, f"Tiles prepared: {len(tiles)}")
+            self._progress(20, f"切圖完成：{len(tiles)} 個 Tile")
 
             total_work = max(len(tiles) * max(len(detectors), 1), 1)
             tile_workers = self._tile_worker_count(recipe, detectors, resident_image, len(tiles))
@@ -254,14 +254,14 @@ class AOIPipeline(LogMixin):
             }
             if detector_fallbacks:
                 self.logger.warning("Detector CUDA fallback: %s", detector_fallbacks)
-            fallback_message = " (CPU fallback)" if (
+            fallback_message = "（CPU fallback）" if (
                 (
                     gpu_requested
                     and (not gpu_runtime.available or gpu_runtime.last_error)
                 )
                 or detector_fallbacks
             ) else ""
-            self._progress(85, f"Aggregating PASS / NG result{fallback_message}")
+            self._progress(85, f"彙總 PASS／NG 判定{fallback_message}")
         with profiler.measure("aggregation"):
             aggregate = Aggregator(recipe["decision"]).aggregate(tile_results)
         with profiler.measure("result_assembly"):
@@ -293,7 +293,7 @@ class AOIPipeline(LogMixin):
 
         with profiler.measure("result_sanitization"):
             serializable_result = self._without_runtime_images(result)
-        self._progress(92, "Writing overlay, CSV, and JSON")
+        self._progress(92, "正在寫出 overlay、CSV 與 JSON")
         with profiler.measure("reporting_total"):
             outputs = Reporter(self.output_dir, recipe["output"], profiler=profiler).write(image, result)
         with profiler.measure("finalization"):
@@ -325,7 +325,7 @@ class AOIPipeline(LogMixin):
         self.logger.info("Inspection performance: %s", serializable_result["execution"]["performance"])
         if gpu_requested:
             self.logger.info("CUDA host metrics: %s", serializable_result["execution"]["gpu"]["metrics"])
-        self._progress(100, "Inspection complete")
+        self._progress(100, "檢測完成")
         return serializable_result
 
     def _check_resident_upload_memory(self, gpu_runtime, image) -> dict:
@@ -377,9 +377,9 @@ class AOIPipeline(LogMixin):
             completed_work += max(len(detectors), 1)
             percent = 20 + int(completed_work / total_work * 60)
             message = (
-                f"Inspecting tile {tile_index}/{len(tiles)} with detector {detectors[-1].detector_id}"
+                f"檢測 Tile {tile_index}/{len(tiles)}（Detector {detectors[-1].detector_id}）"
                 if detectors
-                else f"Preparing tile {tile_index}/{len(tiles)}"
+                else f"準備 Tile {tile_index}/{len(tiles)}"
             )
             self._progress(min(percent, 80), message)
             tile_results.append(tile_result)
@@ -418,7 +418,7 @@ class AOIPipeline(LogMixin):
                 results[index] = tile_result
                 self._record_tile_timings(profiler, timings)
                 percent = 20 + int(completed / len(tiles) * 60)
-                self._progress(min(percent, 80), f"Inspecting tile {completed}/{len(tiles)}")
+                self._progress(min(percent, 80), f"檢測 Tile {completed}/{len(tiles)}")
         return results
 
     @staticmethod

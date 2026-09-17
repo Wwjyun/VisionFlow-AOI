@@ -166,7 +166,7 @@ class BatchInspectionProcessor(LogMixin):
                     completed += 1
                     self._progress(
                         int(completed / total * 100),
-                        f"Batch {completed}/{total}: finished {image_path.name}",
+                        f"批量 {completed}/{total}：已完成 {image_path.name}",
                     )
 
         results = [results_by_index[index] for index in range(total)]

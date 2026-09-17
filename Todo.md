@@ -606,7 +606,7 @@ vs 原本 `[255,255,20,20]`）。因此「標籤編號順序」對 202 的最終
 ### GUI 後續優化（2026-09-15 v1.6.0 發行後盤點）
 
 - [ ] **檢測效能分析面板**：GUI 目前只在 viewer tooltip 顯示預覽的 QImage／QPixmap 時間，`execution.performance` 的各階段耗時、Detector 子階段、`device_host_split`、H2D／D2H bytes 與 native call 數都沒有呈現。在 Results（或 Run 側欄摺疊區）新增唯讀面板，資料一律取自本次執行結果 metadata，不得由 Recipe 推論；hybrid 步驟與 fallback 原因以文字標示。需測試 CPU-only、CUDA、fallback 三種結果的顯示。
-- [ ] **執行進度訊息繁中化**：`core/pipeline.py` 的 `Starting inspection`、`Recipe loaded`、`Tiles prepared`、`Inspecting tile n/m`、`Writing overlay, CSV, and JSON` 等英文訊息直接顯示在 Run 面板，違反操作文字繁中契約。改為繁中（保留 ROI、NG 等縮寫），並補 GUI 訊息測試；log 可維持英文。
+- [x] **執行進度訊息繁中化**（2026-09-17 完成，見完成紀錄）：`core/pipeline.py` 的 `Starting inspection`、`Recipe loaded`、`Tiles prepared`、`Inspecting tile n/m`、`Writing overlay, CSV, and JSON` 等英文訊息直接顯示在 Run 面板，違反操作文字繁中契約。改為繁中（保留 ROI、NG 等縮寫），並補 GUI 訊息測試；log 可維持英文。
 - [ ] **大圖預覽記憶體與 LOD**：`ImagePreviewWorker` 對 16384×13000 影像會建立全解析 RGB `QImage.copy()`（約 639 MB），`set_qimage` 再轉成全尺寸 `QPixmap`，同一張圖在 GUI 行程內至少佔兩份大型記憶體。改為依 viewport 顯示降採樣金字塔或分塊，放大後才載入原解析度區塊；overlay 座標、縮放與游標座標仍以原圖像素為準。需量測記憶體峰值與顯示時間前後對照。
 - [x] **預覽與檢測重複解碼**（2026-09-17 完成：預覽與檢測共用不划算，改為 session 緩衝重用同一檔案的解碼結果，見完成紀錄）：預覽與 `InspectionWorker` 各自解碼同一檔案，正式尺寸 `image_load` 約 768 ms（GPU 模式端到端的 38%）。評估以路徑＋mtime＋size 為 key 的單份解碼快取（設記憶體上限、檔案變更即失效、回傳唯讀或獨立副本），不得違反 GPU 模式「解碼後只上傳一次」邊界；以量測決定是否採用。
 - [x] **預覽不再逐張建立 GpuRuntime**（2026-09-17 完成：實測 GPU 無收益，改為固定 CPU，見完成紀錄）：`ImagePreviewWorker.run` 每次預覽都建立新的 `GpuRuntime`（載入 DLL／建立 context）只為做 BGR→RGB，與「GUI 共用單一 runtime／session」原則不一致。改用 GUI 共用 session 或直接走 CPU（先量測 GPU 轉換是否真的有收益），並測試 strict CUDA 與 fallback 行為不變。
@@ -903,6 +903,8 @@ vs 原本 `[255,255,20,20]`）。因此「標籤編號順序」對 202 的最終
 - [ ] 加速不得犧牲 GUI 回應、打包啟動、結果追溯、錯誤訊息或 CPU fallback。
 
 ## 完成紀錄
+
+- [x] 2026-09-17：**執行進度訊息繁中化。** `core/pipeline.py` 送到 GUI Run 面板、監控與批量進度的訊息改為繁中：「開始檢測」「Recipe 已載入」「影像已載入」「Detector 已初始化」「切圖完成：n 個 Tile」「檢測 Tile i/n（Detector ID）」「準備 Tile i/n」「彙總 PASS／NG 判定（CPU fallback）」「正在寫出 overlay、CSV 與 JSON」「檢測完成」；`core/batch_processor.py` 的「Batch c/t: finished 檔名」改為「批量 c/t：已完成 檔名」。log 訊息維持英文。新增 `tests/test_progress_messages.py`，以真實 CPU 單張檢測與批量收集全部進度訊息，逐則要求含中文字，且排除 Detector ID 與影像檔名後只允許 PASS、NG、CPU、CUDA、GPU、ROI、DLL、Tile、Detector、Recipe、overlay、CSV、JSON、fallback、worker 等既有縮寫與專有名詞。完整 604 tests、compileall、CUDA preflight、CLI 合成圖 smoke 通過。
 
 - [x] 2026-09-17：**同一檔案不重複解碼（session 緩衝記住目前持有的檔案）。** 評估 P6「預覽與檢測重複解碼」：預覽需要 top-down RGB 與 QImage 副本，GPU 檢測需要 BMP 檔案列序且放在 pinned backing，兩者共用解碼至少多一次整圖翻轉／複製，沒有收益，因此不共用。現行 `image_load` 已從當時的 768 ms 降到約 81 ms，剩下可省的是「同一檔案再檢測一次」：`HostImageBufferPool` 記錄 backing 目前持有的檔案身分（解析後路徑、大小、`st_mtime_ns`、檔案 ID）與列序版面，`HostImageLease.cached_image()` 在身分完全相同時直接借出 backing、略過讀檔；讀檔前後身分不同（讀取中被改寫）不記錄；任何新的讀取、脫離、關閉都清除紀錄，所以記憶體上限仍是 session 內一張影像。session backing 交給 pipeline 的影像一律設為唯讀，任何步驟若就地修改原圖會立即報錯，不會汙染下一次的快取像素。每次檢測仍只做一次整圖上傳，GPU mode「解碼後只上傳一次」邊界不變；`host_buffer` 新增 `decode_skipped`。RTX 3090 驗證（`outputs_validation/decode_reuse/decode_reuse_validation.json`）：開啟 overlay、NG tile／sidecar、CSV、matrix CSV、JSON 與 debug images，202-CS-SN-1 正式尺寸與 401-AS-SN-1（GPU auto，4000×3000 合成 BMP）各連跑 6 次，第 2～6 次皆略過解碼，6 次結果完全相同且判定欄位 6/6 與 CPU 參考相同（NG／558、NG／243），tile error 0、pool 脫離 0；不輸出檔案時同檔再檢測 12 次 median／P95 142.0／143.2 ms，對照每次都讀檔 223.7／231.6 ms（讀圖 80.96→0.26 ms，1.58×），判定欄位全部相同。GUI offscreen `MainWindow` 全新 process 各 3 次：自動背景預熱讀過同一張圖後第一次檢測 182.1～186.1 ms（之前 266～270 ms），無自動預熱的第二次檢測亦降為 182～189 ms，6 個 process 皆正常結束。新增測試：同檔重用且唯讀、同大小新內容改讀、讀別的檔後不再命中、讀取中檔案變動不記錄、脫離與關閉清除紀錄且殘留 view 唯讀不可寫、Pipeline 重檢同圖略過解碼且上傳像素完全相同。完整 603 tests、compileall、CUDA preflight、`git diff --check`、CLI 合成圖 smoke 通過。未修改 CUDA source／header／ABI／DLL。
 
