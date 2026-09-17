@@ -25,7 +25,7 @@ from PySide6.QtWidgets import (
 
 from core.camera_monitor_processor import CameraFrameQueue
 from core.logging_system import LogMixin, configure_logging
-from core.gpu_session import GpuExecutionSessionCache
+from core.gpu_session import GpuExecutionSession, GpuExecutionSessionCache
 from core.recipe_manager import RecipeError, RecipeManager
 from devices.ccd_models import CAMERA_STATE_LABELS, TRIGGER_MODE_LABELS, CameraRecipeSettings, CameraStatus
 from devices.ccd_recipe import camera_settings_from_recipe
@@ -224,6 +224,10 @@ class MainWindow(QMainWindow, LogMixin):
         self._tile_preview_controller = TilePreviewWorkflowController(self)
         self._warmup_controller = GpuWarmupWorkflowController(self)
         self.warming_up = False
+        # Background warm-up after a CUDA recipe and an image are loaded. It does not lock the UI:
+        # runs that start meanwhile wait for the shared session instead of racing it.
+        self.auto_warming_up = False
+        self._auto_warmup_key: tuple | None = None
 
         self._preview_thread: QThread | None = None
         self._preview_worker: ImagePreviewWorker | None = None
@@ -634,6 +638,7 @@ class MainWindow(QMainWindow, LogMixin):
         self.preferences.set_value("paths/yolox_model_directory", resolved)
         self.preferences.settings.sync()
         self._inspection_gpu_sessions.invalidate()
+        self._auto_warmup_key = None
 
     def _confirm_discard_designer_changes(self) -> bool:
         if not self.designer_screen.is_dirty():
@@ -1044,6 +1049,8 @@ class MainWindow(QMainWindow, LogMixin):
         self._preview_started_at = None
         self._preview_controller.clear()
         self._refresh_image_chip()
+        # A Recipe load also reloads the preview, so this covers both "image then Recipe" orders.
+        self._maybe_auto_gpu_warmup()
 
     def _refresh_image_chip(self) -> None:
         if self.image_path:
@@ -1101,7 +1108,7 @@ class MainWindow(QMainWindow, LogMixin):
         has_recipe = self.recipe_path is not None
         ready = has_image and has_recipe
         self.run_screen.run_control_panel.set_ready(ready, has_image, has_recipe, False)
-        self.run_screen.run_control_panel.set_warmup_state(has_recipe, False, False)
+        self.run_screen.run_control_panel.set_warmup_state(has_recipe, self.auto_warming_up, self.auto_warming_up)
         self.run_screen.op_panel.set_state(ready, False, 0, "", self.result)
         self._update_batch_ready()
 
@@ -1213,7 +1220,9 @@ class MainWindow(QMainWindow, LogMixin):
         has_recipe = self.recipe_path is not None
         ready = has_image and has_recipe and not running
         self.run_screen.run_control_panel.set_ready(ready, has_image, has_recipe, running)
-        self.run_screen.run_control_panel.set_warmup_state(has_recipe, running, False)
+        self.run_screen.run_control_panel.set_warmup_state(
+            has_recipe, running or self.auto_warming_up, self.auto_warming_up
+        )
 
     # ------------------------------------------------------------------
     # GPU warm-up
@@ -1221,6 +1230,9 @@ class MainWindow(QMainWindow, LogMixin):
     def _run_gpu_warmup(self) -> None:
         if not self.recipe_path:
             self._notice("請先載入 Recipe。", "warning")
+            return
+        if self.auto_warming_up:
+            self._notice("GPU 背景預熱中，完成後即可直接檢測。")
             return
         if self.running or self._warmup_controller.is_running:
             self._notice("請先等待目前檢測或預熱完成。", "warning")
@@ -1243,6 +1255,80 @@ class MainWindow(QMainWindow, LogMixin):
             on_thread_finished=self._on_gpu_warmup_thread_finished,
         )
 
+    def _auto_gpu_warmup_key(self) -> tuple | None:
+        """Session identity plus image size, or ``None`` when an automatic warm-up does not apply."""
+        if not self.recipe or not self.recipe_path or not self.image_path:
+            return None
+        try:
+            if not GpuExecutionSession.cuda_requested(self.recipe):
+                return None
+            identity = GpuExecutionSession.identity(self.recipe, self._inspection_gpu_sessions.workload)
+        except Exception:  # an unusable GPU section is reported by the inspection itself
+            self.logger.debug("Automatic GPU warm-up skipped: GPU identity unavailable", exc_info=True)
+            return None
+        image = self._current_image
+        size = (int(image.width()), int(image.height())) if hasattr(image, "width") else (str(self.image_path),)
+        return (identity, size)
+
+    def _maybe_auto_gpu_warmup(self) -> None:
+        """Warm the shared session in the background once per GPU identity and image size.
+
+        Operators never see the warm-up button, so the first inspection after loading a CUDA recipe
+        would otherwise pay the CUDA context, device buffer and pinned host buffer setup.
+        """
+        key = self._auto_gpu_warmup_key()
+        if key is None or key == self._auto_warmup_key:
+            return
+        if (
+            self.running
+            or self.batch_running
+            or self.monitor_running
+            or self._warmup_controller.is_running
+            or (self._preview_thread and self._preview_thread.isRunning())
+        ):
+            return
+        self._auto_warmup_key = key
+        self.auto_warming_up = True
+        self._update_run_ready()
+        self.statusBar().showMessage("GPU 背景預熱中（可直接開始檢測）")
+        worker = GpuWarmupWorker(
+            recipe_path=self.recipe_path,
+            gpu_session_cache=self._inspection_gpu_sessions,
+            image_path=self.image_path,
+        )
+        self._warmup_controller.start(
+            worker,
+            signal_handlers=(
+                (worker.finished, self._on_auto_gpu_warmup_finished),
+                (worker.failed, self._on_auto_gpu_warmup_failed),
+            ),
+            terminal_signals=(worker.finished, worker.failed),
+            on_thread_finished=self._on_auto_gpu_warmup_thread_finished,
+        )
+
+    def _on_auto_gpu_warmup_finished(self, summary: dict) -> None:
+        status = summary.get("status", "")
+        reason = str(summary.get("reason", "") or "")
+        if status == "warmed":
+            self.statusBar().showMessage(f"GPU 背景預熱完成（{summary.get('pipeline_ms', 0):.0f} ms）")
+        elif status == "fallback":
+            self._notice(f"GPU 背景預熱時 Detector 改用 CPU fallback：{reason}", "warning")
+        elif status == "unavailable":
+            self._notice(f"GPU 背景預熱略過：CUDA 不可用（{reason}）", "warning")
+        else:
+            self.statusBar().showMessage("GPU 背景預熱結束")
+
+    def _on_auto_gpu_warmup_failed(self, message: str) -> None:
+        self._notice(f"GPU 背景預熱失敗，檢測時會再嘗試：{message}", "warning")
+
+    def _on_auto_gpu_warmup_thread_finished(self) -> None:
+        self._warmup_controller.clear()
+        self.auto_warming_up = False
+        if not self.running:
+            self._update_run_ready()
+        # The Recipe or image may have changed while this warm-up ran.
+        self._maybe_auto_gpu_warmup()
+
     def _set_warmup_running(self, warming: bool) -> None:
         # Warm-up owns the shared single-image GPU session, so `running` also blocks the image,
         # Recipe and inspection actions that would replace or close that session mid-run.
@@ -1263,6 +1349,8 @@ class MainWindow(QMainWindow, LogMixin):
         self.statusBar().showMessage("GPU 預熱中")
 
     def _on_gpu_warmup_finished(self, summary: dict) -> None:
+        # A manual warm-up of the current Recipe and image also satisfies the automatic one.
+        self._auto_warmup_key = self._auto_gpu_warmup_key()
         status = summary.get("status", "")
         reason = str(summary.get("reason", "") or "")
         reserved_mb = int(summary.get("reserved_bytes", 0) or 0) / (1024 * 1024)

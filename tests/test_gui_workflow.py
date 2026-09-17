@@ -256,6 +256,93 @@ class GuiWorkflowTests(unittest.TestCase):
                 window._inspection_gpu_sessions.close()
                 window.deleteLater()
 
+    def test_cuda_recipe_and_image_start_one_background_warm_up_without_locking_inspection(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            source = yaml.safe_load(
+                Path("recipes/PRODUCT_A_NEGATIVE_401_AOI_01.yaml").read_text(encoding="utf-8")
+            )
+
+            def write(name, edit=None):
+                recipe = deepcopy(source)
+                recipe["gpu"] = {"mode": "auto", "dll_path": "gpu/visionflow_cuda.dll", "fallback_to_cpu": True}
+                recipe["detectors"]["401-AS-SN-1"]["use_gpu"] = True
+                if edit is not None:
+                    edit(recipe)
+                path = root / name
+                path.write_text(yaml.safe_dump(recipe, allow_unicode=True, sort_keys=False), encoding="utf-8")
+                return path
+
+            gpu_recipe = write("gpu.yaml")
+            window = MainWindow(settings=QSettings(str(root / "auto_warmup.ini"), QSettings.Format.IniFormat))
+            panel = window.run_screen.run_control_panel
+            try:
+                starts = []
+                window._warmup_controller.start = Mock(side_effect=lambda worker, **kwargs: starts.append(worker))
+                # Recipe reloads would start a real preview thread for the fake image path.
+                window._start_preview_load = Mock()
+
+                window._load_recipe(gpu_recipe)
+                window._on_preview_thread_finished()
+                self.assertEqual(starts, [], "no warm-up without an image")
+
+                window.image_path = root / "input.bmp"
+                window._current_image = QImage(64, 48, QImage.Format.Format_RGB888)
+                window._on_preview_thread_finished()
+                self.assertEqual(len(starts), 1)
+                self.assertIs(starts[0].gpu_session_cache, window._inspection_gpu_sessions)
+                self.assertEqual((starts[0].recipe_path, starts[0].image_path), (gpu_recipe, root / "input.bmp"))
+                self.assertTrue(window.auto_warming_up)
+                self.assertFalse(window.running, "background warm-up must not lock the window")
+                self.assertTrue(panel.start_button.isEnabled())
+                self.assertFalse(panel.warmup_button.isEnabled())
+                self.assertEqual(panel.warmup_button.text(), "GPU 預熱中…")
+
+                with patch("gui.main_window.InspectionWorker") as inspection_worker:
+                    window._inspection_controller.start = Mock()
+                    window._run_inspection()
+                inspection_worker.assert_called_once()
+                window._set_inspection_running(False)
+
+                window._on_auto_gpu_warmup_finished({"status": "warmed", "pipeline_ms": 236.0})
+                self.assertIn("GPU 背景預熱完成", window.statusBar().currentMessage())
+                window._on_auto_gpu_warmup_thread_finished()
+                self.assertFalse(window.auto_warming_up)
+                self.assertTrue(panel.warmup_button.isEnabled())
+                self.assertEqual(len(starts), 1, "same identity and image size warm only once")
+
+                # A Designer save of a Detector parameter keeps the warm session: no new warm-up.
+                window._load_recipe(write("gpu.yaml", lambda r: r["detectors"]["401-AS-SN-1"]["params"].update(max_area=4321)))
+                window._on_preview_thread_finished()
+                self.assertEqual(len(starts), 1)
+
+                # A different image size or GPU setting warms again; busy windows wait for the next trigger.
+                window._current_image = QImage(128, 96, QImage.Format.Format_RGB888)
+                window.batch_running = True
+                window._on_preview_thread_finished()
+                self.assertEqual(len(starts), 1)
+                window.batch_running = False
+                window._on_preview_thread_finished()
+                self.assertEqual(len(starts), 2)
+                window._on_auto_gpu_warmup_failed("context failed")
+                self.assertIn("GPU 背景預熱失敗", window.notice_bar.label.text())
+                window._on_auto_gpu_warmup_thread_finished()
+                window._load_recipe(write("gpu.yaml", lambda r: r["gpu"].update(fallback_to_cpu=False)))
+                window._on_preview_thread_finished()
+                self.assertEqual(len(starts), 3)
+                window._on_auto_gpu_warmup_finished({"status": "unavailable", "reason": "CUDA DLL not found"})
+                self.assertIn("CUDA 不可用", window.notice_bar.label.text())
+                window._on_auto_gpu_warmup_thread_finished()
+
+                # CPU recipes never start a warm-up, so CUDA is not loaded for them.
+                window._load_recipe(Path("recipes/PRODUCT_A_AOI_01.yaml"))
+                window._current_image = QImage(32, 32, QImage.Format.Format_RGB888)
+                window._on_preview_thread_finished()
+                self.assertEqual(len(starts), 3)
+            finally:
+                window._inspection_gpu_sessions.close()
+                window.deleteLater()
+
     def test_batch_and_folder_monitor_share_the_window_gpu_session_cache(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             settings = QSettings(str(Path(temp_dir) / "shared_session.ini"), QSettings.Format.IniFormat)

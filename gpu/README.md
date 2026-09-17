@@ -751,6 +751,10 @@ RTX 3090 正式尺寸（202-CS-SN-1，4 張批量各 3 次，median）：
 
 判定與缺陷數全部相同。證據：`outputs_validation/shared_gpu_session/`。未修改 CUDA source／header／ABI。
 
+同日依使用者決定加入**載入 GPU Recipe 與影像後自動背景預熱**：以（session identity、影像寬高）去重，不鎖住
+操作（其間開始的檢測在 session 上排隊）。offscreen `MainWindow` 全新 process 各 3 次，第一次檢測使用者等待
+median 467.8 ms（無自動預熱）→ 268.9 ms（自動預熱後），與第二次 266 ms 相當，判定全部 NG／558 defects。
+
 ### v1.6.2 CUDA-enabled 發行範圍
 
 v1.6.2 收錄本頁「CCL＋ring CNR 留在 device」、「ring 統計平行化」、「BMP 平行 reader」、profiler／
