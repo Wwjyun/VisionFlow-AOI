@@ -19,7 +19,7 @@ from devices.ccd_models import (
     MultipleRate,
     TriggerSettings,
 )
-from devices.interfaces import FrameListener, LineScanCamera, MeterWheel
+from devices.interfaces import FrameListener, LineScanCamera, MeterWheel, TriggerListener
 
 
 class SimulatedLineScanCamera(LineScanCamera):
@@ -47,6 +47,7 @@ class SimulatedLineScanCamera(LineScanCamera):
         self._auto_emit = auto_emit
         self._lock = threading.RLock()
         self._listener: FrameListener | None = None
+        self._trigger_listener: TriggerListener | None = None
         self._state = CameraState.OFFLINE
         self._acquisition = AcquisitionSettings()
         self._trigger = TriggerSettings()
@@ -75,6 +76,10 @@ class SimulatedLineScanCamera(LineScanCamera):
     def set_frame_listener(self, listener: FrameListener | None) -> None:
         with self._lock:
             self._listener = listener
+
+    def set_external_trigger_listener(self, listener: TriggerListener | None) -> None:
+        with self._lock:
+            self._trigger_listener = listener
 
     def connect(
         self,
@@ -140,6 +145,13 @@ class SimulatedLineScanCamera(LineScanCamera):
         if listener is not None:
             listener(frame)
         return frame
+
+    def emit_external_trigger(self) -> None:
+        with self._lock:
+            self._require_connected()
+            listener = self._trigger_listener
+        if listener is not None:
+            listener()
 
     def complete_capture(self) -> np.ndarray | None:
         with self._lock:

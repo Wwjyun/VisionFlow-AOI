@@ -722,7 +722,7 @@ vs 原本 `[255,255,20,20]`）。因此「標籤編號順序」對 202 的最終
 - [ ] 取像狀態機：`capture_in_progress` 期間不得第二次 `Snap()` 或開始 preview；Stop 在擷取中不呼叫 `Freeze()`，停止後續觸發並讓目前 frame 收完；stop 後短暫 cooldown；連線／斷線清除上述狀態。按鈕 enable 跟隨連線、預覽與忙碌狀態。（介面契約、模擬相機與按鈕 enable 已完成並有測試；Sapera `Freeze()` 語意與 stop cooldown 待綁定。）
 - [x] 狀態呈現遵守 GUI 契約：TopBar 只放標題與全域狀態，CCD 頁「相機狀態」顯示連線／相機／解析度／觸發／訊號／累計線數／狀態／設定寫入狀態，錯誤走 inline notice、status bar 只放短事件；狀態全部有文字，CCD 按鈕有鍵盤操作測試。（2026-09-17）
 - [ ] 存圖：BMP（檢測交接）與 PNG／TIF／TIF 不壓縮（保存），先寫 `.tmp` 再 rename；有界存圖佇列，最大並行數可設定（C# 固定 5，需在實機比較 2／3／5）；進度顯示在頁內，不另開 modal 視窗。手動保留影像存到可設定資料夾。（已完成：四種格式無損、`.tmp`→rename、失敗清除暫存、`SnapshotSaveQueue` 上限 16 筆、預設 2 workers、頁內進度與失敗計數、存圖未完成阻止關窗、可設定資料夾；待完成：GUI 調整並行數與實機 2／3／5 比較。）
-- [ ] 自動存圖依模式分開：External Trigger One Frame 與 Software Trigger 各自 gating，同一張 frame 不得存兩次。
+- [x] 自動存圖依模式分開（2026-09-17）：External Trigger One Frame 在觸發事件時計數、Software Trigger 在每張 frame 到達時計數，每張 frame 只消耗一次；模式依連線時實際寫入相機的觸發設定判斷，同一張 frame 不會存兩次，佇列滿時提示未保存。
 - [ ] 滾動式拍照：張數上限 100、上到下／下到上方向；存圖前先 snapshot 目前 frames，背景存完整合成圖。
 - [ ] 灰階波形：在 viewer 上拖線，Shift 依 0–30°水平、31–59°45°、60–90°垂直吸附；相機影像取全解析度 frame 而非預覽，大圖依 tile 分組批次取樣；波形視窗 Y 固定 0–255、每 16 灰階一條輔助線、滾輪縮放、左鍵框選、右鍵重設、可調整大小。一般載入影像也可使用。
 
@@ -737,8 +737,8 @@ vs 原本 `[255,255,20,20]`）。因此「標籤編號順序」對 202 的最終
 
 ### 觸發自動化
 
-- [ ] 外部觸發事件：Trigger Mode=External Trigger、One Frame 與「Compare 跟隨」皆開啟時寫入已存 compare 值；再勾「同時套用 Encoder」時寫入已存 encoder 值。UI 規則：Continuous 取消並停用「Compare 跟隨」；「同時套用 Encoder」需先勾「Compare 跟隨」。
-- [ ] Software Trigger 監控：背景 thread 讀 encoder；啟動時 encoder < compare 就寫 compare 並觸發一張，否則等 encoder 往下穿越 compare；觸發後須等 encoder 回到 compare 以上才重新 arm；擷取中不觸發；Stop 只停後續監控。以 fake encoder 序列做狀態機測試。
+- [x] 外部觸發事件（2026-09-17，`devices/trigger_automation.py`＋`CcdController`）：`LineScanCamera` 新增外部觸發 listener；Trigger Mode=External Trigger、One Frame 與「Compare 跟隨」皆開啟時寫入已存 compare 值，再勾「同時套用 Encoder」時寫入已存 encoder 值；driver thread 只計數自動存圖並把米輪動作交給 GUI thread，米輪未連線只提示。UI 規則沿用既有互斥。與 C# 差異：依連線時實際寫入相機的觸發設定判斷，而非尚未重連的畫面設定。Sapera 端 `ExternalTrigger`／`ExternalTrigger2` 事件接線待相機綁定。
+- [x] Software Trigger 監控（2026-09-17）：「開始預覽」在軟體觸發連線時改為啟動監控（按鈕顯示「開始軟體觸發」）；背景 thread 每 50 ms 讀 encoder，低於 compare 時寫 compare 並請 GUI thread 擷取一張，須回到 compare 以上才重新 arm；等待 GUI 執行中的擷取請求會去重；相機非待機、米輪未連線或相機不是以軟體觸發連線時拒絕啟動並提示；Stop／斷線／關窗停止監控但不中止擷取中的 frame；米輪讀值失敗自動停止並提示（C# 版失敗後按鈕狀態仍停在監控中）。以逐步 encoder 序列與模擬器端到端測試。
 
 ### 與檢測流程整合
 
@@ -750,7 +750,7 @@ vs 原本 `[255,255,20,20]`）。因此「標籤編號順序」對 202 的最終
 
 ### 測試、打包與實機驗收
 
-- [ ] 自動測試（fake backend，無硬體）：設定 round trip 與預設值、載入不觸發寫入、Trigger 互斥矩陣、Software Trigger 狀態機、忙碌／Stop 語意、自動存圖不重複、滾動合成順序、`.tmp` 存檔、波形吸附與取樣、缺 Sapera／缺 DLL 時主程式可啟動且 CCD 頁顯示不可用、OP／工程／管理可見性、GUI offscreen smoke。（`tests/test_ccd_devices.py`、`tests/test_ccd_gui.py` 已涵蓋設定 round trip／損毀檔、載入不寫入、Trigger 16 種組合、忙碌／Stop、`.tmp` 與四格式無損、存圖佇列上限、米輪保存與寫入、不可用後端、權限可見性、鍵盤、監控來源與關窗；待補：Software Trigger 監控、自動存圖、滾動、波形。）
+- [ ] 自動測試（fake backend，無硬體）：設定 round trip 與預設值、載入不觸發寫入、Trigger 互斥矩陣、Software Trigger 狀態機、忙碌／Stop 語意、自動存圖不重複、滾動合成順序、`.tmp` 存檔、波形吸附與取樣、缺 Sapera／缺 DLL 時主程式可啟動且 CCD 頁顯示不可用、OP／工程／管理可見性、GUI offscreen smoke。（`tests/test_ccd_devices.py`、`tests/test_ccd_gui.py` 已涵蓋設定 round trip／損毀檔、載入不寫入、Trigger 16 種組合、忙碌／Stop、`.tmp` 與四格式無損、存圖佇列上限、米輪保存與寫入、不可用後端、權限可見性、鍵盤、監控來源與關窗；`tests/test_ccd_trigger_automation.py` 涵蓋 Software Trigger 狀態機、外部觸發規則矩陣、自動存圖不重複、監控前置條件與停止；待補：滾動、波形。）
 - [ ] 打包：Sapera runtime、`LSI8181_64.dll` 與驅動由現場安裝、不打包；若採 pythonnet 則打包其 runtime。packaged `--smoke-test` 增加「無相機環境 CPU 檢測正常、CCD 顯示不可用」；README 補 Sapera 版本對齊的部署說明。
 - [ ] 相機機台有 `LSI8181_64.dll` 時，建立預設 `MainWindow` 的 unit tests 可能在事件迴圈中觸發米輪自動連線並寫入已存設定；評估測試環境預設以 `VISIONFLOW_LSI8181_DLL` 指向不存在路徑隔離硬體。
 - [ ] 實機驗收（在相機機台執行，未實測不得勾選）：連線／斷線重複；Exposure、Gain、Length、Internal Line Rate 讀回與畫面效果；Continuous 沒有 Sapera 警告視窗；External Trigger 一個脈衝一條線、湊滿 Length 才顯示；One Frame；Software Trigger 監控與擷取中 Stop；米輪自動連線、重開後設定保留、Encoder 正反向計數與倍頻、Compare 自動遞增、錯誤卡片 ID 的狀態碼訊息、示波器確認 CMP_OUT 脈寬與 CMP0–7；16384×50000 各格式存圖時間；連續取像＋存圖＋檢測長時間穩定、記憶體平台與 GUI 回應。
@@ -900,6 +900,8 @@ vs 原本 `[255,255,20,20]`）。因此「標籤編號順序」對 202 的最終
 - [ ] 加速不得犧牲 GUI 回應、打包啟動、結果追溯、錯誤訊息或 CPU fallback。
 
 ## 完成紀錄
+
+- [x] 2026-09-17：**P11 觸發自動化。** 新增 `devices/trigger_automation.py`，移植 `xx_ccd` `MainForm` 的 `ApplyMeterWheelActionsOnExternalTrigger`、`QueueExternalTriggerAutoSave`／`QueueSoftwareTriggerAutoSave` 與 `RunSoftwareTriggerMeterWheelMonitor`：`external_trigger_actions` 決定外部觸發時要寫入的已存 Compare／Encoder 與是否自動存圖，`AutoSaveRequests` 為執行緒安全的存圖計數，`SoftwareTriggerMonitor` 以 50 ms 輪詢 encoder、低於 compare 時寫 compare 並要求擷取、回到 compare 以上才重新 arm。`LineScanCamera` 新增外部觸發 listener（模擬相機提供 `emit_external_trigger()`）。`CcdController` 以連線時實際寫入相機的觸發設定判斷所有自動化，driver／監控 thread 只以 queued signal 交給 GUI thread 執行相機與米輪命令；「開始預覽」在軟體觸發時改為啟動監控並檢查相機待機、米輪連線與觸發模式，擷取請求去重，Stop／相機斷線／米輪斷線或讀值失敗／關窗都會停止監控但不中止擷取中的 frame；frame 到達時依模式計數並只保存一次。CCD 頁新增「軟體觸發監控」狀態欄、按鈕文字與 enable 規則，狀態列顯示觸發事件訊息。新增 `tests/test_ccd_trigger_automation.py`（12 項，含逐步 encoder 序列、背景 thread、外部觸發規則矩陣與模擬器端到端）。Sapera 外部觸發事件接線與實機驗收仍待相機綁定。
 
 - [x] 2026-09-17：**P11 LSI-8181 米輪 ctypes 綁定。** 新增 `devices/lsi8181.py`：`Lsi8181Library` 為 `LSI8181_64.dll` 的 23 個使用中 export 設定 argtypes／restype（對照 `xx_ccd` `Native/Lsi8181Native.cs`），載入順序為 `VISIONFLOW_LSI8181_DLL`（指定但不存在即不可用）→ 程式所在資料夾 → 系統 DLL 搜尋，並拒絕 32 位元 Python 與缺少 export 的 DLL；`Lsi8181MeterWheel` 實作 `MeterWheel`，連線順序與 `Lsi8181MeterWheelService.Open` 相同（initial、info、quadrature＋1 µs debounce＋倍頻碼 X4=0／X2=1／X1=2、只切 A 相極性位元、Compare 自動遞增、CMP OUT 脈衝輸出＋toggle preset、CMP0–7 與 mask、Compare 模式啟動計數），但中途失敗會停止計數並關閉卡片；非 0 狀態碼與 Windows 例外轉為含繁中動作與狀態碼的 `Lsi8181Error`，呼叫前檢查數值寬度，native 呼叫以 RLock 序列化，DLL 載入失敗只快取一次。`devices/factory.py` 預設改用此綁定（相機仍為不可用），`VISIONFLOW_CCD_SIMULATOR=1` 仍使用模擬器。新增 `tests/test_lsi8181_binding.py`（16 項，以 `WINFUNCTYPE` callback 假卡經真實 ctypes 轉換驗證呼叫順序、數值、極性位元、int32 極值、CMP0–7 往返、錯誤釋放、範圍檢查、多執行緒與 CCD 畫面整合）；另於本機以 MSVC 編譯同名 stub DLL 經 `WinDLL` 實際載入驗證（stub 未提交）。未連接實際 LSI-8181 卡片。
 

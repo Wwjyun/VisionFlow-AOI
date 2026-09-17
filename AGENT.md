@@ -109,6 +109,7 @@ Put behavior in the narrowest appropriate module. Do not duplicate pipeline or f
 - Machine-level settings live in the CCD machine settings store, not in Recipes. Product-level camera parameters (exposure, gain, length, line rate, trigger options, auto-save rules) live in the optional Recipe `camera` section parsed by `devices/ccd_recipe.py` and validated strictly by `RecipeManager`.
 - A Recipe without a `camera` section must never change camera settings. The Designer is the only writer of the section: CCD-screen applies become unsaved Designer edits, Engineer-mode saves preserve the section, and unedited values must not be rounded by display widgets.
 - CCD controls are fail-closed through `AccessGate`: only controls explicitly registered for engineers are available in Engineer mode, OP cannot open the screen, and programmatic loads never write hardware or settings.
+- Trigger automation (external-trigger meter-wheel writes, the software-trigger monitor, auto-save) follows the trigger settings actually written to the camera at connect, never unapplied edits. Driver and monitor threads only hand work to the GUI thread, which owns camera and meter-wheel commands; Stop ends monitoring but never aborts a frame that is still capturing.
 - Do not mark CCD or meter wheel items hardware-validated until they run on the camera machine.
 
 ## Detector parameter access contract

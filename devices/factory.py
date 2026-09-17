@@ -17,7 +17,7 @@ from devices.ccd_models import (
     MultipleRate,
     TriggerSettings,
 )
-from devices.interfaces import FrameListener, LineScanCamera, MeterWheel
+from devices.interfaces import FrameListener, LineScanCamera, MeterWheel, TriggerListener
 from devices.lsi8181 import Lsi8181Library, Lsi8181MeterWheel
 from devices.simulated import SimulatedLineScanCamera, SimulatedMeterWheel
 
@@ -42,6 +42,9 @@ class UnavailableLineScanCamera(LineScanCamera):
         return CameraStatus(message=self._reason)
 
     def set_frame_listener(self, listener: FrameListener | None) -> None:
+        return None
+
+    def set_external_trigger_listener(self, listener: TriggerListener | None) -> None:
         return None
 
     def connect(

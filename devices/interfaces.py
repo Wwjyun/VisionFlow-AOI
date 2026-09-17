@@ -17,6 +17,7 @@ from devices.ccd_models import (
 )
 
 FrameListener = Callable[[np.ndarray], None]
+TriggerListener = Callable[[], None]
 
 
 class LineScanCamera(ABC):
@@ -35,6 +36,10 @@ class LineScanCamera(ABC):
 
     @abstractmethod
     def set_frame_listener(self, listener: FrameListener | None) -> None: ...
+
+    @abstractmethod
+    def set_external_trigger_listener(self, listener: TriggerListener | None) -> None:
+        """Called from a driver thread for each external frame-trigger event (Sapera ExternalTrigger/2)."""
 
     @abstractmethod
     def connect(

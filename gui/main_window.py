@@ -491,6 +491,7 @@ class MainWindow(QMainWindow, LogMixin):
         self.batch_dashboard_screen.go_to_run_requested.connect(lambda: self._set_screen("run"))
 
         self.ccd_controller.notice.connect(self._notice)
+        self.ccd_controller.status_message.connect(lambda message: self.statusBar().showMessage(message, 8000))
         self.ccd_controller.product_settings_applied.connect(self._on_ccd_product_settings_applied)
         self.ccd_controller.camera_status_changed.connect(self._on_ccd_camera_status_changed)
         self.ccd_controller.camera_settings_changed.connect(

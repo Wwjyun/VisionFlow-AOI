@@ -12,9 +12,11 @@ from PySide6.QtGui import QImage
 
 from core.logging_system import LogMixin
 from devices.ccd_models import (
+    CAMERA_STATE_LABELS,
     AcquisitionSettings,
     CameraConnectionSettings,
     CameraRecipeSettings,
+    CameraState,
     CameraStatus,
     CcdMachineSettings,
     DeviceAvailability,
@@ -24,11 +26,20 @@ from devices.ccd_models import (
     MeterWheelSnapshot,
     MultipleRate,
     SaveSettings,
+    TriggerMode,
     TriggerSettings,
 )
 from devices.ccd_settings_store import CcdMachineSettingsStore
 from devices.factory import CcdDevices
 from devices.frame_writer import SaveQueueStats, SnapshotSaveQueue
+from devices.trigger_automation import (
+    SOFTWARE_TRIGGER_POLL_SEC,
+    AutoSaveRequests,
+    ExternalTriggerActions,
+    SoftwareTriggerMonitor,
+    external_trigger_actions,
+    software_frame_requests_auto_save,
+)
 
 PREVIEW_MAX_DIMENSION = 2048
 METER_WHEEL_POLL_MS = 200
@@ -121,8 +132,16 @@ class CcdController(QObject, LogMixin):
     meter_wheel_settings_changed = Signal(object)
     preview_image_ready = Signal(QImage, int, int)
     save_stats_changed = Signal(object)
+    software_trigger_monitor_changed = Signal(bool)
+    status_message = Signal(str)
     notice = Signal(str, str)
     _frame_arrived = Signal()
+    _external_trigger_arrived = Signal(object)
+    _software_capture_requested = Signal(int, int)
+    _software_monitor_failed = Signal(str)
+    _auto_save_rejected = Signal()
+
+    software_trigger_poll_sec = SOFTWARE_TRIGGER_POLL_SEC
 
     def __init__(self, devices: CcdDevices, store: CcdMachineSettingsStore, parent=None):
         super().__init__(parent)
@@ -136,12 +155,23 @@ class CcdController(QObject, LogMixin):
         self._applied: tuple[CameraConnectionSettings, AcquisitionSettings, TriggerSettings] | None = None
         self._last_meter_snapshot = MeterWheelSnapshot()
         self._closed = False
+        self._auto_save_requests = AutoSaveRequests()
+        self._software_monitor: SoftwareTriggerMonitor | None = None
+        self._software_capture_lock = threading.Lock()
+        self._software_capture_queued = False
 
         self._converter = PreviewFrameConverter(self.preview_image_ready.emit)
         self._save_queue = self._create_save_queue()
         # Queued even when a driver emits on the GUI thread, so status is read after the device updates it.
         self._frame_arrived.connect(self.refresh_camera_status, Qt.ConnectionType.QueuedConnection)
+        # Driver and monitor threads only hand work to the GUI thread, which owns camera and meter-wheel commands.
+        queued = Qt.ConnectionType.QueuedConnection
+        self._external_trigger_arrived.connect(self._apply_external_trigger_meter_wheel_actions, queued)
+        self._software_capture_requested.connect(self._execute_software_trigger_capture, queued)
+        self._software_monitor_failed.connect(self._on_software_monitor_failed, queued)
+        self._auto_save_rejected.connect(self._on_auto_save_rejected, queued)
         self.devices.camera.set_frame_listener(self._on_device_frame)
+        self.devices.camera.set_external_trigger_listener(self._on_external_trigger)
 
         self._meter_wheel_timer = QTimer(self)
         self._meter_wheel_timer.setInterval(METER_WHEEL_POLL_MS)
@@ -185,6 +215,7 @@ class CcdController(QObject, LogMixin):
         self.save_stats_changed.connect(screen.set_save_stats)
         self.meter_wheel_changed.connect(screen.set_meter_wheel_snapshot)
         self.meter_wheel_settings_changed.connect(screen.set_meter_wheel_settings)
+        self.software_trigger_monitor_changed.connect(screen.set_software_trigger_monitor_running)
 
         screen.set_availability(self.devices.camera.availability(), self.devices.meter_wheel.availability())
         screen.set_camera_settings(self.camera_settings_view())
@@ -230,6 +261,20 @@ class CcdController(QObject, LogMixin):
 
     def _hardware_settings(self) -> tuple[CameraConnectionSettings, AcquisitionSettings, TriggerSettings]:
         return self._machine.connection, self._product.acquisition, self._product.trigger
+
+    def hardware_trigger(self) -> TriggerSettings | None:
+        """Trigger settings written to the connected camera; automation never follows unapplied edits."""
+        applied = self._applied
+        return None if applied is None else applied[2]
+
+    @property
+    def software_trigger_monitor_running(self) -> bool:
+        monitor = self._software_monitor
+        return monitor is not None and monitor.is_running
+
+    @property
+    def pending_auto_saves(self) -> int:
+        return self._auto_save_requests.pending
 
     def has_pending_saves(self) -> bool:
         return self._save_queue.stats().pending > 0
@@ -278,14 +323,22 @@ class CcdController(QObject, LogMixin):
         self.refresh_camera_status()
 
     def disconnect_camera(self) -> None:
+        self.stop_software_trigger_monitor()
         self._run_camera_command(self.devices.camera.disconnect, "相機中斷連線失敗")
         self._applied = None
+        self._auto_save_requests.clear()
         self.camera_settings_changed.emit(self.camera_settings_view())
 
     def start_preview(self) -> None:
+        trigger = self.hardware_trigger() or self._product.trigger
+        if trigger.mode == TriggerMode.SOFTWARE:
+            # Software Trigger does not grab continuously: it monitors the meter wheel and snaps one frame per crossing.
+            self.start_software_trigger_monitor()
+            return
         self._run_camera_command(self.devices.camera.start_preview, "無法開始預覽")
 
     def stop_preview(self) -> None:
+        self.stop_software_trigger_monitor()
         self._run_camera_command(self.devices.camera.stop_preview, "無法停止取像")
 
     def capture_frame(self) -> None:
@@ -324,9 +377,123 @@ class CcdController(QObject, LogMixin):
         self.refresh_camera_status()
 
     def _on_device_frame(self, frame: np.ndarray) -> None:
-        # Driver thread: hand off only; display conversion and status refresh happen elsewhere.
+        # Driver thread: hand off only; display conversion, saving and status refresh happen elsewhere.
         self._converter.submit(frame)
+        if software_frame_requests_auto_save(self.hardware_trigger(), self._product):
+            self._auto_save_requests.request()
+        if self._auto_save_requests.consume():
+            saved = self._save_queue.submit(frame, self.snapshot_directory(), self._machine.save.image_format)
+            if saved is None:
+                self._auto_save_rejected.emit()
         self._frame_arrived.emit()
+
+    def _on_auto_save_rejected(self) -> None:
+        self.notice.emit("自動存圖佇列已滿，這張影像未保存。", "warning")
+
+    # ------------------------------------------------------------------
+    # trigger automation
+    # ------------------------------------------------------------------
+    def _on_external_trigger(self) -> None:
+        # Driver thread: the auto-save request must be counted before the frame arrives.
+        actions = external_trigger_actions(self.hardware_trigger(), self._product, self._machine.meter_wheel)
+        if actions.request_auto_save:
+            self._auto_save_requests.request()
+        if actions.compare_value is not None:
+            self._external_trigger_arrived.emit(actions)
+
+    def _apply_external_trigger_meter_wheel_actions(self, actions: ExternalTriggerActions) -> None:
+        if self._closed:
+            return
+        meter_wheel = self.devices.meter_wheel
+        if not meter_wheel.is_connected:
+            self.status_message.emit("收到外部觸發，但米輪未連線，未寫入 Compare。")
+            return
+        try:
+            meter_wheel.set_compare(actions.compare_value)
+            if actions.encoder_value is not None:
+                meter_wheel.set_encoder(actions.encoder_value)
+        except DeviceError as exc:
+            self.notice.emit(f"外部觸發的米輪動作失敗：{exc}", "error")
+            return
+        message = f"外部觸發：已寫入 Compare {actions.compare_value}"
+        if actions.encoder_value is not None:
+            message += f"、Encoder {actions.encoder_value}"
+        self.status_message.emit(message + "。")
+        self.poll_meter_wheel()
+
+    def start_software_trigger_monitor(self) -> bool:
+        if self.software_trigger_monitor_running:
+            return True
+        hardware = self.hardware_trigger()
+        status = self.camera_status()
+        reason = ""
+        if hardware is None or not status.connected:
+            reason = "相機未連線。"
+        elif hardware.mode != TriggerMode.SOFTWARE:
+            reason = "相機目前不是以軟體觸發連線，請斷線重連以寫入觸發設定。"
+        elif status.state != CameraState.IDLE:
+            reason = f"相機{CAMERA_STATE_LABELS[status.state]}，請等待完成。"
+        elif not self.devices.meter_wheel.is_connected:
+            reason = "米輪未連線。"
+        if reason:
+            self.notice.emit(f"軟體觸發監控未啟動：{reason}", "warning")
+            self.refresh_camera_status()
+            return False
+        monitor = SoftwareTriggerMonitor(
+            self.devices.meter_wheel,
+            self._machine.meter_wheel.compare_value,
+            self._request_software_capture,
+            on_message=self.status_message.emit,
+            on_error=lambda error: self._software_monitor_failed.emit(str(error)),
+            poll_interval_sec=self.software_trigger_poll_sec,
+        )
+        with self._software_capture_lock:
+            self._software_capture_queued = False
+        self._software_monitor = monitor
+        monitor.start()
+        self.software_trigger_monitor_changed.emit(True)
+        self.refresh_camera_status()
+        return True
+
+    def stop_software_trigger_monitor(self) -> None:
+        monitor, self._software_monitor = self._software_monitor, None
+        if monitor is None:
+            return
+        monitor.stop()
+        with self._software_capture_lock:
+            self._software_capture_queued = False
+        self.software_trigger_monitor_changed.emit(False)
+        self.status_message.emit("軟體觸發監控已停止；擷取中的影像會繼續收完。")
+
+    def _request_software_capture(self, compare_value: int, encoder_value: int) -> None:
+        # Monitor thread: drop requests while one is still waiting for the GUI thread.
+        with self._software_capture_lock:
+            if self._software_capture_queued:
+                return
+            self._software_capture_queued = True
+        self._software_capture_requested.emit(compare_value, encoder_value)
+
+    def _execute_software_trigger_capture(self, compare_value: int, encoder_value: int) -> None:
+        try:
+            hardware = self.hardware_trigger()
+            if self._closed or self._software_monitor is None or hardware is None or hardware.mode != TriggerMode.SOFTWARE:
+                return
+            try:
+                self.devices.camera.capture_frame()
+            except DeviceError as exc:
+                self.status_message.emit(
+                    f"軟體觸發無法開始擷取（Compare {compare_value}、Encoder {encoder_value}）：{exc}"
+                )
+            else:
+                self.status_message.emit(f"軟體觸發已開始擷取（Compare {compare_value}、Encoder {encoder_value}）。")
+        finally:
+            with self._software_capture_lock:
+                self._software_capture_queued = False
+            self.refresh_camera_status()
+
+    def _on_software_monitor_failed(self, message: str) -> None:
+        self.stop_software_trigger_monitor()
+        self.notice.emit(f"軟體觸發監控失敗，已停止：{message}", "error")
 
     # ------------------------------------------------------------------
     # meter wheel
@@ -359,6 +526,7 @@ class CcdController(QObject, LogMixin):
         self.connect_meter_wheel(quiet=True)
 
     def disconnect_meter_wheel(self) -> None:
+        self.stop_software_trigger_monitor()
         self._meter_wheel_timer.stop()
         self.devices.meter_wheel.disconnect()
         self._publish_meter_snapshot(MeterWheelSnapshot())
@@ -377,6 +545,7 @@ class CcdController(QObject, LogMixin):
                 extension_status=tuple(meter_wheel.read_extension_status()),
             )
         except DeviceError as exc:
+            self.stop_software_trigger_monitor()
             self._meter_wheel_timer.stop()
             meter_wheel.disconnect()
             self.notice.emit(f"米輪讀值失敗，已中斷連線：{exc}", "error")
@@ -478,8 +647,10 @@ class CcdController(QObject, LogMixin):
         if self._closed:
             return
         self._closed = True
+        self.stop_software_trigger_monitor()
         self._meter_wheel_timer.stop()
         self.devices.camera.set_frame_listener(None)
+        self.devices.camera.set_external_trigger_listener(None)
         self._converter.close()
         self._save_queue.close(wait=True)
         try:

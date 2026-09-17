@@ -228,6 +228,7 @@ class CcdScreen(QWidget):
         self._meter_snapshot = MeterWheelSnapshot()
         self._trigger_mode = TriggerMode.CONTINUOUS
         self._pending_hardware_write = False
+        self._software_trigger_monitor_running = False
         self._save_settings = SaveSettings()
         # Steppers display rounded values; unedited fields keep the loaded values exactly.
         self._loaded_acquisition = AcquisitionSettings()
@@ -378,7 +379,9 @@ class CcdScreen(QWidget):
         self.auto_save_software_check = self.gate.register(QCheckBox("軟體觸發完成後自動存圖"))
         panel.add_widget(self.auto_save_external_check)
         panel.add_widget(self.auto_save_software_check)
-        panel.add_widget(_hint("自動存圖於觸發流程移植後生效。"))
+        panel.add_widget(
+            _hint("外部觸發單張：收到觸發後完成的那一張會保存；軟體觸發：每張完成的影像都會保存。格式與資料夾依「存圖」設定。")
+        )
 
         self.pending_label = _hint("已連線的相機仍使用先前設定，需斷線重連才會寫入。", COLORS["warn"])
         self.pending_label.setVisible(False)
@@ -542,6 +545,7 @@ class CcdScreen(QWidget):
             ("lines", "累計線數"),
             ("state", "狀態"),
             ("settings", "設定"),
+            ("trigger_monitor", "軟體觸發監控"),
         )
         for index, (key, title) in enumerate(fields):
             row, column = divmod(index, 4)
@@ -621,6 +625,12 @@ class CcdScreen(QWidget):
         self._refresh_trigger_options()
         self.pending_label.setVisible(self._pending_hardware_write)
         self._refresh_status_values()
+        self._refresh_camera_controls()
+
+    def set_software_trigger_monitor_running(self, running: bool) -> None:
+        self._software_trigger_monitor_running = bool(running)
+        self._refresh_status_values()
+        self._refresh_camera_controls()
 
     def set_camera_status(self, status: CameraStatus) -> None:
         self._status = status
@@ -787,6 +797,7 @@ class CcdScreen(QWidget):
         else:
             settings_text = "已寫入相機"
         values["settings"].setText(settings_text)
+        values["trigger_monitor"].setText("監控中" if self._software_trigger_monitor_running else "未啟動")
         values["state"].setToolTip(status.message)
 
     def _refresh_camera_controls(self) -> None:
@@ -794,9 +805,14 @@ class CcdScreen(QWidget):
         state = status.state
         self.gate.set_enabled(self.connect_button, self._camera_available.available and not status.connected)
         self.gate.set_enabled(self.disconnect_button, status.connected)
-        self.gate.set_enabled(self.preview_button, state == CameraState.IDLE)
-        self.gate.set_enabled(self.stop_button, state in (CameraState.PREVIEWING, CameraState.CAPTURING))
-        self.gate.set_enabled(self.capture_button, state == CameraState.IDLE)
+        monitoring = self._software_trigger_monitor_running
+        # Software Trigger replaces continuous preview with meter-wheel monitoring (same button, as in the reference).
+        self.preview_button.setText("開始軟體觸發" if self._trigger_mode == TriggerMode.SOFTWARE else "開始預覽")
+        self.gate.set_enabled(self.preview_button, state == CameraState.IDLE and not monitoring)
+        self.gate.set_enabled(
+            self.stop_button, monitoring or state in (CameraState.PREVIEWING, CameraState.CAPTURING)
+        )
+        self.gate.set_enabled(self.capture_button, state == CameraState.IDLE and not monitoring)
         self.gate.set_enabled(self.snapshot_button, self.preview_view.has_image())
 
     def _refresh_meter_wheel_controls(self) -> None:
