@@ -4,6 +4,7 @@ from PySide6.QtCore import Qt, Signal
 from PySide6.QtGui import QDoubleValidator
 from PySide6.QtWidgets import (
     QButtonGroup,
+    QComboBox,
     QFormLayout,
     QFrame,
     QLabel,
@@ -13,8 +14,19 @@ from PySide6.QtWidgets import (
 )
 
 from core.gpu_runtime import GpuRuntime
+from devices.ccd_models import (
+    EXPOSURE_RANGE,
+    GAIN_RANGE,
+    LENGTH_LINES_RANGE,
+    LINE_RATE_HZ_RANGE,
+    TRIGGER_MODE_LABELS,
+    AcquisitionSettings,
+    CameraRecipeSettings,
+    TriggerMode,
+    TriggerSettings,
+)
 from gui.theme import COLORS
-from gui.widgets.common import Toggle
+from gui.widgets.common import NumStepper, Toggle
 from gui.widgets.panel import Panel
 
 
@@ -243,6 +255,150 @@ class GpuSettingsPanel(Panel):
         for widget in (self.tiling_toggle, self.display_toggle, self.dll_path_edit, *self._advanced_labels):
             widget.setEnabled(gpu_allowed)
         self.detector_hint_label.setVisible(gpu_allowed)
+
+
+class CameraRecipePanel(Panel):
+    """Optional Recipe `camera` section with product-level CCD parameters (Admin edits only).
+
+    A loaded section is returned unchanged until the operator edits it, so Engineer-mode saves
+    and stepper display precision never rewrite the stored values.
+    """
+
+    def __init__(self, parent=None):
+        super().__init__(title="相機 CCD", parent=parent)
+        hint = QLabel("產品層相機參數。載入 Recipe 時套用到 CCD 控制，於下次相機連線寫入；僅管理模式可編輯。")
+        hint.setWordWrap(True)
+        hint.setStyleSheet(f"color: {COLORS['text_3']}; font-size: 11px;")
+        self.add_widget(hint)
+
+        form = _form_grid()
+        self.include_toggle = Toggle(checked=False)
+        self.include_toggle.setAccessibleName("包含相機設定")
+        form.addRow(_label("包含相機設定"), self.include_toggle)
+        self.exposure_input = NumStepper(1200, *EXPOSURE_RANGE, step=10, decimals=1)
+        self.exposure_input.setToolTip("寫入相機 ExposureTime；單位依相機定義。")
+        self.gain_input = NumStepper(1, *GAIN_RANGE, step=0.1, decimals=2)
+        self.length_input = NumStepper(720, *LENGTH_LINES_RANGE, step=100)
+        self.line_rate_input = NumStepper(30, *LINE_RATE_HZ_RANGE, step=10)
+        form.addRow(_label("曝光時間"), self.exposure_input)
+        form.addRow(_label("增益"), self.gain_input)
+        form.addRow(_label("影像長度（線）"), self.length_input)
+        form.addRow(_label("線速率（Hz）"), self.line_rate_input)
+        self.trigger_mode_combo = QComboBox()
+        for mode, label in TRIGGER_MODE_LABELS.items():
+            self.trigger_mode_combo.addItem(label, mode.value)
+        form.addRow(_label("觸發模式"), self.trigger_mode_combo)
+        self.one_frame_toggle = Toggle(checked=False)
+        self.compare_follow_toggle = Toggle(checked=False)
+        self.set_encoder_toggle = Toggle(checked=False)
+        self.auto_save_external_toggle = Toggle(checked=False)
+        self.auto_save_software_toggle = Toggle(checked=False)
+        for label, toggle in (
+            ("外部觸發單張", self.one_frame_toggle),
+            ("觸發時寫入 Compare", self.compare_follow_toggle),
+            ("同時寫入 Encoder", self.set_encoder_toggle),
+            ("外部單張自動存圖", self.auto_save_external_toggle),
+            ("軟體觸發自動存圖", self.auto_save_software_toggle),
+        ):
+            toggle.setAccessibleName(label)
+            form.addRow(_label(label), toggle)
+        self.add_layout(form)
+
+        self._editable = False
+        self._programmatic = False
+        self._loaded: CameraRecipeSettings | None = None
+        self._edited = False
+        for toggle in (
+            self.include_toggle,
+            self.one_frame_toggle,
+            self.compare_follow_toggle,
+            self.set_encoder_toggle,
+            self.auto_save_external_toggle,
+            self.auto_save_software_toggle,
+        ):
+            toggle.toggled.connect(self._on_user_change)
+        self.trigger_mode_combo.currentIndexChanged.connect(self._on_user_change)
+        for stepper in (self.exposure_input, self.gain_input, self.length_input, self.line_rate_input):
+            stepper.valueChanged.connect(self._on_user_change)
+        self._apply_enablement()
+
+    def set_camera_settings(self, settings: CameraRecipeSettings | None) -> None:
+        """Show a Recipe's section (or its absence) without counting it as an edit."""
+        self._loaded = settings
+        values = settings or CameraRecipeSettings()
+        self._programmatic = True
+        try:
+            self.include_toggle.setChecked(settings is not None)
+            self.exposure_input.setValue(values.acquisition.exposure_time)
+            self.gain_input.setValue(values.acquisition.gain)
+            self.length_input.setValue(values.acquisition.length_lines)
+            self.line_rate_input.setValue(values.acquisition.internal_line_rate_hz)
+            index = self.trigger_mode_combo.findData(values.trigger.mode.value)
+            self.trigger_mode_combo.setCurrentIndex(max(0, index))
+            self.one_frame_toggle.setChecked(values.trigger.external_frame_one_frame)
+            self.compare_follow_toggle.setChecked(values.trigger.compare_follows_encoder)
+            self.set_encoder_toggle.setChecked(values.trigger.set_encoder_on_trigger)
+            self.auto_save_external_toggle.setChecked(values.auto_save_external_one_frame)
+            self.auto_save_software_toggle.setChecked(values.auto_save_software_trigger)
+        finally:
+            self._programmatic = False
+        self._edited = False
+        self._apply_enablement()
+
+    def camera_settings(self) -> CameraRecipeSettings | None:
+        if not self._edited:
+            return self._loaded
+        if not self.include_toggle.isChecked():
+            return None
+        return CameraRecipeSettings(
+            acquisition=AcquisitionSettings(
+                exposure_time=float(self.exposure_input.value()),
+                gain=float(self.gain_input.value()),
+                length_lines=int(self.length_input.value()),
+                internal_line_rate_hz=int(self.line_rate_input.value()),
+            ),
+            trigger=self._trigger_from_widgets(),
+            auto_save_external_one_frame=self.auto_save_external_toggle.isChecked(),
+            auto_save_software_trigger=self.auto_save_software_toggle.isChecked(),
+        ).normalized()
+
+    def set_editable(self, editable: bool) -> None:
+        self._editable = bool(editable)
+        self._apply_enablement()
+
+    def _trigger_from_widgets(self) -> TriggerSettings:
+        return TriggerSettings(
+            mode=TriggerMode(self.trigger_mode_combo.currentData()),
+            external_frame_one_frame=self.one_frame_toggle.isChecked(),
+            compare_follows_encoder=self.compare_follow_toggle.isChecked(),
+            set_encoder_on_trigger=self.set_encoder_toggle.isChecked(),
+        )
+
+    def _on_user_change(self, *_args) -> None:
+        if self._programmatic:
+            return
+        self._edited = True
+        normalized = self._trigger_from_widgets().normalized()
+        self._programmatic = True
+        try:
+            self.one_frame_toggle.setChecked(normalized.external_frame_one_frame)
+            self.compare_follow_toggle.setChecked(normalized.compare_follows_encoder)
+            self.set_encoder_toggle.setChecked(normalized.set_encoder_on_trigger)
+        finally:
+            self._programmatic = False
+        self._apply_enablement()
+
+    def _apply_enablement(self) -> None:
+        self.include_toggle.setEnabled(self._editable)
+        fields_enabled = self._editable and self.include_toggle.isChecked()
+        for widget in (self.exposure_input, self.gain_input, self.length_input, self.line_rate_input, self.trigger_mode_combo):
+            widget.setEnabled(fields_enabled)
+        availability = self._trigger_from_widgets().availability()
+        self.one_frame_toggle.setEnabled(fields_enabled and availability.external_frame_one_frame)
+        self.compare_follow_toggle.setEnabled(fields_enabled and availability.compare_follows_encoder)
+        self.set_encoder_toggle.setEnabled(fields_enabled and availability.set_encoder_on_trigger)
+        self.auto_save_external_toggle.setEnabled(fields_enabled and availability.auto_save_external_one_frame)
+        self.auto_save_software_toggle.setEnabled(fields_enabled and availability.auto_save_software_trigger)
 
 
 class PreviewPanel(Panel):

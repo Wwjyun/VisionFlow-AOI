@@ -700,7 +700,8 @@ vs 原本 `[255,255,20,20]`）。因此「標籤編號順序」對 202 的最終
 
 - [ ] 以 Qt 對話框取代 `AcqConfigDlg`：列舉 server／resource、選 CCF；只找到一個 AcqDevice 時自動選取並提示。
 - [x] 保留「離線修改 → 套用 → 重新連線才寫入硬體」流程（Sapera 建立 acquisition／buffer／transfer 後部分參數會鎖定）：設定只在 `connect()` 寫入；已連線時套用會顯示「待重新連線寫入」與提示文字。（2026-09-17）
-- [ ] **產品層相機參數接 Recipe `camera` 區段**：目前 Exposure／Gain／Length／Line Rate／Trigger 只保存在本次執行的 `CcdController`，重開程式回到預設；需加入 Recipe 選用 `camera` 區段、Designer dirty tracking、`RecipeManager` 驗證，舊 Recipe 無此區段時不得改動相機設定。自動存圖旗標目前存在機台設定檔，接 Recipe 時一併搬移。
+- [x] **產品層相機參數接 Recipe `camera` 區段**（2026-09-17）：Exposure／Gain／Length／Line Rate／觸發模式與選項／自動存圖保存在 Recipe 選用 `camera` 區段（`devices/ccd_recipe.py`），`RecipeManager` 嚴格驗證（必填、型別、範圍、未知欄位、觸發選項與模式衝突）；自動存圖旗標已從機台設定檔移出。Recipe 設計新增「相機 CCD」區塊參與 dirty tracking，僅管理模式可編輯，工程模式儲存原值保留，未修改的數值不因顯示精度被改寫；舊 Recipe 無此區段時不改動相機設定。CCD 控制按「套用相機設定」後同步為 Recipe 設計的未儲存變更，Recipe 設計仍是唯一寫入者；載入含此區段的 Recipe 會套用到相機 session，已連線時提示需重連。
+- [ ] 一次性從 `xx_ccd` `settings.ini` 匯入機台層與產品層設定（產品層匯入到 Recipe 設計成為未儲存變更）。
 - [ ] 只移植已實機確認的寫入路徑，禁止重新加入探測式寫法：
   - Internal Line Rate：在 `SapAcquisition.Create()` 前建立 `SapAcqDevice`，將 `AcquisitionLineRate` 以 Int64 寫入並 `UpdateFeaturesToDevice()`；`INT_LINE_TRIGGER_ENABLE／FREQ`、`EXT_LINE_TRIGGER_ENABLE=0`、`SHAFT_ENCODER_ENABLE=0` 僅作輔助。不改寫 CCF，不探測 `LineRateAbs` 等候選。
   - Exposure：在 line rate 之後經 `SapAcqDevice` 寫入；不得設定 `ExposureStart` trigger source。
@@ -898,6 +899,8 @@ vs 原本 `[255,255,20,20]`）。因此「標籤編號順序」對 202 的最終
 - [ ] 加速不得犧牲 GUI 回應、打包啟動、結果追溯、錯誤訊息或 CPU fallback。
 
 ## 完成紀錄
+
+- [x] 2026-09-17：**P11 產品層相機參數存入 Recipe `camera` 區段。** 新增 `devices/ccd_recipe.py`（`camera` 區段 codec：曝光、增益、影像長度、內部線速率、`trigger` 模式與三個選項、選用 `auto_save`），`RecipeManager.validate` 對此區段嚴格驗證並回報具體欄位；`CameraRecipeSettings` 成為產品層值物件，`SaveSettings` 移除自動存圖旗標（舊機台設定檔多出的欄位會被忽略）。`DesignerRecipeMapper` 只在有相機設定時寫出 `camera`；Recipe 設計新增「相機 CCD」區塊（包含開關、數值、觸發規則與自動存圖），參與 dirty tracking，僅管理模式可編輯，未修改時原樣回傳以免 NumStepper 顯示精度改寫數值（例如 1234.56）。`MainWindow` 載入 Recipe 時把 `camera` 套用到 `CcdController`，沒有此區段的舊 Recipe 保留目前參數，已連線且不同時提示需重連；CCD 控制「套用相機設定」只保存 Sapera 位置到機台設定檔，產品層參數同步為 Recipe 設計未儲存變更（未載入 Recipe 時提示只用於本次執行），CCD 頁顯示參數來源與是否已儲存，也不會把未編輯的數值四捨五入。五份追蹤中的 Recipe 均無 `camera` 區段且載入不變。新增 `tests/test_ccd_recipe.py`（11）並更新既有 CCD 測試；本機無相機，未做硬體驗證。
 
 - [x] 2026-09-17：**P11 CCD 控制 GUI 第一階段與監控來源選擇。** 新增頂層 `devices/`：`ccd_models.py`（Trigger／存圖／米輪／CMP0–7 typed value objects，Trigger 規則對照 `xx_ccd`：Software Trigger 強制關閉 One Frame、Compare 跟隨只在 External＋One Frame、Encoder 跟隨需先勾 Compare）、`interfaces.py`（`LineScanCamera`／`MeterWheel`）、`simulated.py`、`factory.py`（預設「不可用」並說明原因，`VISIONFLOW_CCD_SIMULATOR=1` 改用模擬器）、`ccd_settings_store.py`（機台層 JSON `config/ccd_machine.json`，schema `visionflow-ccd-machine/v1`，`.tmp` 原子寫入，損毀或型別錯誤回預設、保留原檔並提示）、`frame_writer.py`（BMP／PNG／TIF／TIF 不壓縮、`.tmp`→rename、有界背景佇列）。GUI：NavRail 新增「CCD 控制」（OP 不可見），`CcdScreen` 含相機連線／預覽／擷取／保留影像、Sapera 位置與取像參數、觸發、存圖、米輪、CMP0–7；以 fail-closed `AccessGate` 讓工程模式只能操作、管理模式才能改參數；`CcdController` 由 `MainWindow` 擁有，設定只在連線時寫入並標示待重連、預覽只轉最新一張並降到 2048 px 內、米輪 200 ms 輪詢與啟動 1 秒自動連線、存圖未完成阻止關窗。依使用者需求，Monitor「監控來源」可選監控資料夾或相機直連，選擇保存於 QSettings，相機直連顯示唯讀相機狀態，檢測後端未完成前停用「啟動」並說明。產品層相機參數尚未接 Recipe，Sapera／LSI-8181 實際綁定與觸發自動化未開始；本機無相機，未做任何硬體驗證。新增 `tests/test_ccd_devices.py`（15）與 `tests/test_ccd_gui.py`（15）。
 

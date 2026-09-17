@@ -36,6 +36,7 @@ from devices.ccd_models import (
     UINT16_RANGE,
     AcquisitionSettings,
     CameraConnectionSettings,
+    CameraRecipeSettings,
     CameraState,
     CameraStatus,
     DeviceAvailability,
@@ -203,7 +204,7 @@ class CcdScreen(QWidget):
     preview_stop_requested = Signal()
     capture_requested = Signal()
     snapshot_requested = Signal()
-    camera_settings_applied = Signal(object, object, object)
+    camera_settings_applied = Signal(object, object)
     save_settings_applied = Signal(object)
     meter_wheel_connect_requested = Signal(int)
     meter_wheel_disconnect_requested = Signal()
@@ -228,6 +229,9 @@ class CcdScreen(QWidget):
         self._trigger_mode = TriggerMode.CONTINUOUS
         self._pending_hardware_write = False
         self._save_settings = SaveSettings()
+        # Steppers display rounded values; unedited fields keep the loaded values exactly.
+        self._loaded_acquisition = AcquisitionSettings()
+        self._edited_acquisition_fields: set[str] = set()
         # Checked boxes are filled and unchecked boxes are hollow, so state does not rely on hue alone.
         self.setStyleSheet(
             f"QCheckBox {{ spacing: 8px; }}"
@@ -304,7 +308,14 @@ class CcdScreen(QWidget):
 
     def _build_settings_panel(self) -> Panel:
         panel = Panel(title="相機設定")
-        panel.add_widget(_hint("按下「套用相機設定」後保存；設定於下次連線時寫入相機，已連線時需斷線重連。"))
+        panel.add_widget(
+            _hint(
+                "Sapera 位置保存於本機；取像參數、觸發與自動存圖屬於產品設定，套用後會同步到 Recipe 設計等待儲存。"
+                "設定於下次連線時寫入相機，已連線時需斷線重連。"
+            )
+        )
+        self.product_source_label = _hint(color=COLORS["text_2"])
+        panel.add_widget(self.product_source_label)
 
         panel.add_widget(_section("Sapera 位置"))
         form = _form()
@@ -343,6 +354,8 @@ class CcdScreen(QWidget):
         self.line_rate_input = self.gate.register(NumStepper(30, *LINE_RATE_HZ_RANGE, step=10))
         form.addRow("內部線速率（Hz）", self.line_rate_input)
         panel.add_layout(form)
+        for field_name, stepper in self._acquisition_inputs().items():
+            stepper.valueChanged.connect(lambda _value, name=field_name: self._edited_acquisition_fields.add(name))
 
         panel.add_widget(_section("觸發"))
         form = _form()
@@ -359,6 +372,13 @@ class CcdScreen(QWidget):
         self.trigger_mode_combo.currentIndexChanged.connect(self._refresh_trigger_options)
         self.one_frame_check.toggled.connect(self._refresh_trigger_options)
         self.compare_follow_check.toggled.connect(self._refresh_trigger_options)
+
+        panel.add_widget(_section("自動存圖"))
+        self.auto_save_external_check = self.gate.register(QCheckBox("外部觸發單張完成後自動存圖"))
+        self.auto_save_software_check = self.gate.register(QCheckBox("軟體觸發完成後自動存圖"))
+        panel.add_widget(self.auto_save_external_check)
+        panel.add_widget(self.auto_save_software_check)
+        panel.add_widget(_hint("自動存圖於觸發流程移植後生效。"))
 
         self.pending_label = _hint("已連線的相機仍使用先前設定，需斷線重連才會寫入。", COLORS["warn"])
         self.pending_label.setVisible(False)
@@ -388,12 +408,7 @@ class CcdScreen(QWidget):
         folder_layout.addWidget(self.save_folder_button)
         form.addRow("存圖資料夾", folder_row)
         panel.add_layout(form)
-
-        self.auto_save_external_check = self.gate.register(QCheckBox("外部觸發單張完成後自動存圖"))
-        self.auto_save_software_check = self.gate.register(QCheckBox("軟體觸發完成後自動存圖"))
-        panel.add_widget(self.auto_save_external_check)
-        panel.add_widget(self.auto_save_software_check)
-        panel.add_widget(_hint("自動存圖於觸發流程移植後生效；目前「保留影像」會以背景佇列寫入完整解析度影像。"))
+        panel.add_widget(_hint("「保留影像」會以背景佇列寫入完整解析度影像。"))
 
         self.save_stats_label = _hint()
         self.save_stats_label.setProperty("mono", "true")
@@ -576,27 +591,31 @@ class CcdScreen(QWidget):
             self.feature_server_edit.setText(connection.device_feature_server_name)
             self.feature_resource_input.setValue(connection.device_feature_resource_index)
 
-            acquisition: AcquisitionSettings = view.acquisition
+            product: CameraRecipeSettings = view.product
+            acquisition = product.acquisition
+            self._loaded_acquisition = acquisition
+            self._edited_acquisition_fields.clear()
             self.exposure_input.setValue(acquisition.exposure_time)
             self.gain_input.setValue(acquisition.gain)
             self.length_input.setValue(acquisition.length_lines)
             self.line_rate_input.setValue(acquisition.internal_line_rate_hz)
 
-            trigger: TriggerSettings = view.trigger
+            trigger = product.trigger
             self.trigger_mode_combo.setCurrentIndex(max(0, self.trigger_mode_combo.findData(trigger.mode.value)))
             self.one_frame_check.setChecked(trigger.external_frame_one_frame)
             self.compare_follow_check.setChecked(trigger.compare_follows_encoder)
             self.set_encoder_check.setChecked(trigger.set_encoder_on_trigger)
             self._trigger_mode = trigger.mode
+            self.auto_save_external_check.setChecked(product.auto_save_external_one_frame)
+            self.auto_save_software_check.setChecked(product.auto_save_software_trigger)
 
             save: SaveSettings = view.save
             self._save_settings = save
             self.save_format_combo.setCurrentIndex(max(0, self.save_format_combo.findData(save.image_format.value)))
             self.save_folder_edit.setText(save.folder)
-            self.auto_save_external_check.setChecked(save.auto_save_external_one_frame)
-            self.auto_save_software_check.setChecked(save.auto_save_software_trigger)
 
             self._pending_hardware_write = bool(view.pending_hardware_write)
+            self.product_source_label.setText(view.source_text)
         finally:
             self._loading = False
         self._refresh_trigger_options()
@@ -668,12 +687,19 @@ class CcdScreen(QWidget):
         ).normalized()
 
     def acquisition_settings(self) -> AcquisitionSettings:
-        return AcquisitionSettings(
-            exposure_time=float(self.exposure_input.value()),
-            gain=float(self.gain_input.value()),
-            length_lines=int(self.length_input.value()),
-            internal_line_rate_hz=int(self.line_rate_input.value()),
-        ).normalized()
+        values = {
+            name: stepper.value() if name in self._edited_acquisition_fields else getattr(self._loaded_acquisition, name)
+            for name, stepper in self._acquisition_inputs().items()
+        }
+        return AcquisitionSettings(**values).normalized()
+
+    def _acquisition_inputs(self) -> dict[str, NumStepper]:
+        return {
+            "exposure_time": self.exposure_input,
+            "gain": self.gain_input,
+            "length_lines": self.length_input,
+            "internal_line_rate_hz": self.line_rate_input,
+        }
 
     def trigger_settings(self) -> TriggerSettings:
         return TriggerSettings(
@@ -683,12 +709,18 @@ class CcdScreen(QWidget):
             set_encoder_on_trigger=self.set_encoder_check.isChecked(),
         ).normalized()
 
+    def product_settings(self) -> CameraRecipeSettings:
+        return CameraRecipeSettings(
+            acquisition=self.acquisition_settings(),
+            trigger=self.trigger_settings(),
+            auto_save_external_one_frame=self.auto_save_external_check.isChecked(),
+            auto_save_software_trigger=self.auto_save_software_check.isChecked(),
+        ).normalized()
+
     def save_settings(self) -> SaveSettings:
         return SaveSettings(
             image_format=ImageSaveFormat(self.save_format_combo.currentData()),
             folder=self.save_folder_edit.text(),
-            auto_save_external_one_frame=self.auto_save_external_check.isChecked(),
-            auto_save_software_trigger=self.auto_save_software_check.isChecked(),
             max_concurrent_saves=self._save_settings.max_concurrent_saves,
         ).normalized()
 
@@ -707,9 +739,7 @@ class CcdScreen(QWidget):
     # internal behaviour
     # ------------------------------------------------------------------
     def _emit_camera_settings(self) -> None:
-        self.camera_settings_applied.emit(
-            self.connection_settings(), self.acquisition_settings(), self.trigger_settings()
-        )
+        self.camera_settings_applied.emit(self.connection_settings(), self.product_settings())
 
     def _emit_save_settings(self) -> None:
         self.save_settings_applied.emit(self.save_settings())

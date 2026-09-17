@@ -20,6 +20,7 @@ from devices.ccd_models import (
     EXTENSION_CHANNEL_COUNT,
     AcquisitionSettings,
     CameraConnectionSettings,
+    CameraRecipeSettings,
     CameraState,
     ExtensionCompareChannel,
     ImageSaveFormat,
@@ -69,6 +70,12 @@ def _wait_until(app: QApplication, predicate, timeout: float = 5.0) -> bool:
         time.sleep(0.01)
     app.processEvents()
     return predicate()
+
+
+def _type_into(stepper, value) -> None:
+    """Edit a NumStepper the way an operator does: type, then finish editing."""
+    stepper.edit.setText(str(value))
+    stepper.edit.editingFinished.emit()
 
 
 class CcdGuiTests(unittest.TestCase):
@@ -173,10 +180,14 @@ class CcdGuiTests(unittest.TestCase):
         screen.set_camera_settings(
             CcdCameraSettingsView(
                 connection=CameraConnectionSettings("srv", 1, "a.ccf"),
-                acquisition=AcquisitionSettings(900, 2.5, 5000, 400),
-                trigger=TriggerSettings(TriggerMode.EXTERNAL, True, True, True),
-                save=SaveSettings(ImageSaveFormat.PNG, "D:/snap", True, False),
+                product=CameraRecipeSettings(
+                    AcquisitionSettings(900, 2.5, 5000, 400),
+                    TriggerSettings(TriggerMode.EXTERNAL, True, True, True),
+                    auto_save_external_one_frame=True,
+                ),
+                save=SaveSettings(ImageSaveFormat.PNG, "D:/snap"),
                 pending_hardware_write=True,
+                source_text="來源：測試 Recipe",
             )
         )
         screen.set_meter_wheel_settings(
@@ -200,6 +211,8 @@ class CcdGuiTests(unittest.TestCase):
         self.assertFalse(screen.extension_rows[1]["output"].isChecked())
         self.assertFalse(screen.extension_rows[1]["output"].isEnabled())
         self.assertFalse(screen.pending_label.isHidden())
+        self.assertTrue(screen.auto_save_external_check.isChecked())
+        self.assertEqual(screen.product_source_label.text(), "來源：測試 Recipe")
 
         _screen, _controller = self._controller()
         self.assertFalse(self.store.path.exists(), "attaching a screen must not write the machine settings file")
@@ -241,12 +254,13 @@ class CcdGuiTests(unittest.TestCase):
         self.assertEqual(screen.status_values["settings"].text(), "已寫入相機")
         self.assertFalse(screen.connect_button.isEnabled())
 
-        screen.length_input.setValue(4096)
+        _type_into(screen.length_input, 4096)
         screen.server_name_edit.setText("Xtium-CL_MX4_1")
         screen.apply_camera_button.click()
         self.assertTrue(controller.pending_hardware_write())
         self.assertFalse(screen.pending_label.isHidden())
         self.assertEqual(screen.status_values["settings"].text(), "待重新連線寫入")
+        self.assertIn("未載入 Recipe", screen.product_source_label.text())
         self.assertEqual(self.store.load().connection.server_name, "Xtium-CL_MX4_1")
 
         screen.disconnect_button.click()

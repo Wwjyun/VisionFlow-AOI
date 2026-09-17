@@ -258,6 +258,7 @@ CPU 切圖預設使用 `auto`：先檢視前 16 張 ROI，至少 4 張且總裁�
 - `detectors`：啟用的 Detector 與參數
 - `output`：輸出開關
 - `gpu`：可選的 CUDA 設定
+- `camera`：可選的 CCD 相機產品層參數（見下方）
 
 最小範例：
 
@@ -322,6 +323,26 @@ output:
 ```
 
 `decision.max_ng_count` 控制整張影像可容許的 NG Tile 數量。目前判定邏輯為：`ng_count <= max_ng_count` 時 `PASS`，否則為 `NG`。
+
+選用的 `camera` 區段保存產品層 CCD 相機參數，不影響檢測判定；沒有此區段的 Recipe 不會改動相機設定：
+
+```yaml
+camera:
+  exposure_time: 1200.0          # 0–100000，寫入相機 ExposureTime
+  gain: 1.0                      # 0–1000
+  length_lines: 16384            # 1–1000000，整數
+  internal_line_rate_hz: 5000    # 1–1000000，整數
+  trigger:
+    mode: external_trigger       # continuous／external_trigger／software_trigger
+    external_frame_one_frame: true
+    compare_follows_encoder: true    # 僅 external_trigger 且 external_frame_one_frame=true
+    set_encoder_on_trigger: false    # 需 compare_follows_encoder=true
+  auto_save:                     # 選用，預設皆為 false
+    external_one_frame: true
+    software_trigger: false
+```
+
+`RecipeManager` 會拒絕未知欄位、型別錯誤、超出範圍，以及與觸發模式衝突的選項（例如 `software_trigger` 搭配 `external_frame_one_frame: true`）。
 
 ## 切圖策略
 
@@ -676,7 +697,8 @@ CCD 控制頁移植自線掃相機擷取程式（C# `CameraCaptureApp`，Teledyn
 - Engineer 可連線／斷線、開始預覽、停止、擷取、保留影像、設定存圖格式與資料夾、連線米輪；Admin 另可修改 Sapera 位置、曝光、增益、影像長度、內部線速率、觸發模式、米輪參數與 CMP0–CMP7。未明確開放給 Engineer 的控制一律只給 Admin。
 - 相機設定按「套用相機設定」後保存，**於下次連線時寫入相機**；已連線時畫面會標示「待重新連線寫入」。這沿用原程式的流程，因為 Sapera 建立取像物件後部分參數會鎖定。
 - 保留影像會以背景佇列寫入完整解析度影像，格式為 BMP（檢測交接用）、PNG、TIF 或 TIF（不壓縮）；先寫 `.tmp` 再更名，預設資料夾為 `outputs\ccd_snapshots`。存圖未完成時無法關閉程式。
-- 機台層設定（Sapera 位置、米輪卡片 ID 與參數、CMP0–CMP7、存圖設定）保存於工作目錄的 `config\ccd_machine.json`；檔案損毀時改用預設值並提示，原檔不會被覆寫。曝光等產品層參數目前只保留在本次執行，之後會移入 Recipe。
+- 機台層設定（Sapera 位置、米輪卡片 ID 與參數、CMP0–CMP7、存圖格式與資料夾）保存於工作目錄的 `config\ccd_machine.json`；檔案損毀時改用預設值並提示，原檔不會被覆寫。
+- 產品層參數（曝光、增益、影像長度、內部線速率、觸發模式與選項、自動存圖）保存在 Recipe 的選用 `camera` 區段。載入含此區段的 Recipe 會套用到 CCD 控制（已連線時標示需重連）；載入沒有此區段的舊 Recipe 不會改動目前相機參數。Admin 在 CCD 控制按「套用相機設定」後，參數會同步到 Recipe 設計成為未儲存變更，需在 Recipe 設計儲存；Recipe 設計的「相機 CCD」區塊也可直接編輯或移除此區段，Engineer 模式只能檢視且儲存時原值保留。
 - 米輪連線後每 200 ms 更新 Encoder／Compare；主程式啟動 1 秒後會依已存卡片 ID 自動連線，失敗只顯示提示。
 
 ## 輸出內容

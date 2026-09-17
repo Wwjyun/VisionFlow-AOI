@@ -178,11 +178,29 @@ class TriggerSettings:
 
 
 @dataclass(frozen=True)
-class SaveSettings:
-    image_format: ImageSaveFormat = ImageSaveFormat.BMP
-    folder: str = ""
+class CameraRecipeSettings:
+    """Product-level camera settings persisted in a Recipe's optional `camera` section."""
+
+    acquisition: AcquisitionSettings = field(default_factory=AcquisitionSettings)
+    trigger: TriggerSettings = field(default_factory=TriggerSettings)
     auto_save_external_one_frame: bool = False
     auto_save_software_trigger: bool = False
+
+    def normalized(self) -> "CameraRecipeSettings":
+        return CameraRecipeSettings(
+            acquisition=self.acquisition.normalized(),
+            trigger=self.trigger.normalized(),
+            auto_save_external_one_frame=bool(self.auto_save_external_one_frame),
+            auto_save_software_trigger=bool(self.auto_save_software_trigger),
+        )
+
+
+@dataclass(frozen=True)
+class SaveSettings:
+    """Machine-level snapshot saving; auto-save rules are product-level (`CameraRecipeSettings`)."""
+
+    image_format: ImageSaveFormat = ImageSaveFormat.BMP
+    folder: str = ""
     max_concurrent_saves: int = 2
 
     def normalized(self) -> "SaveSettings":
@@ -190,8 +208,6 @@ class SaveSettings:
             self,
             image_format=ImageSaveFormat(self.image_format),
             folder=str(self.folder).strip(),
-            auto_save_external_one_frame=bool(self.auto_save_external_one_frame),
-            auto_save_software_trigger=bool(self.auto_save_software_trigger),
             max_concurrent_saves=int(_clamp(int(self.max_concurrent_saves), SAVE_WORKERS_RANGE)),
         )
 

@@ -14,6 +14,7 @@ from core.logging_system import LogMixin
 from devices.ccd_models import (
     AcquisitionSettings,
     CameraConnectionSettings,
+    CameraRecipeSettings,
     CameraStatus,
     CcdMachineSettings,
     DeviceAvailability,
@@ -100,10 +101,10 @@ class PreviewFrameConverter:
 @dataclass(frozen=True)
 class CcdCameraSettingsView:
     connection: CameraConnectionSettings
-    acquisition: AcquisitionSettings
-    trigger: TriggerSettings
+    product: CameraRecipeSettings
     save: SaveSettings
     pending_hardware_write: bool
+    source_text: str = ""
 
 
 class CcdController(QObject, LogMixin):
@@ -115,6 +116,7 @@ class CcdController(QObject, LogMixin):
 
     camera_status_changed = Signal(object)
     camera_settings_changed = Signal(object)
+    product_settings_applied = Signal(object)
     meter_wheel_changed = Signal(object)
     meter_wheel_settings_changed = Signal(object)
     preview_image_ready = Signal(QImage, int, int)
@@ -127,8 +129,10 @@ class CcdController(QObject, LogMixin):
         self.devices = devices
         self.store = store
         self._machine = store.load()
-        self._acquisition = AcquisitionSettings()
-        self._trigger = TriggerSettings()
+        self._product = CameraRecipeSettings()
+        self._recipe_name: str | None = None
+        self._recipe_product: CameraRecipeSettings | None = None
+        self._product_edited_since_recipe = False
         self._applied: tuple[CameraConnectionSettings, AcquisitionSettings, TriggerSettings] | None = None
         self._last_meter_snapshot = MeterWheelSnapshot()
         self._closed = False
@@ -195,19 +199,37 @@ class CcdController(QObject, LogMixin):
     def camera_status(self) -> CameraStatus:
         return self.devices.camera.status()
 
+    @property
+    def product_settings(self) -> CameraRecipeSettings:
+        return self._product
+
     def camera_settings_view(self) -> CcdCameraSettingsView:
         return CcdCameraSettingsView(
             connection=self._machine.connection,
-            acquisition=self._acquisition,
-            trigger=self._trigger,
+            product=self._product,
             save=self._machine.save,
             pending_hardware_write=self.pending_hardware_write(),
+            source_text=self.product_source_text(),
         )
+
+    def product_source_text(self) -> str:
+        if self._recipe_name is None:
+            return "來源：未載入 Recipe，相機參數只用於本次執行。"
+        if self._recipe_product is None and self._product_edited_since_recipe:
+            return f"來源：Recipe「{self._recipe_name}」未包含相機設定；CCD 頁的參數尚未儲存到 Recipe。"
+        if self._recipe_product is None:
+            return f"來源：Recipe「{self._recipe_name}」未包含相機設定，沿用目前參數。"
+        if self._recipe_product != self._product:
+            return f"來源：Recipe「{self._recipe_name}」，已在 CCD 頁修改，尚未儲存到 Recipe。"
+        return f"來源：Recipe「{self._recipe_name}」。"
 
     def pending_hardware_write(self) -> bool:
         if not self.camera_status().connected or self._applied is None:
             return False
-        return self._applied != (self._machine.connection, self._acquisition, self._trigger)
+        return self._applied != self._hardware_settings()
+
+    def _hardware_settings(self) -> tuple[CameraConnectionSettings, AcquisitionSettings, TriggerSettings]:
+        return self._machine.connection, self._product.acquisition, self._product.trigger
 
     def has_pending_saves(self) -> bool:
         return self._save_queue.stats().pending > 0
@@ -218,30 +240,39 @@ class CcdController(QObject, LogMixin):
     # ------------------------------------------------------------------
     # camera
     # ------------------------------------------------------------------
-    def apply_camera_settings(
-        self,
-        connection: CameraConnectionSettings,
-        acquisition: AcquisitionSettings,
-        trigger: TriggerSettings,
-    ) -> None:
-        self._acquisition = acquisition.normalized()
-        self._trigger = trigger.normalized()
+    def apply_camera_settings(self, connection: CameraConnectionSettings, product: CameraRecipeSettings) -> None:
+        """Operator apply from the CCD screen: machine location is saved, product settings stay in session.
+
+        The window decides whether the product settings also become an unsaved Recipe edit.
+        """
         if not self._save_machine(replace(self._machine, connection=connection.normalized())):
             return
+        self._product = product.normalized()
+        self._product_edited_since_recipe = self._recipe_name is not None
         self.camera_settings_changed.emit(self.camera_settings_view())
-        if self.pending_hardware_write():
-            self.notice.emit("相機設定已保存，需斷線後重新連線才會寫入相機。", "info")
-        else:
-            self.notice.emit("相機設定已保存，下次連線時寫入相機。", "success")
+        self.product_settings_applied.emit(self._product)
+
+    def set_recipe_camera_settings(self, settings: CameraRecipeSettings | None, recipe_name: str) -> None:
+        """Adopt a loaded Recipe; a Recipe without a camera section leaves the current parameters unchanged."""
+        self._recipe_name = str(recipe_name)
+        self._recipe_product = None if settings is None else settings.normalized()
+        self._product_edited_since_recipe = False
+        if self._recipe_product is not None:
+            self._product = self._recipe_product
+        self.camera_settings_changed.emit(self.camera_settings_view())
+        if self._recipe_product is not None and self.pending_hardware_write():
+            self.notice.emit(
+                f"Recipe「{self._recipe_name}」的相機設定與相機目前設定不同，需斷線重連才會寫入相機。", "info"
+            )
 
     def connect_camera(self) -> None:
-        connection = self._machine.connection
+        connection, acquisition, trigger = self._hardware_settings()
         try:
-            status = self.devices.camera.connect(connection, self._acquisition, self._trigger)
+            status = self.devices.camera.connect(connection, acquisition, trigger)
         except DeviceError as exc:
             self.notice.emit(f"相機連線失敗：{exc}", "error")
         else:
-            self._applied = (connection, self._acquisition, self._trigger)
+            self._applied = (connection, acquisition, trigger)
             self.notice.emit(f"相機已連線：{status.camera_name or '線掃相機'}", "success")
             self.camera_settings_changed.emit(self.camera_settings_view())
         self.refresh_camera_status()

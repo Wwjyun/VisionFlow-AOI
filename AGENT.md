@@ -106,7 +106,8 @@ Put behavior in the narrowest appropriate module. Do not duplicate pipeline or f
 - `xx_ccd/` (the C# `CameraCaptureApp`) is an untracked behavior reference only. Port its confirmed behavior into `devices/`; never import, embed, or launch it at runtime.
 - Camera settings are written to hardware only on connect; applying while connected marks a pending reconnect. Keep only the hardware write paths confirmed in `xx_ccd/PROJECT_HANDOFF.md` and do not reintroduce feature probing.
 - `MainWindow` owns one `CcdController`; screens never own or disconnect devices. Driver callbacks only hand off frames; preview conversion, saving, and status refresh run elsewhere, and older preview frames may be dropped.
-- Machine-level settings live in the CCD machine settings store, not in Recipes. Product-level camera parameters belong to the Recipe `camera` section once implemented.
+- Machine-level settings live in the CCD machine settings store, not in Recipes. Product-level camera parameters (exposure, gain, length, line rate, trigger options, auto-save rules) live in the optional Recipe `camera` section parsed by `devices/ccd_recipe.py` and validated strictly by `RecipeManager`.
+- A Recipe without a `camera` section must never change camera settings. The Designer is the only writer of the section: CCD-screen applies become unsaved Designer edits, Engineer-mode saves preserve the section, and unedited values must not be rounded by display widgets.
 - CCD controls are fail-closed through `AccessGate`: only controls explicitly registered for engineers are available in Engineer mode, OP cannot open the screen, and programmatic loads never write hardware or settings.
 - Do not mark CCD or meter wheel items hardware-validated until they run on the camera machine.
 

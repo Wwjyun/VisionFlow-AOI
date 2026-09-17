@@ -112,7 +112,7 @@ class SettingsStoreTests(unittest.TestCase):
                     for index in range(EXTENSION_CHANNEL_COUNT)
                 ),
             ),
-            save=SaveSettings(ImageSaveFormat.TIF_UNCOMPRESSED, "D:/存圖", True, False, 3),
+            save=SaveSettings(ImageSaveFormat.TIF_UNCOMPRESSED, "D:/存圖", 3),
         )
         with tempfile.TemporaryDirectory() as directory:
             store = CcdMachineSettingsStore(Path(directory) / "機台" / "ccd_machine.json")

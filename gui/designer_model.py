@@ -27,6 +27,7 @@ class RecipeDraft:
     detectors: dict
     pixel_size_um_per_px: float | None
     active_template_path: str = ""
+    camera: dict | None = None
 
 
 class DesignerRecipeMapper:
@@ -56,6 +57,9 @@ class DesignerRecipeMapper:
                 "pixel_size_um_per_px": draft.pixel_size_um_per_px,
             },
         }
+        if draft.camera is not None:
+            # Optional product-level CCD settings; Recipes without them keep no camera section.
+            recipe["camera"] = draft.camera
         return RecipeTemplatePathSync(draft.active_template_path).apply(recipe)
 
 

@@ -173,6 +173,7 @@ class RecipeManager:
             if "use_gpu" in config and not isinstance(config["use_gpu"], bool):
                 raise RecipeError(f"Recipe detector {detector_id}.use_gpu must be true or false.")
         self._validate_output(recipe["output"])
+        self._validate_camera(recipe.get("camera"))
         self._validate_detector_parameters(recipe["detectors"])
 
     @staticmethod
@@ -187,6 +188,17 @@ class RecipeManager:
             raise RecipeError("Recipe output.pixel_size_um_per_px must be a positive number or null.")
         if not math.isfinite(float(pixel_size)) or float(pixel_size) <= 0:
             raise RecipeError("Recipe output.pixel_size_um_per_px must be greater than 0.")
+
+    @staticmethod
+    def _validate_camera(camera: Any) -> None:
+        if camera is None:
+            return
+        from devices.ccd_recipe import parse_camera_section
+
+        try:
+            parse_camera_section(camera)
+        except ValueError as exc:
+            raise RecipeError(str(exc)) from exc
 
     @staticmethod
     def _validate_detector_parameters(detectors: dict[str, Any]) -> None:

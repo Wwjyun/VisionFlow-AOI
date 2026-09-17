@@ -25,6 +25,8 @@ from core.detector_manager import DetectorManager
 from core.gpu_runtime import GpuRuntime
 from core.parameter_schema import PARAMETER_GROUP_INNER, PARAMETER_GROUP_OUTER
 from core.recipe_manager import RecipeError
+from devices.ccd_models import CameraRecipeSettings
+from devices.ccd_recipe import camera_section, camera_settings_from_recipe
 from gui import icons
 from gui.designer_model import (
     DesignerEditorState,
@@ -32,7 +34,7 @@ from gui.designer_model import (
     DesignerRecipeValidator,
     RecipeDraft,
 )
-from gui.designer_panels import GpuSettingsPanel, PreviewPanel, RecipeInfoPanel
+from gui.designer_panels import CameraRecipePanel, GpuSettingsPanel, PreviewPanel, RecipeInfoPanel
 from gui.detector_labels import detector_zh_name
 from gui.theme import COLORS, R_MD
 from gui.widgets.common import Badge, NumStepper, Segmented, Toggle, make_param_widget, param_value
@@ -292,6 +294,8 @@ class DesignerScreen(QWidget):
 
         left_layout.addWidget(self._build_recipe_info_panel())
         left_layout.addWidget(self._build_gpu_panel())
+        self.camera_panel = CameraRecipePanel()
+        left_layout.addWidget(self.camera_panel)
         left_layout.addWidget(self._build_tiling_panel())
         left_layout.addWidget(self._build_preview_panel())
         left_layout.addStretch(1)
@@ -611,6 +615,7 @@ class DesignerScreen(QWidget):
             self.gpu_tiling_toggle.setChecked(bool(gpu.get("tiling", False)))
             self.gpu_display_toggle.setChecked(bool(gpu.get("display", False)))
             self.gpu_dll_path_edit.setText(str(gpu.get("dll_path", GpuRuntime.DEFAULT_DLL)))
+            self.camera_panel.set_camera_settings(camera_settings_from_recipe(recipe))
             self._set_detector_config(recipe.get("detectors", {}))
             self._refresh_gpu_status()
         finally:
@@ -673,7 +678,21 @@ class DesignerScreen(QWidget):
         valid = state != "invalid"
         self.validation_changed.emit(valid, message)
 
+    def apply_camera_settings(self, settings: CameraRecipeSettings) -> bool:
+        """Adopt camera settings applied on the CCD screen as an unsaved Recipe edit."""
+        settings = settings.normalized()
+        if self.camera_panel.camera_settings() == settings:
+            return False
+        self._loading_recipe = True
+        try:
+            self.camera_panel.set_camera_settings(settings)
+        finally:
+            self._loading_recipe = False
+        self._mark_dirty()
+        return True
+
     def set_mode(self, mode: str) -> None:
+        self.camera_panel.set_editable(mode == "admin")
         if mode == self.mode:
             return
         self.mode = mode
@@ -1293,8 +1312,13 @@ class DesignerScreen(QWidget):
                 detectors=detectors,
                 pixel_size_um_per_px=self._pixel_size_um_per_px(),
                 active_template_path=self._active_template_path(),
+                camera=self._camera_section(),
             )
         )
+
+    def _camera_section(self) -> dict | None:
+        settings = self.camera_panel.camera_settings()
+        return None if settings is None else camera_section(settings)
 
     def _pixel_size_um_per_px(self) -> float | None:
         text = self.pixel_size_um_edit.text().strip()

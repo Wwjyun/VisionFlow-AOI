@@ -26,7 +26,8 @@ from PySide6.QtWidgets import (
 from core.logging_system import LogMixin, configure_logging
 from core.gpu_session import GpuExecutionSessionCache
 from core.recipe_manager import RecipeError, RecipeManager
-from devices.ccd_models import CAMERA_STATE_LABELS, TRIGGER_MODE_LABELS, CameraStatus
+from devices.ccd_models import CAMERA_STATE_LABELS, TRIGGER_MODE_LABELS, CameraRecipeSettings, CameraStatus
+from devices.ccd_recipe import camera_settings_from_recipe
 from devices.ccd_settings_store import CcdMachineSettingsStore
 from devices.factory import CcdDevices, create_ccd_devices
 from gui import theme
@@ -490,6 +491,7 @@ class MainWindow(QMainWindow, LogMixin):
         self.batch_dashboard_screen.go_to_run_requested.connect(lambda: self._set_screen("run"))
 
         self.ccd_controller.notice.connect(self._notice)
+        self.ccd_controller.product_settings_applied.connect(self._on_ccd_product_settings_applied)
         self.ccd_controller.camera_status_changed.connect(self._on_ccd_camera_status_changed)
         self.ccd_controller.camera_settings_changed.connect(
             lambda _view: self._on_ccd_camera_status_changed(self.ccd_controller.camera_status())
@@ -822,13 +824,26 @@ class MainWindow(QMainWindow, LogMixin):
         if not camera_availability.available:
             text = "相機：不可用（請至 CCD 控制查看原因）"
         else:
-            trigger = self.ccd_controller.camera_settings_view().trigger
+            trigger = self.ccd_controller.product_settings.trigger
             parts = [f"相機：{CAMERA_STATE_LABELS[status.state]}"]
             if status.camera_name:
                 parts.append(status.camera_name)
             parts.append(f"觸發：{TRIGGER_MODE_LABELS[trigger.mode]}")
             text = " · ".join(parts)
         self.monitor_screen.set_camera_status_text(text)
+
+    def _on_ccd_product_settings_applied(self, settings: CameraRecipeSettings) -> None:
+        if self.ccd_controller.pending_hardware_write():
+            write_text = "需斷線重連才會寫入相機。"
+        else:
+            write_text = "下次連線時寫入相機。"
+        if self.recipe is None:
+            self._notice(f"未載入 Recipe，相機參數只用於本次執行；{write_text}", "warning")
+            return
+        if self.designer_screen.apply_camera_settings(settings):
+            self._notice(f"相機參數已同步到 Recipe 設計（未儲存），請至 Recipe 設計儲存；{write_text}", "info")
+        else:
+            self._notice(f"相機參數與 Recipe 設計內容相同；{write_text}", "success")
 
     def _start_monitoring(self) -> None:
         if self.monitor_source == MONITOR_SOURCE_CAMERA:
@@ -1026,6 +1041,7 @@ class MainWindow(QMainWindow, LogMixin):
         self.topbar.recipe_chip.set_value(path.name)
         self.run_screen.recipe_info_panel.set_recipe(recipe)
         self.designer_screen.set_recipe(recipe)
+        self.ccd_controller.set_recipe_camera_settings(camera_settings_from_recipe(recipe), path.name)
         self.topbar.set_backend_status({"requested": False, "active": False})
         if self.image_path is not None and not (self._preview_thread and self._preview_thread.isRunning()):
             self._start_preview_load(self.image_path, update_current_image=False)
