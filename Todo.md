@@ -13,6 +13,7 @@
 - GPU 路徑應盡量一次 upload、連續執行多個 operators、最後只 download 必要 mask 或統計值。
 - 新功能必須保持 OOP 邊界、CPU-only 可啟動、舊 DLL 相容與完整 detector CPU fallback。
 - 只有 RTX 3090 實測通過數值等價、穩定性與端到端效能門檻的功能，才能預設啟用 GPU。
+- 標記 `【實物】`：必須使用真實產品影像、產線回饋數據，或現場硬體（Sapera 相機、LSI-8181 米輪卡、相機機台）才能完成或勾選的項目。本開發機永遠不會取得實物照片，產線數據也不會回饋到本機（2026-09-17 使用者說明），因此這些項目不在本機排程，也不得以合成圖、fake backend 或 stub DLL 的結果勾選；其中可在本機先做的前置（合成圖基準、模擬器、介面與測試）照常推進並記在項目括號內。以 `Select-String -Path Todo.md -Encoding utf8 -Pattern '【實物】'` 列出。
 
 ## 目前狀態摘要
 
@@ -34,7 +35,7 @@
 - [x] 已有 persistent context、grow-only buffers 與 401-2 fused preprocessing 原型。
 - [x] 已建立通用 `PreprocessPlan`、typed operators、CPU/CUDA executors，401-2 已完成第一階段遷移。
 - [x] 目前開發機已具備 RTX 3090（Driver 610.62）、CUDA 13.3 `nvcc` 與 Visual Studio 18 x64 工具，可經 `vcvars64.bat` 執行 `gpu/build_cuda_dll.ps1`（建置不需 CMake）；新增 CUDA 原始碼仍須每次重編並跑 native smoke／validator 後才可宣稱通過。
-- [ ] 尚未完成固定 production 測試集、五個 recipes 全流程等價、長時間壓測與可信的 CPU/GPU benchmark。
+- [ ] 【實物】尚未完成固定 production 測試集、五個 recipes 全流程等價、長時間壓測與可信的 CPU/GPU benchmark。
 
 ## P0：正確性、CPU 基準與觀測能力
 
@@ -46,7 +47,7 @@
 - [x] 加入 GUI 顯示、QImage/QPixmap 轉換與使用者實際等待時間計時。
 - [x] DLL 加入 CUDA event，拆分 context、allocation、H2D、device copy、kernel、synchronize、D2H 與 free；RTX 數值驗證仍列在實機驗收清單。
 - [x] benchmark JSON 保存 CPU、GPU、RAM、Driver、recipe、影像資訊與 commit hash；Toolkit 另由 runner environment artifact 保存。
-- [ ] 在 RTX 3090 固定 production 測試集執行並建立可重現 baseline。（workflow_dispatch 已支援可選 production manifest；待真實樣本與 runner）
+- [ ] 【實物】在 RTX 3090 固定 production 測試集執行並建立可重現 baseline。（workflow_dispatch 已支援可選 production manifest；待真實樣本與 runner）
 - [x] benchmark 分開記錄 cold、warm-up 次數、純檢測與既有 pipeline/report 端到端數據。
 - [x] benchmark 記錄平均、median、P95、process CPU%、GPU utilization、VRAM、溫度與功耗快照。
 - [x] **修正 resident 模式的 GPU anchor 接線與 `device_host_split` 誤報**（2026-09-15 v1.6.0 發行驗收發現；同日完成，見完成紀錄與 `gpu/README.md`〈v1.6.0 後：anchor 接線修正〉）：16384×13000 正式尺寸 benchmark 的 GPU 呼叫統計只有 `vf_context_upload_u8`、`vf_plan_execute_roi`、`vf_cnr_mask_u8_roi`，沒有 `vf_match_template_gray_u8`，`template_match` 與 CPU 同為約 58.7 ms；搜尋區 512×512、template 64×64 都在 `gpu_anchor_shapes_supported` 界限內，因此不是形狀界限造成。(1) 接線：`core/pipeline.py` 以 `gpu_runtime if tiling_gpu_requested and resident_image is None else None` 建立 Tiler，resident 模式下 Tiler 拿到 `None`，`_find_grid_anchor_on_device` 直接回 CPU，GPU anchor 在 pipeline 中永遠不會執行；`tests/test_tiler_anchor_backend.py` 直接建構 Tiler，未覆蓋此接線。修正為 resident 模式把同一 runtime 交給 anchor（不得新增 H2D），補 pipeline 層級測試證明 export 被呼叫、座標與 CPU 相同，並重量 `template_match` 與端到端。(2) 回報：`core/pipeline_stages.py` 只要 `resident_image is not None` 就標 `device`，改為依本次實際呼叫的 export 判定，並補「resident 上傳但 anchor 走 CPU」回歸測試；GUI 與報告的 backend 標示依此修正。
@@ -57,9 +58,9 @@
 - [x] 缺少 DLL 時，CPU fallback 與純 CPU 的 PASS/NG、tiles、defects、bbox 與 metadata 完整一致。
 - [x] fused GPU 呼叫失敗時不採用部分結果，整個 detector 重新從 CPU preprocess 開始執行。
 - [x] 建立固定 random seed 合成測例：BGR、gray、全黑、全白、棋盤格與邊界像素。
-- [ ] 補入固定真實 AOI 影像測例；manifest schema、路徑/標籤/coverage 驗證已完成，待取得可追蹤的生產樣本後執行。
+- [ ] 【實物】補入固定真實 AOI 影像測例；manifest schema、路徑/標籤/coverage 驗證已完成，待取得可追蹤的生產樣本後執行。
 - [x] 覆蓋奇數尺寸、極小圖、4K、non-contiguous stride、1/3 channels 與不同 ROI 尺寸。
-- [ ] 五個 production recipes 各準備至少一張 PASS 與一張 NG 樣本；`gpu/production_manifest.example.yaml` 已固定所需 10 個 case，影像待提供。
+- [ ] 【實物】五個 production recipes 各準備至少一張 PASS 與一張 NG 樣本；`gpu/production_manifest.example.yaml` 已固定所需 10 個 case，影像待提供。
 - [x] 實機注入 kernel error、CUDA 初始化失敗與 OOM，確認 fallback 後無 stale pointer 或錯誤中間結果。（2026-09-14 RTX 3090 以 `gpu/validate_cuda_fault_injection.py` 完成：`CUDA_VISIBLE_DEVICES=-1`、超過 kernel grid 上限的真實 launch error、超過專用＋共用 GPU 記憶體的 ROI batch OOM；Detector／Pipeline 與 CPU 完全一致，同一 runtime／session 下一張圖恢復 CUDA。sticky context error 另列 P2 待辦）
 - [x] `fallback_to_cpu: false` 且 CUDA DLL 不可用時必須明確失敗，不可回報假的 GPU success。
 
@@ -101,7 +102,7 @@
 - [x] Integral image 使用 row scan、transpose、第二次 row scan，並檢查 allocation overflow。
 - [x] 驗證工具已加入 Gaussian、Adaptive Mean、401-2 fused 與 4K benchmark 案例。
 - [x] Gaussian 加入 shared-memory tile/halo，實測 kernel 45 收益與限制。（2026-09-14 RTX 3090：block-local tile/halo 融合兩段 pass 輸出完全相同但全面約慢 2 倍，未採用；改採保留 reflect101 邊界的內部像素無分支快速路徑，k45 在 4K／2300×12000 ROI 交錯 A/B 10/10 勝出、kernel 時間降約 40～47%，小 kernel 在雜訊範圍）
-- [ ] 正式 Recipe 真圖量測 Gaussian 快速路徑對 Detector／端到端的實際占比與收益；512² tile 的 k45 kernel 僅約 0.09→0.08 ms，收益主要在大 ROI。
+- [ ] 【實物】正式 Recipe 真圖量測 Gaussian 快速路徑對 Detector／端到端的實際占比與收益；512² tile 的 k45 kernel 僅約 0.09→0.08 ms，收益主要在大 ROI。
 - [x] CUDA event 分別量測 Adaptive Mean integral/kernel、Gaussian passes 與 threshold kernel；待 RTX runner 回收實測數值。
 
 ### Persistent context 與 buffers
@@ -116,7 +117,7 @@
 - [x] 測試尺寸增減、channel 切換、參數改變、CUDA error/OOM 後的重用與釋放。（validator 覆蓋 shape grow/shrink、1/3 channel、參數切換與 warm allocation plateau；2026-09-14 RTX 3090 真實 launch error 後 context allocation 不再增加、真實 OOM 後連續三次小批次／resident plan 與 CPU 相同且 allocation count 不變、失敗 batch 不留下 native handle）
 - [x] 偵測 sticky CUDA context error（例如 illegal memory access）後，明確停用或重建共用 `GpuExecutionSession`，並以 GUI／監控狀態提示重新啟動；目前每次 run 仍會嘗試 CUDA 後整顆 Detector CPU fallback，結果正確但會重複失敗。需在 RTX 以隔離子程序注入驗證。（2026-09-14：同一程序內重建無法恢復 primary context，因此 runtime 標記 CUDA 損毀並停用至重新啟動；RTX 3090 以 NVRTC 越界 kernel 實測 CUDA 700 通過）
 - [x] 評估 Windows 驅動預設 CUDA sysmem fallback：佔滿專用 VRAM 時配置溢出到共用記憶體而不回傳 OOM（2026-09-14 4K plan 結果等價、新 context 首次 51 ms），需以正式大圖／批次量測溢出後的端到端延遲，決定是否以 `recommended_roi_batch_size`／監控告警限制專用 VRAM 使用量。（2026-09-14 以 16384×13000 合成圖／正式 401-AS-SN-1 量測：閒置佔用者時中位數不變，持續使用 VRAM 的佔用者使端到端 +58～105%，主要在整圖 resident 上傳；結果皆一致。決定不另限批次，改為上傳前記錄專用 VRAM 並在不足時警告）
-- [ ] 以正式真圖與實際並行 GPU 程式（例如其他檢測站或 AI 服務）量測 sysmem 溢出頻率與延遲，確認警告門檻與是否需要監控介面顯示。
+- [ ] 【實物】以正式真圖與實際並行 GPU 程式（例如其他檢測站或 AI 服務）量測 sysmem 溢出頻率與延遲，確認警告門檻與是否需要監控介面顯示。
 - [x] 評估 `cudaMallocAsync`/memory pool；只有相容且實測有收益時採用。（2026-09-14 評估後不採用：五份正式 Recipe 以 4K 圖在共用 session 連續 12 張，暖機後 context allocation 增量皆為 0；pool 只能加速首張、尺寸成長、plan 建立及 production 未使用的 stateless／ROI batch 路徑，且保留記憶體會壓縮其他程序可用的專用 VRAM）
 
 ### Morphology
@@ -158,10 +159,10 @@
 - [x] 離線分析器新增「計時口徑（請勿混用）」與 `scopes_ms`，比較 CPU/GPU detector、cold/warm pipeline、reporting、end-to-end 與非 detector overhead；重疊 CUDA events 仍只作瓶頸占比，不相加為總時間。
 - [x] 在 RTX 3090 以相同 image/recipe 重新執行 cold 1 次、warm 10 次與 GUI 連續 10 次；確認第二次以後 context/allocation 接近 0、GPU active、無 fallback、ROI/PASS-NG 完全一致，再決定下列分支。（2026-09-14 以產線配置的合成 16384×13000、Template Anchor Grid 6 個 2000×12000 ROI 完成：warm allocation 增量 0、GPU active、無 fallback、ROI／PASS-NG／defects 與 CPU 相同；瓶頸為 Morphology，走下方 Morphology 分支。真圖重跑見本節最後一項）
 - [ ] 若 launch/synchronize/ROI gather/D2H 為主：（2026-09-14 合成產線配置未觸發：synchronize 0.12 ms、ROI gather 1.8 ms、每 ROI 28 次 launch；D2H 39.7 ms 為次要，真圖結果若不同再重新判斷）實作 detector-neutral `execute_plan_roi_batch` optional ABI，resident image 唯讀共享、一次提交一批 ROI、一次同步及批次 masks 下載；測 batch size 1/4/8/16/32/全部。
-- [ ] 若 Morphology 為主：針對簡報第 12 頁的 5×5 open、iterations=10，先在 RTX 3090 以相同真圖／Recipe／ROI 記錄現有 CUDA 形態學、Detector 與端到端 warm median／P95，以及 kernel 啟動、顯存讀寫與 VRAM 峰值；70 ROI 單顆 401 曾量得形態學約 300 ms，須以本次基準重測。
+- [ ] 【實物】若 Morphology 為主：針對簡報第 12 頁的 5×5 open、iterations=10，先在 RTX 3090 以相同真圖／Recipe／ROI 記錄現有 CUDA 形態學、Detector 與端到端 warm median／P95，以及 kernel 啟動、顯存讀寫與 VRAM 峰值；70 ROI 單顆 401 曾量得形態學約 300 ms，須以本次基準重測。
 - [x] 建立可分離橫向／縱向形態學 CUDA 原型，並比較 shared-memory／合併有效 kernel 方案；（2026-09-14 完成比較並不採用：合併有效半徑的 van Herk／Gil-Werman 原型與 OpenCV 逐像素相同，但正式 401-AS-SN-1 的 BGR open 5×5×10 無可重現收益，小半徑變慢，保留現行 5×5 shared-memory kernel；見完成紀錄）保留矩形 kernel、OpenCV open 的侵蝕後膨脹次序、iterations、border、channel 與輸出語意。500→200 次鄰居讀取只是理論存取次數，不能當成 2.5 倍實測加速，且須計入新增的中間寫入與 kernel 啟動。
 - [ ] （合併 kernel 原型未採用，僅在日後重新提案替換形態學路徑時執行）以 CPU OpenCV 與現有 CUDA 作參考，比對 5×5 open、iterations=10 的 binary mask，涵蓋 ROI 邊界、不同尺寸／channel、連續與非連續輸入，並驗證正式 Recipe 的 PASS／NG、缺陷 bbox／area／metadata、排序及失敗後整顆 Detector CPU fallback；等價不通過不得替換現有路徑。
-- [ ] 在 RTX 3090 對相同真圖交錯量測舊／新 CUDA 路徑的形態學、Detector 與端到端 warm median／P95、VRAM 與長時間穩定性；只有完整等價且端到端有可重現收益才採用，否則保留原 kernel。若修改 `.cu`，須重編 DLL、跑 native smoke／CUDA validator 並確認舊 DLL 相容路由。
+- [ ] 【實物】在 RTX 3090 對相同真圖交錯量測舊／新 CUDA 路徑的形態學、Detector 與端到端 warm median／P95、VRAM 與長時間穩定性；只有完整等價且端到端有可重現收益才採用，否則保留原 kernel。若修改 `.cu`，須重編 DLL、跑 native smoke／CUDA validator 並確認舊 DLL 相容路由。
 - [x] 先以生成的 16384×13000 BMP／70 ROI／401-AS-SN-1 在 RTX 3090 驗證 5×5 shared-memory 形態學：舊／新 DLL 交錯 A/B 各 10 次，morphology warm median 165.0→69.8 ms、Detector 413.8→325.2 ms、整張圖 1429.1→1341.2 ms，三個指標逐對均 10/10 勝出；1960 次 kernel launch 不變，ROI／PASS-NG／完整 Tile 輸出一致。此項只代表合成圖，不替代上方真圖及 production 驗收。
 - [ ] Batch 單 stream 仍無法達標時才建立 2/4 execution slots；每 slot 獨立 stream/scratch/events/pinned output，縮小 Python lock 至 metadata/context lifecycle，不接受仍被全域 lock 序列化的 worker 數字。
 - [ ] 以相同 ROI/輸入/輸出條件比較 OpenCV CPU、自製 CUDA、OpenCV CUDA/hybrid；Gray-first 僅作 feature-flag 實驗，golden mask/PASS-NG 不等價時不得採用。
@@ -198,7 +199,7 @@
 - [x] GPU resident tile 不再預製所有 CPU tile 副本；PreprocessPlan／native linear 與 DAG 能力查詢及 device ROI 執行可用非連續 NumPy view 的 shape／dtype／channels 驗證，避免 `np.ascontiguousarray` 偷做等量複製。ROI inset、generation／bounds 與 batch／monitor 共用 session 沿用既有生命週期。
 - [x] 混用 CPU Detector 時才按需建立獨立 CPU tile 副本供該 tile 的 CPU Detectors 共用；GPU 執行失敗時依既有政策從原圖 view 重跑完整 Detector。保留 `gpu.mode=cpu/auto/cuda`、舊 DLL 與 strict CUDA 路由，不混用部分 GPU 中間結果與 CPU 後續步驟。
 - [x] Overlay、NG tile／sidecar、debug 與 GUI 預覽所需的 CPU 像素按需取得；（2026-09-14 RTX 3090 以合成 16384×13000、6 個 2000×12000 ROI 開啟全部輸出與 debug images 驗證：CPU／strict CUDA 各 22 個輸出檔，PNG 逐像素、JSON／sidecar 與 CSV 除耗時／後端／路徑外完全相同；resident tile 仍為 CPU 原圖零複製 view，只有 debug 開啟時才複製中間影像，GUI 預覽維持獨立 CPU 讀圖）401 等目前仍需 CPU `findContours`／幾何判定的 Detector 只下載必要的 binary mask，檢查 PASS/NG、tile 順序／座標、defect bbox／area／confidence／metadata、輸出內容與 CPU 基準等價。
-- [ ] 用同一批真實 16384×13000 圖、約六個 2300×12000 ROI 及正式 Recipe／輸出設定，在 RTX 3090 比較修改前後 cold、warm median／P95、image load、整圖 H2D、tile 建立、Detector、D2D／必要 D2H、Reporter、端到端耗時、RAM／VRAM 峰值與 100 次穩定性；未證明整體收益與完整等價前保持 production 預設不變。2026-09-14 合成尺寸基準：BGR 原圖約 609.4 MiB，六張 CPU tile 副本約 473.8 MiB，CPU 裁切 warm median 128.6 ms，整圖 H2D 85.0 ms，ROI descriptor 建立約 0.03 ms；預期省的是 CPU 副本及其約 129 ms 複製，不包含既有 H2D，端到端百分比須以目前每張總耗時為分母實測。
+- [ ] 【實物】用同一批真實 16384×13000 圖、約六個 2300×12000 ROI 及正式 Recipe／輸出設定，在 RTX 3090 比較修改前後 cold、warm median／P95、image load、整圖 H2D、tile 建立、Detector、D2D／必要 D2H、Reporter、端到端耗時、RAM／VRAM 峰值與 100 次穩定性；未證明整體收益與完整等價前保持 production 預設不變。2026-09-14 合成尺寸基準：BGR 原圖約 609.4 MiB，六張 CPU tile 副本約 473.8 MiB，CPU 裁切 warm median 128.6 ms，整圖 H2D 85.0 ms，ROI descriptor 建立約 0.03 ms；預期省的是 CPU 副本及其約 129 ms 複製，不包含既有 H2D，端到端百分比須以目前每張總耗時為分母實測。
 
 #### 目前卡點與可平行推進的項目（2026-09-14 使用者指示：卡住的寫清楚，先往下做別的）
 
@@ -564,9 +565,9 @@ vs 原本 `[255,255,20,20]`）。因此「標籤編號順序」對 202 的最終
 
 目前只有實作紀錄與 v1.4.0／v1.5.1 發行時的合成圖 CPU/GPU 等價，缺正式 Recipe、真圖與產線配置效能證據。
 
-- [ ] 為四個 Detector 各指定正式 Recipe（或使用中的產線 Recipe），並各準備至少一張 PASS 與一張 NG 可追溯真圖，納入 production manifest；RTX 3090 比較 CPU／GPU 的 tiles、PASS/NG、defect count、bbox、area、confidence、metadata 與 fallback log。
+- [ ] 【實物】為四個 Detector 各指定正式 Recipe（或使用中的產線 Recipe），並各準備至少一張 PASS 與一張 NG 可追溯真圖，納入 production manifest；RTX 3090 比較 CPU／GPU 的 tiles、PASS/NG、defect count、bbox、area、confidence、metadata 與 fallback log。
 - [ ] 以產線配置（16384×13000、6 個 2000×12000 ROI）量測 CPU、strict CUDA、auto crossover 的 Detector 與端到端 warm median／P95、上傳與 D2H，確認結果一致並記錄是否值得啟用 GPU。
-- [ ] 以正式真圖重跑上一項，確認合成圖結論在產線影像上成立，再決定四個 Detector 的建議 `gpu.mode`。
+- [ ] 【實物】以正式真圖重跑上一項，確認合成圖結論在產線影像上成立，再決定四個 Detector 的建議 `gpu.mode`。
 
 ## P5：CPU 與整體 Pipeline 最佳化
 
@@ -585,7 +586,7 @@ vs 原本 `[255,255,20,20]`）。因此「標籤編號順序」對 202 的最終
 
 - [x] Recipe 與 GUI 可設定 GPU，並顯示 DLL/device/fallback 狀態。
 - [x] GPU mode 統一為清楚的 `auto`、`cpu`、`cuda` 語意，並相容未含 mode 的舊 recipe。
-- [ ] production 預設 mode 仍需由 RTX 3090 實機驗收決定。
+- [ ] 【實物】production 預設 mode 仍需由 RTX 3090 實機驗收決定。
 - [x] GUI worker 不在 UI thread 等待 CUDA；monitor 取消、錯誤與進度以 stop callback／Qt signals 保持可回應。
 - [x] GUI 顯示實際 backend，不得因 recipe 勾選 GPU 就顯示 CUDA active。
 - [x] PyInstaller 有 DLL 時條件式包含 `gpu/visionflow_cuda.dll`，無 DLL 時建立 CPU-compatible package 且 runtime 可 fallback。
@@ -655,7 +656,7 @@ vs 原本 `[255,255,20,20]`）。因此「標籤編號順序」對 202 的最終
 - [x] `output.save_debug_images` 可輸出 detector preprocess 中間影像；runtime payload 在 JSON 與公開 tile result 前移除，預設關閉，CPU fallback 也保留擷取。
 - [x] 新增 `core/result_types.py` TypedDict 結果契約與 runtime contract test。
 - [x] 新增 Windows Unicode 路徑安全的 P9 regression tests，固定 serial/parallel 結果等價、cache invalidation、batch/GC policy、輸出參數、overlay decode/downscale 與 debug payload 隔離。
-- [ ] 使用固定 production 資料集量測 worker 上限、GC interval、PNG compression、NG write workers 的 median/P95、peak RSS 與檔案大小，再決定量產建議值。
+- [ ] 【實物】使用固定 production 資料集量測 worker 上限、GC interval、PNG compression、NG write workers 的 median/P95、peak RSS 與檔案大小，再決定量產建議值。
 - [x] 在 RTX 3090 驗證 `AOI_TILE_WORKERS>1` 不會使 GPU detector/resident image 進入平行路徑，且 GPU queue/VRAM 無競爭或累積。（2026-09-14 完成，見完成紀錄）
 
 ## P10：OOP 責任邊界重構
@@ -682,7 +683,7 @@ vs 原本 `[255,255,20,20]`）。因此「標籤編號順序」對 202 的最終
 ### 已確認決策（2026-09-17 使用者同意規劃建議）
 
 - [x] **Sapera 綁定方式採 `pythonnet`**：載入 `DALSA.SaperaLT.SapClassBasic.dll`，類別與參數名稱和 C# 參考逐行對照，移植風險最低；ctypes 呼叫 Sapera C API 只在 spike 證明 pythonnet 不可行時才改用。
-- [ ] **pythonnet spike**（目前 `env` 未安裝，需在裝有 Sapera 的相機機台執行）：x64 與 .NET Framework runtime 載入、`SapAcquisition`／`SapAcqDevice`／`SapBuffer`／`SapAcqToBuf` 建立與釋放、`EndOfFrame` callback 從非 UI thread 進入 Python、`SapBuffer` 直接複製成 numpy（不經 `Bitmap`）、PyInstaller 打包可行性；結果記錄於本節後才開始正式移植。
+- [ ] 【實物】**pythonnet spike**（目前 `env` 未安裝，需在裝有 Sapera 的相機機台執行）：x64 與 .NET Framework runtime 載入、`SapAcquisition`／`SapAcqDevice`／`SapBuffer`／`SapAcqToBuf` 建立與釋放、`EndOfFrame` callback 從非 UI thread 進入 Python、`SapBuffer` 直接複製成 numpy（不經 `Bitmap`）、PyInstaller 打包可行性；結果記錄於本節後才開始正式移植。
 - [x] **設定歸屬分兩層，取代 `settings.ini`**：機台層（server／resource index、CCF 路徑、AcqDevice 位置、米輪 card ID、倍頻、反向、CMP Out Width、CMP0–7）存機台設定檔，不進 Recipe；產品層（Exposure、Gain、Length、Internal Line Rate、Trigger Mode、自動存圖）放 Recipe 選用 `camera` 區段，參與 dirty tracking 與 `RecipeManager` 驗證，舊 Recipe 沒有 `camera` 區段時不得改動相機設定。另提供一次性從 `xx_ccd` `settings.ini` 匯入。
 - [x] **權限分級**：OP 看不到 CCD 頁（Monitor 只顯示唯讀相機／米輪連線與取像狀態）；工程模式可連線／斷線、預覽、停止、擷取、存圖、查看米輪讀值；管理模式才可改相機參數、Sapera 位置／CCF、Trigger、米輪與 CMP0–7、匯出診斷。新增控制項比照 Detector 參數 fail-closed，未分類一律只給管理模式。
 - [x] **存圖格式與 AOI 交接**：`xx_ccd` 因大型 BMP 在一般看圖軟體開啟慢而移除 BMP，但 VisionFlow 產線格式是 BMP，且 `BmpReader`／BMP file-order resident upload 是目前最快的讀圖路徑。因此第一階段 CCD→檢測的檔案交接使用 BMP；第二階段評估記憶體直接交接；PNG／TIF／TIF 不壓縮只作保存用途。
@@ -693,43 +694,43 @@ vs 原本 `[255,255,20,20]`）。因此「標籤編號順序」對 202 的最終
 - [x] 新增頂層 `devices/`（`ccd_models.py` typed value objects、`interfaces.py`、`simulated.py`、`factory.py`、`ccd_settings_store.py`、`frame_writer.py`），GUI 放 `gui/screens/ccd_screen.py` 與 `gui/ccd_controller.py`（相機是常駐 session 而非單次 worker，因此不放 `workflow_controllers.py`）；GUI 不直接呼叫 Sapera 或 ctypes。`AGENT.md` 模組職責與 `README.md` 已同步。（2026-09-17）
 - [x] 定義 backend-neutral `LineScanCamera`／`MeterWheel` 介面與 `SimulatedLineScanCamera`／`SimulatedMeterWheel`，`MainWindow` 可注入 devices 與設定檔 store，無硬體電腦與 CI 可測；未設定 `VISIONFLOW_CCD_SIMULATOR=1` 時預設為「不可用」backend 並顯示原因。（2026-09-17）
 - [x] LSI-8181 以 ctypes 包裝 `LSI8181_64.dll`（`devices/lsi8181.py`，2026-09-17）：23 個使用中的 export 與型別對照 `Native/Lsi8181Native.cs`（byte／ushort／short／int／uint 與指標輸出），不包裝 `LSI8181_CO_read`；非 0 回傳碼與 Windows 例外轉成含動作與狀態碼的 `Lsi8181Error`；呼叫前檢查 card／int32／int16／uint16 範圍；反向計數讀寫 CIO polarity，只切 A 相 bit 0；連線順序與 `Lsi8181MeterWheelService.Open` 相同，但任一步失敗會停止計數並關閉卡片（原 C# 會留在已初始化狀態）；所有 native 呼叫以鎖序列化。DLL 與驅動不提交；`devices/factory.py` 預設選用此綁定，DLL 載入失敗只讓米輪不可用。驗證：ctypes callback 假卡 16 項測試，並在本機以 MSVC 編出同名 stub DLL 經 `WinDLL` 實際載入確認 export、int32 極值、uint16 40000、極性位元與 CMP0–7 往返（stub 未提交）。**實際卡片驗證仍待相機機台。**
-- [ ] Lifecycle 明確：`close()`／context manager；每個 Sapera 物件個別 guarded destroy／dispose 並記 log，清理失敗不得傳到 UI thread；關閉主程式一定斷線。不使用持有相機、影像或設定的 mutable module global。（GUI 層已完成：`CcdController.close()` 停止輪詢、預覽 thread 與存圖佇列並關閉 devices，存圖未完成時阻止關窗；Sapera 物件清理待綁定實作。）
+- [ ] 【實物】Lifecycle 明確：`close()`／context manager；每個 Sapera 物件個別 guarded destroy／dispose 並記 log，清理失敗不得傳到 UI thread；關閉主程式一定斷線。不使用持有相機、影像或設定的 mutable module global。（GUI 層已完成：`CcdController.close()` 停止輪詢、預覽 thread 與存圖佇列並關閉 devices，存圖未完成時阻止關窗；Sapera 物件清理待綁定實作。）
 - [x] 相機與米輪 session 由 `MainWindow` composition root 擁有的 `CcdController` 管理，不由頁面擁有；切換頁面不斷線，只有斷線按鈕或關閉主程式才釋放。（2026-09-17）
-- [ ] 偵測 Sapera runtime 與 managed DLL 版本不符（開發機 9.12、現場 8.6 曾出現 `FileLoadException`），以繁中 inline notice 顯示「Sapera runtime 版本不符」與兩個版本號，不得當成「沒有擷取卡」。
+- [ ] 【實物】偵測 Sapera runtime 與 managed DLL 版本不符（開發機 9.12、現場 8.6 曾出現 `FileLoadException`），以繁中 inline notice 顯示「Sapera runtime 版本不符」與兩個版本號，不得當成「沒有擷取卡」。
 
 ### 相機連線與參數（Sapera）
 
-- [ ] 以 Qt 對話框取代 `AcqConfigDlg`：列舉 server／resource、選 CCF；只找到一個 AcqDevice 時自動選取並提示。
+- [ ] 【實物】以 Qt 對話框取代 `AcqConfigDlg`：列舉 server／resource、選 CCF；只找到一個 AcqDevice 時自動選取並提示。
 - [x] 保留「離線修改 → 套用 → 重新連線才寫入硬體」流程（Sapera 建立 acquisition／buffer／transfer 後部分參數會鎖定）：設定只在 `connect()` 寫入；已連線時套用會顯示「待重新連線寫入」與提示文字。（2026-09-17）
 - [x] **產品層相機參數接 Recipe `camera` 區段**（2026-09-17）：Exposure／Gain／Length／Line Rate／觸發模式與選項／自動存圖保存在 Recipe 選用 `camera` 區段（`devices/ccd_recipe.py`），`RecipeManager` 嚴格驗證（必填、型別、範圍、未知欄位、觸發選項與模式衝突）；自動存圖旗標已從機台設定檔移出。Recipe 設計新增「相機 CCD」區塊參與 dirty tracking，僅管理模式可編輯，工程模式儲存原值保留，未修改的數值不因顯示精度被改寫；舊 Recipe 無此區段時不改動相機設定。CCD 控制按「套用相機設定」後同步為 Recipe 設計的未儲存變更，Recipe 設計仍是唯一寫入者；載入含此區段的 Recipe 會套用到相機 session，已連線時提示需重連。
 - [ ] 一次性從 `xx_ccd` `settings.ini` 匯入機台層與產品層設定（產品層匯入到 Recipe 設計成為未儲存變更）。
-- [ ] 只移植已實機確認的寫入路徑，禁止重新加入探測式寫法：
+- [ ] 【實物】只移植已實機確認的寫入路徑，禁止重新加入探測式寫法：
   - Internal Line Rate：在 `SapAcquisition.Create()` 前建立 `SapAcqDevice`，將 `AcquisitionLineRate` 以 Int64 寫入並 `UpdateFeaturesToDevice()`；`INT_LINE_TRIGGER_ENABLE／FREQ`、`EXT_LINE_TRIGGER_ENABLE=0`、`SHAFT_ENCODER_ENABLE=0` 僅作輔助。不改寫 CCF，不探測 `LineRateAbs` 等候選。
   - Exposure：在 line rate 之後經 `SapAcqDevice` 寫入；不得設定 `ExposureStart` trigger source。
   - Gain：`SetFeatureValue("Gain", 字串)`。
   - Length：`CROP_HEIGHT`。
   - 四個參數都讀回、依能力範圍 clamp 並在畫面與報告顯示實際值。
-- [ ] Trigger 模式與互斥規則：
+- [ ] 【實物】Trigger 模式與互斥規則：
   - Continuous：Line Sync Source=None（freerun），任何外部觸發寫入不得殘留。
   - External Trigger：`EXT_LINE_TRIGGER_ENABLE=1`、Line integration Method 3、CC1=Pulse #1、相機 `TriggerMode=On`。
   - External Trigger One Frame：`EXT_FRAME_TRIGGER_ENABLE`，獨立於 Trigger Mode。
   - Software Trigger：`EXT_FRAME_TRIGGER_ENABLE=0`、`EXT_LINE_TRIGGER_ENABLE=1`，由程式呼叫 `Snap()` 開始一張，米輪脈衝逐線完成；One Frame 顯示但停用且強制取消，line integration 設定與 External Trigger 一致。
   - External Trigger arm 檢查同時看 EXT_LINE 與 EXT_FRAME。
-- [ ] 診斷：`last_requested_settings`／`last_apply_params`、Live Features、Acq Params 報告寫到 `outputs/logs/camera/`，GUI 提供管理模式「匯出診斷」。
+- [ ] 【實物】診斷：`last_requested_settings`／`last_apply_params`、Live Features、Acq Params 報告寫到 `outputs/logs/camera/`，GUI 提供管理模式「匯出診斷」。
 
 ### 取像、預覽與存圖
 
-- [ ] Sapera callback 只做最少交接：把 `SapBuffer` 複製到預先配置的 `uint8` 全解析度 frame，放入有界佇列；背景 worker 產生降採樣預覽，UI 只畫最新一張，允許丟棄舊預覽；不得每張建立全解析度 `QPixmap`（與 P6「大圖預覽記憶體與 LOD」共用實作，不另做一套）。預覽解析度文字顯示原始 frame 尺寸。（GUI 端已完成：frame listener 只交接，`PreviewFrameConverter` 單一背景 thread 只轉最新一張、`INTER_AREA` 降到 2048 px 內，UI 只建立預覽大小的 pixmap 並顯示原始／預覽尺寸；Sapera buffer 複製待綁定。）
-- [ ] 取像狀態機：`capture_in_progress` 期間不得第二次 `Snap()` 或開始 preview；Stop 在擷取中不呼叫 `Freeze()`，停止後續觸發並讓目前 frame 收完；stop 後短暫 cooldown；連線／斷線清除上述狀態。按鈕 enable 跟隨連線、預覽與忙碌狀態。（介面契約、模擬相機與按鈕 enable 已完成並有測試；Sapera `Freeze()` 語意與 stop cooldown 待綁定。）
+- [ ] 【實物】Sapera callback 只做最少交接：把 `SapBuffer` 複製到預先配置的 `uint8` 全解析度 frame，放入有界佇列；背景 worker 產生降採樣預覽，UI 只畫最新一張，允許丟棄舊預覽；不得每張建立全解析度 `QPixmap`（與 P6「大圖預覽記憶體與 LOD」共用實作，不另做一套）。預覽解析度文字顯示原始 frame 尺寸。（GUI 端已完成：frame listener 只交接，`PreviewFrameConverter` 單一背景 thread 只轉最新一張、`INTER_AREA` 降到 2048 px 內，UI 只建立預覽大小的 pixmap 並顯示原始／預覽尺寸；Sapera buffer 複製待綁定。）
+- [ ] 【實物】取像狀態機：`capture_in_progress` 期間不得第二次 `Snap()` 或開始 preview；Stop 在擷取中不呼叫 `Freeze()`，停止後續觸發並讓目前 frame 收完；stop 後短暫 cooldown；連線／斷線清除上述狀態。按鈕 enable 跟隨連線、預覽與忙碌狀態。（介面契約、模擬相機與按鈕 enable 已完成並有測試；Sapera `Freeze()` 語意與 stop cooldown 待綁定。）
 - [x] 狀態呈現遵守 GUI 契約：TopBar 只放標題與全域狀態，CCD 頁「相機狀態」顯示連線／相機／解析度／觸發／訊號／累計線數／狀態／設定寫入狀態，錯誤走 inline notice、status bar 只放短事件；狀態全部有文字，CCD 按鈕有鍵盤操作測試。（2026-09-17）
-- [ ] 存圖：BMP（檢測交接）與 PNG／TIF／TIF 不壓縮（保存），先寫 `.tmp` 再 rename；有界存圖佇列，最大並行數可設定（C# 固定 5，需在實機比較 2／3／5）；進度顯示在頁內，不另開 modal 視窗。手動保留影像存到可設定資料夾。（已完成：四種格式無損、`.tmp`→rename、失敗清除暫存、`SnapshotSaveQueue` 上限 16 筆、預設 2 workers、頁內進度與失敗計數、存圖未完成阻止關窗、可設定資料夾；待完成：GUI 調整並行數與實機 2／3／5 比較。）
+- [ ] 【實物】存圖：BMP（檢測交接）與 PNG／TIF／TIF 不壓縮（保存），先寫 `.tmp` 再 rename；有界存圖佇列，最大並行數可設定（C# 固定 5，需在實機比較 2／3／5）；進度顯示在頁內，不另開 modal 視窗。手動保留影像存到可設定資料夾。（已完成：四種格式無損、`.tmp`→rename、失敗清除暫存、`SnapshotSaveQueue` 上限 16 筆、預設 2 workers、頁內進度與失敗計數、存圖未完成阻止關窗、可設定資料夾；待完成：GUI 調整並行數與實機 2／3／5 比較。）
 - [x] 自動存圖依模式分開（2026-09-17）：External Trigger One Frame 在觸發事件時計數、Software Trigger 在每張 frame 到達時計數，每張 frame 只消耗一次；模式依連線時實際寫入相機的觸發設定判斷，同一張 frame 不會存兩次，佇列滿時提示未保存。
 
 ### 米輪（LSI-8181）
 
 - [x] 主程式啟動 1 秒後依儲存的 card ID 自動連線；後端不可用時略過，失敗寫 log 並以 warning inline notice 顯示，不跳 modal、不阻擋啟動。（2026-09-17，實機驗收見下方）
 - [x] 控制項：card ID 0–15、連線／斷線、encoder 每 200 ms 更新、encoder 清除／設定、compare 清除／設定（compare 值由使用者輸入，Set 時不得用即時 encoder 覆蓋；清除只寫 0 到卡片、不覆蓋已存原點值）、auto increment、倍頻 X4／X2／X1（沿用原廠順序）、反向、CMP Out Width；變更即保存到機台設定檔，已連線才寫硬體。（2026-09-17，CIO polarity 寫法屬 LSI 綁定項目）
-- [ ] 連線時套用已存設定：quadrature 模式、倍頻、方向、compare auto increment 與 increment、CMP_OUT pulse 輸出、`LSI8181_toggle_preset(card, 1)`、CMP0–7、以 compare 輸出模式啟動 counter。
+- [ ] 【實物】連線時套用已存設定：quadrature 模式、倍頻、方向、compare auto increment 與 increment、CMP_OUT pulse 輸出、`LSI8181_toggle_preset(card, 1)`、CMP0–7、以 compare 輸出模式啟動 counter。
 - [x] Extension compare CMP0–7（僅管理模式可見）：mask、offset、pulse width、output state、status 每 200 ms 更新並以 ON／OFF 文字顯示；mask 開啟時 output state 清除並停用；套用時寫入 8 個通道並保存。（2026-09-17）
 - [ ] 不得以 `LSI8181_CO_read == 1` 判斷 CMP OUT 已啟用（它是瞬時輸出狀態，脈衝之間可能是 0）。
 - [x] 載入已存值到控制項時不得觸發寫硬體或存檔（比照 Designer 程式載入不產生 dirty）；encoder／compare 輸入值只保存，不在開頁時自動寫入硬體；attach 畫面不寫設定檔。（2026-09-17）
@@ -744,15 +745,15 @@ vs 原本 `[255,255,20,20]`）。因此「標籤編號順序」對 202 的最終
 - [x] **監控模式影像來源選擇**（2026-09-17 使用者需求）：Monitor「監控來源」可選「監控資料夾」（原模式）或「相機直連」；工程／管理模式可切換，OP 與監控執行中不可切換；選擇以 QSettings 保存；相機直連時隱藏資料夾控制、顯示唯讀相機狀態與觸發模式，並依相機狀態說明能否啟動。
 - [x] **相機直連監控的檢測後端**（2026-09-17）：直接採記憶體交接，不走「存 BMP 到監控資料夾」的第一階段（同一行程內寫出再讀回大型 BMP 沒有好處）。`AOIPipeline.run_frame(frame, source_name, source_metadata)` 以 `frame_to_bgr` 轉成與 8-bit BMP 解碼逐像素相同的 BGR 影像，檔案路徑入口與結果欄位不變；相機 frame 結果多一個 `source`（type=camera、frame 序號、擷取時間、觸發模式、尺寸）並寫入 JSON。`CcdController` 只在相機以外部觸發或軟體觸發連線時，把完成的 frame 交給有界 `CameraFrameQueue`（預設 4 張，滿了記為未檢測），連續取像的 frame 一律不檢測；`CameraMonitorProcessor` 共用一個 GPU session 依序檢測，產生與資料夾監控相同格式的表格項目（`source=camera`、`camera` metadata、佇列等待／檢測／端到端時間），停止時新 frame 立即停止交接、佇列中已收到的 frame 仍會檢測完，輸出到 `outputs/monitor/<時間>_camera/`。GPU mode 下 frame 視為已解碼影像，與檔案相同只上傳一次。
 - 原「第一階段：CCD 自動存 BMP 到 Monitor 資料夾」已由記憶體交接取代，不實作；需要原圖時使用 Recipe 相機設定的自動存圖。
-- [ ] 相機直連大 frame 的記憶體與耗時量測：16384×50000 單通道 819 MB，`frame_to_bgr` 轉 BGR 約 2.4 GB，加上佇列最多 4 張；需在相機機台量測轉換耗時、峰值記憶體與佇列上限，並評估灰階直通（不得改變 Detector 判定）。encoder 值目前未寫入 frame metadata，需確認從 driver thread 讀米輪的時機。
-- [ ] 檢測與取像並行時，相機 callback、存圖佇列、檢測 worker 與 GPU session 互不阻塞；GUI 保持可回應。（結構已分離：callback 只交接 frame、檢測在 worker thread；需在相機機台以實際 frame 速率與尺寸壓測。）
+- [ ] 【實物】相機直連大 frame 的記憶體與耗時量測：16384×50000 單通道 819 MB，`frame_to_bgr` 轉 BGR 約 2.4 GB，加上佇列最多 4 張；需在相機機台量測轉換耗時、峰值記憶體與佇列上限，並評估灰階直通（不得改變 Detector 判定）。encoder 值目前未寫入 frame metadata，需確認從 driver thread 讀米輪的時機。
+- [ ] 【實物】檢測與取像並行時，相機 callback、存圖佇列、檢測 worker 與 GPU session 互不阻塞；GUI 保持可回應。（結構已分離：callback 只交接 frame、檢測在 worker thread；需在相機機台以實際 frame 速率與尺寸壓測。）
 
 ### 測試、打包與實機驗收
 
 - [ ] 自動測試（fake backend，無硬體）：設定 round trip 與預設值、載入不觸發寫入、Trigger 互斥矩陣、Software Trigger 狀態機、忙碌／Stop 語意、自動存圖不重複、`.tmp` 存檔、缺 Sapera／缺 DLL 時主程式可啟動且 CCD 頁顯示不可用、OP／工程／管理可見性、GUI offscreen smoke。（`tests/test_ccd_devices.py`、`tests/test_ccd_gui.py` 已涵蓋設定 round trip／損毀檔、載入不寫入、Trigger 16 種組合、忙碌／Stop、`.tmp` 與四格式無損、存圖佇列上限、米輪保存與寫入、不可用後端、權限可見性、鍵盤、監控來源與關窗；`tests/test_ccd_trigger_automation.py` 涵蓋 Software Trigger 狀態機、外部觸發規則矩陣、自動存圖不重複、監控前置條件與停止。）
 - [ ] 打包：Sapera runtime、`LSI8181_64.dll` 與驅動由現場安裝、不打包；若採 pythonnet 則打包其 runtime。packaged `--smoke-test` 增加「無相機環境 CPU 檢測正常、CCD 顯示不可用」；README 補 Sapera 版本對齊的部署說明。
 - [ ] 相機機台有 `LSI8181_64.dll` 時，建立預設 `MainWindow` 的 unit tests 可能在事件迴圈中觸發米輪自動連線並寫入已存設定；評估測試環境預設以 `VISIONFLOW_LSI8181_DLL` 指向不存在路徑隔離硬體。
-- [ ] 實機驗收（在相機機台執行，未實測不得勾選）：連線／斷線重複；Exposure、Gain、Length、Internal Line Rate 讀回與畫面效果；Continuous 沒有 Sapera 警告視窗；External Trigger 一個脈衝一條線、湊滿 Length 才顯示；One Frame；Software Trigger 監控與擷取中 Stop；米輪自動連線、重開後設定保留、Encoder 正反向計數與倍頻、Compare 自動遞增、錯誤卡片 ID 的狀態碼訊息、示波器確認 CMP_OUT 脈寬與 CMP0–7；16384×50000 各格式存圖時間；連續取像＋存圖＋檢測長時間穩定、記憶體平台與 GUI 回應。
+- [ ] 【實物】實機驗收（在相機機台執行，未實測不得勾選）：連線／斷線重複；Exposure、Gain、Length、Internal Line Rate 讀回與畫面效果；Continuous 沒有 Sapera 警告視窗；External Trigger 一個脈衝一條線、湊滿 Length 才顯示；One Frame；Software Trigger 監控與擷取中 Stop；米輪自動連線、重開後設定保留、Encoder 正反向計數與倍頻、Compare 自動遞增、錯誤卡片 ID 的狀態碼訊息、示波器確認 CMP_OUT 脈寬與 CMP0–7；16384×50000 各格式存圖時間；連續取像＋存圖＋檢測長時間穩定、記憶體平台與 GUI 回應。
 
 ### 暫不移植
 
@@ -795,12 +796,12 @@ vs 原本 `[255,255,20,20]`）。因此「標籤編號順序」對 202 的最終
 
 ### Production recipes、GUI、打包與壓測
 
-- [ ] `PRODUCT_A_AOI_01.yaml` PASS/NG 樣本一致。
-- [ ] `PRODUCT_A_CIRCLE_401_1_AOI_01.yaml` PASS/NG 樣本一致。
-- [ ] `PRODUCT_A_NEGATIVE_401_AOI_01.yaml` PASS/NG 樣本一致。
-- [ ] `PRODUCT_A_WHITE_RATIO_401_2_AOI_01.yaml` PASS/NG 樣本一致。（2026-09-14 依使用者指示暫緩：401-CS-AP-2 可能不再使用、僅保留）
-- [ ] `PRODUCT_A_FRAME_900_AOI_01.yaml` PASS/NG 樣本一致。（2026-09-14 依使用者指示暫緩：900-CS-AP-1 暫時不用、僅保留）
-- [ ] 比較 tiles、PASS/NG、defect count、bbox、area、confidence、metadata 與 fallback log。
+- [ ] 【實物】`PRODUCT_A_AOI_01.yaml` PASS/NG 樣本一致。
+- [ ] 【實物】`PRODUCT_A_CIRCLE_401_1_AOI_01.yaml` PASS/NG 樣本一致。
+- [ ] 【實物】`PRODUCT_A_NEGATIVE_401_AOI_01.yaml` PASS/NG 樣本一致。
+- [ ] 【實物】`PRODUCT_A_WHITE_RATIO_401_2_AOI_01.yaml` PASS/NG 樣本一致。（2026-09-14 依使用者指示暫緩：401-CS-AP-2 可能不再使用、僅保留）
+- [ ] 【實物】`PRODUCT_A_FRAME_900_AOI_01.yaml` PASS/NG 樣本一致。（2026-09-14 依使用者指示暫緩：900-CS-AP-1 暫時不用、僅保留）
+- [ ] 【實物】比較 tiles、PASS/NG、defect count、bbox、area、confidence、metadata 與 fallback log。
 - [ ] GUI 的 recipe 儲存/載入、viewer backend、status、overlay、輸出與 fallback 正確。
 - [ ] 打包版在有 NVIDIA GPU 與無 NVIDIA GPU 電腦均完成驗證。（目前無 GPU 電腦已完成 CPU-compatible package build 與 bundled recipe/MainWindow smoke；有 GPU 電腦待驗收）
 - [ ] warm-up 5 張後測 10、100、1000 張；VRAM 穩定、GUI 可回應、無 crash/error。（validator/workflow 已加入 checkpoints、allocation/VRAM/median/P95；待 RTX 執行）
@@ -830,7 +831,7 @@ vs 原本 `[255,255,20,20]`）。因此「標籤編號順序」對 202 的最終
 - [x] 在 `core/` 建立 detector-neutral 的 AI model/session manager；cache key 至少包含 model SHA-256、backend、device、precision 與 input shape，GUI preview、單張檢測、batch 與 monitor 共用 session，不得由每個 worker 各載入一份模型。
 - [ ] session 支援明確 `close()`、warm-up、bounded batch queue、VRAM budget、模型切換安全釋放及 cache invalidation；同一模型連續執行不得重複載入。
   - [x] 已完成 `close()`、warm-up、bounded inference queue、LRU cache 上限、模型/backend 選擇性 invalidation、安全等待 active inference 結束及 session/queue metrics；同模型連續執行與 batch/monitor 實測只載入一次。
-  - [ ] production 模型的實際 VRAM budget 與模型切換峰值仍需在 RTX 3090 量測後定案。
+  - [ ] 【實物】production 模型的實際 VRAM budget 與模型切換峰值仍需在 RTX 3090 量測後定案。
 - [x] 沿用 `gpu.mode` 與 `fallback_to_cpu`：`cpu` 只使用 ONNX Runtime CPU；`auto` 的 CUDA/TensorRT 初始化或推論失敗時，只有在存在相容 ONNX reference model 時才整個 detector 於 CPU 重跑；`cuda` 必須明確失敗且禁止 silent fallback。
 - [ ] TensorRT engine 必須與 GPU compute capability、TensorRT/CUDA 版本及模型 SHA-256 綁定；不相容時不可載入舊 engine。FP16 通過精度驗收後才可選，INT8 需保存校正資料集版本與精度報告。
 - [x] AI inference 與既有傳統 CV 共用 `GpuExecutionSession` execution scope；YOLOX 另有 bounded inference queue 與 metrics，batch/monitor 停止會在目前影像完成後收斂，CUDA stability validator 以 `nvidia-smi` 記錄 process VRAM，避免 YOLOX session 和 CUDA DLL 工作同時無限制搶占 GPU。
@@ -848,10 +849,10 @@ vs 原本 `[255,255,20,20]`）。因此「標籤編號順序」對 202 的最終
 - [x] 測試 invalid model/manifest、缺少 execution provider、CUDA OOM、推論中斷、輸出 shape 錯誤、空 detection、單框、多框、高重疊同類／跨類、邊界框、非方形影像、極小 ROI、灰階輸入及 Unicode 路徑。
 - [ ] 驗證 GUI、CLI、batch、monitor 與 PyInstaller package；無 NVIDIA GPU 電腦可使用 reference CPU model，有 GPU 電腦連續執行 1000 張後 session 數量與 VRAM 位於穩定平台，且停止/切換模型無 crash 或 stale result。
   - [x] CPU reference 已覆蓋 GUI Recipe、CLI、batch、monitor、Unicode 路徑與 PyInstaller bundled YOLOX smoke；本機 warm-up 5 後執行 1000 次，session/load count 固定 1、輸出 deterministic、RSS 由 69,177,344 增至 69,484,544 bytes，validator 通過。
-  - [ ] RTX 3090 尚需以 production 模型連續 1000 張驗證 session 數量、VRAM 平台、停止與模型切換。
-- [ ] 建立人工標註 acceptance set，以 precision、recall、mAP50、誤殺率、漏檢率及每類 confusion matrix 驗收；`confidence_threshold` 與 `nms_iou_threshold` 的 production 預設值必須由該資料集決定，不以範例預設值直接上線。
+  - [ ] 【實物】RTX 3090 尚需以 production 模型連續 1000 張驗證 session 數量、VRAM 平台、停止與模型切換。
+- [ ] 【實物】建立人工標註 acceptance set，以 precision、recall、mAP50、誤殺率、漏檢率及每類 confusion matrix 驗收；`confidence_threshold` 與 `nms_iou_threshold` 的 production 預設值必須由該資料集決定，不以範例預設值直接上線。
   - [x] 已建立 `gpu/yolox_acceptance.example.yaml` 與 `gpu/validate_yolox_acceptance.py`；檢查 PASS/NG coverage、標註 bbox 邊界、production/test-only 模型隔離、backend、單一 session，並輸出完整指標與 JSON 證據。
-  - [ ] 尚待 production ONNX 權重、實際 AOI 標註影像與門檻，由正式 acceptance set 決定 production 預設值。
+  - [ ] 【實物】尚待 production ONNX 權重、實際 AOI 標註影像與門檻，由正式 acceptance set 決定 production 預設值。
 
 - [ ] 導入模型時比較 PyTorch CUDA、ONNX Runtime CUDA 與 TensorRT 的部署及效能。
 - [ ] 模型/session 只載入一次並常駐 GPU；支援 batch inference 與固定輸入尺寸。
@@ -884,23 +885,25 @@ vs 原本 `[255,255,20,20]`）。因此「標籤編號順序」對 202 的最終
 
 - [ ] 先建立可散佈的小型分類 ONNX fixture，覆蓋 registry／manifest、前處理 pixel equivalence、logits／Softmax、PASS／NG、低信心、完整 ROI bbox、metadata、Recipe round trip、Unicode 路徑、空／灰階／非方形／極小 ROI、錯誤 shape／class count 與 deterministic ordering。
 - [ ] 定義 ONNX Runtime CPU 為分類 correctness reference；分別驗證 ONNX Runtime CUDA、TensorRT FP32、TensorRT FP16 的 raw logits／probability、Top-1、PASS/NG 與門檻邊界容差。任何 class、PASS/NG、數量或排序不等價都不得預設啟用 GPU／FP16。
-- [ ] 使用真實 AOI 人工標註 acceptance set，依產品、lot、日期、機台／相機與光源切分，避免同一生成器或近重複樣本跨 train/test；至少輸出正常品過殺率、所有缺陷合併漏檢率、各缺陷 precision／recall／F1、confusion matrix、confidence calibration 與 Wilson CI。合成資料與隨機同分布 100% accuracy 不可作為量產驗收。
+- [ ] 【實物】使用真實 AOI 人工標註 acceptance set，依產品、lot、日期、機台／相機與光源切分，避免同一生成器或近重複樣本跨 train/test；至少輸出正常品過殺率、所有缺陷合併漏檢率、各缺陷 precision／recall／F1、confusion matrix、confidence calibration 與 Wilson CI。合成資料與隨機同分布 100% accuracy 不可作為量產驗收。
 - [ ] 先確認分類適用範圍：輸入必須是已定位且語意單一的元件／ROI；若同一 ROI 可能同時有多個缺陷、需要精確座標或大圖搜尋，改採 object detection／segmentation，不以 ROI-level classifier 取代定位模型。
-- [ ] 在 RTX 3090 以 production 模型完成 warm-up 5 後 10／100／1000 張與模型切換／停止測試；確認 session/load count、VRAM 平台、queue、GUI 回應、無 crash/OOM/stale result，並與 ONNX Runtime CPU／CUDA 比較端到端效能。未達精度、穩定性或至少 1.5 倍目標加速時維持 CPU／GPU 預設關閉。
+- [ ] 【實物】在 RTX 3090 以 production 模型完成 warm-up 5 後 10／100／1000 張與模型切換／停止測試；確認 session/load count、VRAM 平台、queue、GUI 回應、無 crash/OOM/stale result，並與 ONNX Runtime CPU／CUDA 比較端到端效能。未達精度、穩定性或至少 1.5 倍目標加速時維持 CPU／GPU 預設關閉。
 - [ ] 驗證 CLI、GUI 單張、batch、monitor、Reporter、NG tile／sidecar、PyInstaller CPU-compatible 與 CUDA-enabled package；無 NVIDIA GPU 可用 ONNX CPU，engine 缺少／不相容可安全 fallback，strict CUDA 明確失敗，且 VisionFlow 發行包不包含任何訓練功能。
 
 ## 最終驗收門檻
 
 - [x] CPU-only 是完整受支援模式，沒有 CUDA/NVIDIA GPU 仍可啟動 GUI、CLI、batch 與 monitor。
-- [ ] 五個 production recipes 通過 CPU/GPU 等價規則，沒有未解釋的 fallback。
+- [ ] 【實物】五個 production recipes 通過 CPU/GPU 等價規則，沒有未解釋的 fallback。
 - [x] 每個 GPU plan 原則上每張輸入最多一次 upload 與一次必要 download；resident ROI plan 額外 H2D 為零。
 - [x] native plan/context 預留並重用 operator buffers，相同 shape warm-up 後不再逐 operator `cudaMalloc/cudaFree`。
 - [ ] 連續 1000 張後 VRAM 位於穩定平台，沒有資源洩漏或程序崩潰。
-- [ ] GPU 純檢測 median 與 P95 在目標資料集均優於 CPU；目標加速門檻為至少 1.5 倍。
+- [ ] 【實物】GPU 純檢測 median 與 P95 在目標資料集均優於 CPU；目標加速門檻為至少 1.5 倍。
 - [x] 未達 RTX 效能門檻的 production recipe/operator 保持 CPU、GPU 預設關閉。
 - [ ] 加速不得犧牲 GUI 回應、打包啟動、結果追溯、錯誤訊息或 CPU fallback。
 
 ## 完成紀錄
+
+- [x] 2026-09-17：依使用者說明「本開發機永遠不會有實物照片，產線數據也不會回饋到本機」，新增 `【實物】` 標記並在「開發原則」加入定義與列出指令。逐項檢查所有未勾選項目，標記 41 項完成或勾選必須依賴實物者：真實產品影像／production 樣本與 manifest（P0 測試集、五份 production Recipe PASS/NG、四個 Detector 真圖驗收、Gaussian／形態學／大圖 ROI 直通的真圖量測、sysmem 溢出、P9 production 資料集、production 預設 mode、最終驗收的 production 等價與目標資料集加速）、AI 的 production 模型與人工標註 acceptance set，以及 P11 需 Sapera 相機、LSI-8181 卡或相機機台的綁定與實機項目（pythonnet spike、Sapera 物件清理、版本不符偵測、server／resource 列舉、硬體寫入路徑、Trigger 寫入、Live Features 診斷、`SapBuffer` 交接、`Freeze()` 語意、存圖並行數實機比較、米輪連線套用、大 frame 量測、並行壓測、實機驗收）。合成圖、fake backend、stub DLL 可完成的項目不標記。未改變任何 checkbox 狀態；僅文件變更。
 
 - [x] 2026-09-17：整理根目錄散落的 8 支 `build_*.ps1` 與 7 個 `*.spec`，全數移入 `packaging/`：建置腳本集中 `packaging/scripts/`、PyInstaller spec 集中 `packaging/specs/`，根目錄不再有封裝入口。因 PyInstaller 6.21 以 `SPECPATH`（spec 所在目錄）解析 spec 內相對路徑，每個 spec 改以 `SPEC_DIR = Path(SPECPATH).resolve()`、`ROOT = SPEC_DIR.parent.parent` 推導 repository 根目錄後把來源接成絕對路徑；8 支腳本改用 `$RepoRoot = (Resolve-Path (Join-Path $PSScriptRoot "..\..")).Path` 回推根目錄，`dist\`、`build\`、`release_artifacts\` 產物位置與 PyInstaller 參數維持不變。新增 `packaging/README.md` 記錄入口對照表與維護規則。過程中實測 Windows PowerShell 5.1 會把無 BOM 的 UTF-8 當 ANSI 讀取，中文註解連行尾一起被吃掉而使 `$RepoRoot` 變成 `$null`，故 `.ps1`／`.spec` 內註解一律維持純 ASCII 並以契約測試防止復發。同步更新 `AGENT.md`（封裝入口與 `packaging/` 模組邊界）、`README.md`、`tools/README.md`、`release_artifacts/README.md`、`contour_preprocess_tool/README.md`、`docs/README.md`、`docs/reports/FEATURE_VALIDATION_VERSION_CONTROL_REPORT.md`、`codex-skills` 與 `.claude` 兩份 `aoi-release` skill、`.github/workflows/weekly-packaging.yml`，以及 `tests/test_utility_packaging.py`、`tests/test_gui_threading_packaging.py`（新增根目錄不得再出現 `*.ps1`／`*.spec`、每個 spec 都有建置腳本引用、spec 與腳本的 root 推導慣例、腳本不得再以 `$PSScriptRoot` 當根目錄等契約）。實跑 `packaging\scripts\build_ng_tile_area_tool.ps1` exit 0、`packaging\scripts\build_exe.ps1` exit 0（含 CUDA DLL），packaged `--smoke-test` exit 0，包內 6 recipes、1 CUDA DLL、`build_provenance.json` 與 YOLOX model 齊備；完整 582 tests、compileall、CUDA source preflight、`git diff --check` 通過。歷史完成紀錄與週報保留當時檔名不追改。未修改 runtime、Detector、Recipe、CUDA source／header／ABI／DLL。
 
