@@ -9,10 +9,11 @@ from pathlib import Path
 from core.ai_runtime import AiModelSessionManager
 from core.detector_manager import DetectorManager
 from core.gpu_runtime import GpuRuntime, GpuRuntimeError
+from core.logging_system import LogMixin
 from core.recipe_manager import RecipeManager
 
 
-class GpuExecutionSession:
+class GpuExecutionSession(LogMixin):
     """Own one long-lived runtime/context shared by compatible pipeline runs."""
 
     def __init__(
@@ -98,10 +99,6 @@ class GpuExecutionSession:
         "save_debug_images": False,
     }
 
-    @property
-    def fallback_to_cpu(self) -> bool:
-        return self._fallback_to_cpu
-
     def warm_up(self, recipe_path: Path, image_path: Path | None = None, progress_callback=None) -> dict:
         """Pay the first-inspection cost on this session before the first real image.
 
@@ -173,6 +170,51 @@ class GpuExecutionSession:
             summary["status"] = "warmed"
         report(100, "GPU 預熱完成")
         return summary
+
+    def warm_up_before_run(self, recipe_path: Path, image_path: Path | None = None, progress_callback=None) -> dict:
+        """Prepare this session before a batch or monitor run and enforce ``gpu.mode`` up front.
+
+        Batch passes no image: a sample run costs more than the one-time cold start it would save,
+        and the DLL/CUDA context already exists once the session is built, so only its state is
+        recorded. Monitor passes the operator's loaded image because it waits for the first product
+        anyway. ``gpu.mode: cuda`` raises before the run when CUDA is unavailable or the warm-up
+        fails, instead of turning every image into an ERROR; ``auto`` records the reason and the
+        run continues on the normal per-image fallback path.
+        """
+        sample_missing = image_path is not None and not Path(image_path).is_file()
+        if sample_missing:
+            self.logger.warning("GPU warm-up sample image is missing, using context only: %s", image_path)
+            image_path = None
+        strict = self.requested and not self._fallback_to_cpu
+        try:
+            summary = self.warm_up(Path(recipe_path), image_path, progress_callback=progress_callback)
+        except Exception as exc:
+            if strict:
+                raise
+            self.logger.warning("GPU warm-up failed, the run continues: %s", exc, exc_info=True)
+            summary = {"status": "failed", "image_used": image_path is not None, "reason": str(exc)}
+        if sample_missing:
+            summary["sample_image_missing"] = True
+        if strict and summary.get("status") == "unavailable":
+            raise GpuRuntimeError(f"嚴格 CUDA 模式無法開始檢測：{summary.get('reason', '')}")
+        return summary
+
+    @staticmethod
+    def warm_up_notice(summary: dict) -> str:
+        """Short operator-facing prefix for batch/monitor progress text; empty for CPU recipes."""
+        status = summary.get("status", "")
+        reason = str(summary.get("reason", "") or "")
+        if status == "warmed":
+            return "GPU 預熱完成；"
+        if status == "context_only":
+            return "已建立 CUDA context（第一張仍需配置裝置記憶體）；"
+        if status == "fallback":
+            return f"GPU 預熱時 Detector 改用 CPU：{reason}；"
+        if status == "unavailable":
+            return f"CUDA 不可用，改用 CPU：{reason}；"
+        if status == "failed":
+            return f"GPU 預熱失敗，繼續執行：{reason}；"
+        return ""
 
     @staticmethod
     def _context_summary(runtime) -> dict:

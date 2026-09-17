@@ -646,6 +646,7 @@ class GpuExecutionSessionTests(unittest.TestCase):
         fake_session = Mock()
         fake_session.__enter__ = Mock(return_value=fake_session)
         fake_session.__exit__ = Mock(return_value=None)
+        fake_session.warm_up_before_run.return_value = {"status": "not_requested"}
         captured_sessions = []
 
         def process(image_path, _output_dir, gpu_session):

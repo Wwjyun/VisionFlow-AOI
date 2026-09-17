@@ -64,6 +64,7 @@ class CsvSummaryWorkflowTests(unittest.TestCase):
         fake_session = Mock()
         fake_session.__enter__ = Mock(return_value=fake_session)
         fake_session.__exit__ = Mock(return_value=None)
+        fake_session.warm_up_before_run.return_value = {"status": "not_requested"}
         with tempfile.TemporaryDirectory(prefix="visionflow_batch_summary_") as temporary:
             root = Path(temporary)
             processor = BatchInspectionProcessor(root, root / "recipe.yaml", root / "output", max_workers=1)
@@ -92,8 +93,7 @@ class CsvSummaryWorkflowTests(unittest.TestCase):
         fake_session = Mock()
         fake_session.__enter__ = Mock(return_value=fake_session)
         fake_session.__exit__ = Mock(return_value=None)
-        fake_session.requested = False
-        fake_session.warm_up.return_value = {"status": "not_requested"}
+        fake_session.warm_up_before_run.return_value = {"status": "not_requested"}
         with tempfile.TemporaryDirectory(prefix="visionflow_monitor_summary_") as temporary:
             root = Path(temporary)
             processor = FolderMonitorProcessor(

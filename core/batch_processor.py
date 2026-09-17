@@ -5,6 +5,7 @@ import datetime
 import gc
 import os
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
@@ -118,11 +119,21 @@ class BatchInspectionProcessor(LogMixin):
         results_by_index: dict[int, BatchImageResult] = {}
         completed = 0
         worker_count = self._worker_count(total)
-        self._progress(0, f"批量檢測執行中，使用 {worker_count} 個 worker")
-
+        session_started = time.perf_counter()
         with self._opencv_thread_budget(worker_count), GpuExecutionSession.from_recipe_path(
             self.recipe_path, workload="throughput"
         ) as gpu_session:
+            # The DLL and CUDA context exist once the session is built, before any image is timed.
+            # No sample run: it would cost a full inspection to save a one-time allocation.
+            gpu_warmup = {
+                "session_ms": round((time.perf_counter() - session_started) * 1000.0, 1),
+                **gpu_session.warm_up_before_run(self.recipe_path),
+            }
+            self.logger.info("Batch GPU session ready: %s", gpu_warmup)
+            self._progress(
+                0,
+                f"{GpuExecutionSession.warm_up_notice(gpu_warmup)}批量檢測執行中，使用 {worker_count} 個 worker",
+            )
             with ThreadPoolExecutor(max_workers=worker_count) as executor:
                 futures = {
                     executor.submit(
@@ -157,6 +168,7 @@ class BatchInspectionProcessor(LogMixin):
 
         results = [results_by_index[index] for index in range(total)]
         summary = self._build_summary(started_at, batch_output_dir, results)
+        summary["gpu_warmup"] = gpu_warmup
         csv_summary_path = CsvSummaryExporter.write_summary(batch_output_dir / "csv")
         if csv_summary_path is not None:
             summary["csv_summary"] = str(csv_summary_path)

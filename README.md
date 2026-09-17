@@ -758,7 +758,9 @@ detectors:
 - GPU mode 統一為 `auto`、`cpu`、`cuda`：`auto` 依設定嘗試並可回退，`cpu` 不載入 CUDA，`cuda` 禁止隱性 CPU fallback；執行結果與 GUI 顯示的是實際 backend。
 - Recipe Designer 的「運算後端 GPU / CPU」以三個選項直接表達行為：「僅 CPU」（`mode: cpu`）、「GPU 優先，失敗改用 CPU」（`mode: auto`、`fallback_to_cpu: true`）、「僅 GPU（嚴格）」（`mode: cuda`）。舊 Recipe 的 `mode: auto` 搭配 `fallback_to_cpu: false` 行為等同嚴格模式，畫面會標示此情況，未變更選項時原值保存。狀態列會顯示 CUDA 是否可用、有幾個啟用中的 Detector 開啟 GPU，以及「切小圖使用 GPU」無效的組合。
 - GUI「檢測控制」面板的「GPU 預熱」會建立 CUDA context，並以目前影像試跑一次（不輸出任何檔案），讓第一張檢測不承擔初始化成本；RTX 3090 正式尺寸實測第一張由 2075.5 ms 降為 1859.2 ms。
-- 監控模式會在開始監控前自動預熱自己的 GPU session：有載入影像時以該影像試跑一次（不輸出、不計入監控結果），否則只建立 CUDA context。「GPU 優先」模式預熱失敗會記錄原因並繼續監控，「僅 GPU（嚴格）」會在監控開始前直接失敗。批量與監控目前不共用「GPU 預熱」按鈕建立的 session，按鈕預熱只影響單張檢測。
+- 監控模式會在開始監控前自動預熱自己的 GPU session：有載入影像時以該影像試跑一次（不輸出、不計入監控結果），否則只建立 CUDA context。「GPU 優先」模式預熱失敗會記錄原因並繼續監控，「僅 GPU（嚴格）」會在監控開始前直接失敗。
+- 批量模式在第一張開始計時前建立 CUDA context，但不以影像試跑（試跑成本高於一次性的冷啟動）；「僅 GPU（嚴格）」而 CUDA 不可用時，批量會在第一張前直接失敗。批量與監控的結果摘要都含 `gpu_warmup`（session 建立耗時與 context 狀態）。
+- 批量與監控目前不共用「GPU 預熱」按鈕建立的 session，按鈕預熱只影響單張檢測。
 
 目前 CUDA 原始碼包含 separable Gaussian、constant weights、64-bit integral Adaptive Mean Threshold、persistent context 與 grow-only buffers。這些功能仍需在目標 RTX 3090（`sm_86`）完成正式編譯、五份配方等價、效能、VRAM 與壓力驗收後，才能視為 production-ready 或預設啟用。
 
