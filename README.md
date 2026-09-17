@@ -185,14 +185,22 @@ AOI_CVbased/
 |   |-- recipe_io.py                # 版本化調參 Recipe JSON
 |   `-- app.py                      # Qt composition root 與背景 workers
 |-- models/yolox/                   # YOLOX model registry 與 checksum 保護的模型
+|-- devices/                        # 選配取像硬體：CCD 線掃相機與 LSI-8181 米輪
+|   |-- ccd_models.py               # 相機／觸發／存圖／米輪 typed value objects
+|   |-- interfaces.py               # LineScanCamera／MeterWheel backend 介面
+|   |-- simulated.py                # 無硬體模擬相機與米輪
+|   |-- factory.py                  # backend 選擇（不可用說明或模擬器）
+|   |-- ccd_settings_store.py       # 機台層設定檔 config/ccd_machine.json
+|   `-- frame_writer.py             # .tmp 原子寫入與有界背景存圖佇列
 |-- gui/
 |   |-- main_window.py
+|   |-- ccd_controller.py           # CCD 相機／米輪常駐 session、預覽轉換與存圖
 |   |-- workflow_controllers.py     # Batch／Monitor／Preview／Inspection thread lifecycle
 |   |-- designer_model.py           # Designer state、recipe mapper 與 validator
 |   |-- designer_panels.py          # 可獨立組合的 Designer panels
 |   |-- workers.py                  # Qt 背景工作執行緒
 |   |-- image_viewer.py
-|   |-- screens/                    # Run、Results、Designer、Monitor、Dashboard
+|   |-- screens/                    # Run、Results、Designer、Monitor、Dashboard、CCD 控制
 |   `-- widgets/                    # 共用 GUI 元件
 |-- gpu/
 |   |-- include/                    # 公開 C ABI 與內部 CUDA headers
@@ -603,7 +611,8 @@ Reference 配方使用的 `yolox_tiny_fixture.onnx` 只會輸出固定測試 ten
 主視窗標題為 `VisionFlow AOI`，包含下列畫面：
 
 - **執行檢測**：載入影像與配方、執行單張或資料夾批次檢測、查看最近紀錄。
-- **監控模式**：監控資料夾並逐張處理新加入且已穩定的影像。
+- **監控模式**：監控資料夾並逐張處理新加入且已穩定的影像；影像來源可切換為「相機直連」（檢測後端開發中）。
+- **CCD 控制**：線掃相機連線、預覽、擷取與保留影像，相機參數、觸發、存圖，以及 LSI-8181 米輪與 CMP0–CMP7（OP 模式不顯示）。
 - **Recipe 設計**：設定配方 metadata、切圖方式、Detector 開關與參數，並預覽 Tile。
 - **檢測結果**：查看最終結果、缺陷表格、縮圖及輸出路徑。
 - **批量數據圖表**：查看批次總量、PASS／NG／ERROR、缺陷統計與切圖散佈圖。
@@ -656,6 +665,19 @@ Worker 預設為 `min(8, CPU 核數, 影像數)`；可用 `AOI_BATCH_WORKERS` �
 
 監控預設每秒輪詢一次，需連續通過 2 次穩定檢查；若設定移動資料夾，會保留子資料夾結構並處理同名衝突。
 監控表格的「耗時」是每張影像的端到端時間：從檔案建立時間可落在前後兩次輪詢區間時的到達點（否則採首次觀測），包含輪詢發現、穩定檢查、等待前序影像、檢測、overlay／CSV／JSON 等報告寫檔、結果整理，以及處理後原圖搬移完成。逐圖資料的 `timing` 另提供 `discovery_and_stability_wait_sec`、`queue_wait_sec`、`pipeline_and_reports_sec`、`processed_image_move_sec` 與 `end_to_end_sec` 分項；因此它會高於只看 Detector 或 Pipeline 前段的時間。
+
+監控來源（監控資料夾／相機直連）只能在 Engineer 或 Admin 模式、且監控未執行時切換，選擇會在下次啟動時恢復。選擇「相機直連」時畫面改顯示相機連線狀態與觸發模式；相機影像自動送檢尚未實作，因此「啟動」會停用並說明原因。
+
+### CCD 控制
+
+CCD 控制頁移植自線掃相機擷取程式（C# `CameraCaptureApp`，Teledyne DALSA Sapera LT＋JS Automation LSI-8181），目前完成 GUI 與無硬體模擬，**尚未連接真實相機或米輪**：
+
+- 預設 backend 顯示「不可用」與原因，主程式其他功能不受影響。要在沒有硬體的電腦試用畫面，啟動前設定 `VISIONFLOW_CCD_SIMULATOR=1`，改用模擬相機與模擬米輪。
+- Engineer 可連線／斷線、開始預覽、停止、擷取、保留影像、設定存圖格式與資料夾、連線米輪；Admin 另可修改 Sapera 位置、曝光、增益、影像長度、內部線速率、觸發模式、米輪參數與 CMP0–CMP7。未明確開放給 Engineer 的控制一律只給 Admin。
+- 相機設定按「套用相機設定」後保存，**於下次連線時寫入相機**；已連線時畫面會標示「待重新連線寫入」。這沿用原程式的流程，因為 Sapera 建立取像物件後部分參數會鎖定。
+- 保留影像會以背景佇列寫入完整解析度影像，格式為 BMP（檢測交接用）、PNG、TIF 或 TIF（不壓縮）；先寫 `.tmp` 再更名，預設資料夾為 `outputs\ccd_snapshots`。存圖未完成時無法關閉程式。
+- 機台層設定（Sapera 位置、米輪卡片 ID 與參數、CMP0–CMP7、存圖設定）保存於工作目錄的 `config\ccd_machine.json`；檔案損毀時改用預設值並提示，原檔不會被覆寫。曝光等產品層參數目前只保留在本次執行，之後會移入 Recipe。
+- 米輪連線後每 200 ms 更新 Encoder／Compare；主程式啟動 1 秒後會依已存卡片 ID 自動連線，失敗只顯示提示。
 
 ## 輸出內容
 
@@ -946,7 +968,7 @@ release_artifacts\VisionFlow-AOI-vX.Y.Z-windows-x64.zip
 
 ```powershell
 .\env\Scripts\python.exe -m unittest discover -s tests -v
-.\env\Scripts\python.exe -m compileall main.py gui_launcher.py tools contour_preprocess_tool core detectors gui gpu
+.\env\Scripts\python.exe -m compileall main.py gui_launcher.py tools contour_preprocess_tool core detectors devices gui gpu
 .\env\Scripts\python.exe gpu\preflight_cuda_build.py
 git diff --check
 ```

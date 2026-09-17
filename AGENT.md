@@ -42,7 +42,8 @@ The normal development machine may not have `nvcc`, CMake, or an NVIDIA GPU. Nev
 - `core/`: pipeline, recipe loading/building, tiling, aggregation, reporting, profiling, batch/monitor processing, result schemas/compaction, GPU sessions/bridge, preprocessing plans and executors.
 - `detectors/`: detector-specific feature extraction, geometry, filtering, and result metadata.
 - `gpu/`: CUDA C ABI, kernels, persistent contexts, build scripts, native smoke tests, and CPU/GPU validation.
-- `gui/`: PySide6 screens, widgets, workers, status, and preview behavior.
+- `devices/`: optional acquisition hardware (CCD line-scan camera, LSI-8181 meter wheel): backend-neutral interfaces, typed settings, simulators, vendor bindings, machine-level settings store, and frame writing. No Qt imports.
+- `gui/`: PySide6 screens, widgets, workers, status, and preview behavior; `gui/ccd_controller.py` owns the long-lived CCD sessions.
 - `recipes/`: YAML configuration and production defaults.
 - `tests/`: automated correctness, fallback, routing, and regression tests.
 - `.github/workflows/`: CI only; keep GPU runtime jobs isolated from ordinary hosted runners.
@@ -99,6 +100,16 @@ Put behavior in the narrowest appropriate module. Do not duplicate pipeline or f
 - Keep hidden Results content lazy. Defer table/output population until the screen is opened and create large thumbnail collections in bounded event-loop batches so inspection completion remains responsive.
 - New operator-facing text is Traditional Chinese except established industrial abbreviations such as PASS, NG, ERROR, CPU, CUDA, ROI and DLL. Status must remain understandable without color alone and keyboard paths require tests.
 
+## CCD camera and meter wheel contract
+
+- Camera and meter wheel support is an optional capability like the CUDA DLL. Missing Sapera LT, pythonnet, `LSI8181_64.dll`, drivers, or hardware must never block GUI, CLI, batch, or monitor startup; the CCD screen shows the reason.
+- `xx_ccd/` (the C# `CameraCaptureApp`) is an untracked behavior reference only. Port its confirmed behavior into `devices/`; never import, embed, or launch it at runtime.
+- Camera settings are written to hardware only on connect; applying while connected marks a pending reconnect. Keep only the hardware write paths confirmed in `xx_ccd/PROJECT_HANDOFF.md` and do not reintroduce feature probing.
+- `MainWindow` owns one `CcdController`; screens never own or disconnect devices. Driver callbacks only hand off frames; preview conversion, saving, and status refresh run elsewhere, and older preview frames may be dropped.
+- Machine-level settings live in the CCD machine settings store, not in Recipes. Product-level camera parameters belong to the Recipe `camera` section once implemented.
+- CCD controls are fail-closed through `AccessGate`: only controls explicitly registered for engineers are available in Engineer mode, OP cannot open the screen, and programmatic loads never write hardware or settings.
+- Do not mark CCD or meter wheel items hardware-validated until they run on the camera machine.
+
 ## Detector parameter access contract
 
 - Every registered Detector parameter must be classified by the shared `ParameterSpec.parameter_group` contract as `outer` or `inner`. `parameter_group` is authoritative; the derived `engineer_visible` field exists only for compatibility and detector source must not set it directly.
@@ -143,7 +154,7 @@ Before finishing, always run:
 
 ```powershell
 .\env\Scripts\python.exe -m unittest discover -s tests -v
-.\env\Scripts\python.exe -m compileall main.py gui_launcher.py tools contour_preprocess_tool core detectors gui gpu
+.\env\Scripts\python.exe -m compileall main.py gui_launcher.py tools contour_preprocess_tool core detectors devices gui gpu
 .\env\Scripts\python.exe gpu\preflight_cuda_build.py
 git diff --check
 ```

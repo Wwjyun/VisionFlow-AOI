@@ -12,6 +12,7 @@ from gui.widgets.common import Badge, Chip, ProgressBar, Segmented
 
 SCREEN_TITLES = {
     "monitor": "監控模式",
+    "ccd": "CCD 控制",
     "run": "執行檢測",
     "designer": "Recipe 設計",
     "results": "檢測結果",

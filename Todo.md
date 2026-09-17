@@ -689,17 +689,18 @@ vs 原本 `[255,255,20,20]`）。因此「標籤編號順序」對 202 的最終
 
 ### 架構與模組邊界
 
-- [ ] 建議新增頂層 `devices/`（相機與米輪綁定、typed settings value objects、lifecycle），GUI 放 `gui/screens/ccd_screen.py` 與 `gui/workflow_controllers.py` 中的 CCD controller；GUI 不直接呼叫 Sapera 或 ctypes。實作時同步更新 `AGENT.md` 模組職責與 `README.md`。
-- [ ] 定義 backend-neutral `LineScanCamera`／`MeterWheel` 介面與 `FakeLineScanCamera`／`FakeMeterWheel`，runtime 相依一律注入，讓無硬體電腦與 CI 可測。
-- [ ] LSI-8181 以 ctypes 包裝 `LSI8181_64.dll`，函式與型別對照 `Native/Lsi8181Native.cs`（byte／ushort／short／int／uint 與 ref 參數），非 0 回傳碼轉成具名例外；DLL 與驅動不提交、不假設存在。
-- [ ] Lifecycle 明確：`close()`／context manager；每個 Sapera 物件個別 guarded destroy／dispose 並記 log，清理失敗不得傳到 UI thread；關閉主程式一定斷線。不使用持有相機、影像或設定的 mutable module global。
-- [ ] 相機與米輪 session 由 `MainWindow` composition root 擁有，不由頁面擁有；切換頁面或關閉子面板不得斷線。
+- [x] 新增頂層 `devices/`（`ccd_models.py` typed value objects、`interfaces.py`、`simulated.py`、`factory.py`、`ccd_settings_store.py`、`frame_writer.py`），GUI 放 `gui/screens/ccd_screen.py` 與 `gui/ccd_controller.py`（相機是常駐 session 而非單次 worker，因此不放 `workflow_controllers.py`）；GUI 不直接呼叫 Sapera 或 ctypes。`AGENT.md` 模組職責與 `README.md` 已同步。（2026-09-17）
+- [x] 定義 backend-neutral `LineScanCamera`／`MeterWheel` 介面與 `SimulatedLineScanCamera`／`SimulatedMeterWheel`，`MainWindow` 可注入 devices 與設定檔 store，無硬體電腦與 CI 可測；未設定 `VISIONFLOW_CCD_SIMULATOR=1` 時預設為「不可用」backend 並顯示原因。（2026-09-17）
+- [ ] LSI-8181 以 ctypes 包裝 `LSI8181_64.dll`，函式與型別對照 `Native/Lsi8181Native.cs`（byte／ushort／short／int／uint 與 ref 參數），非 0 回傳碼轉成具名例外；反向計數讀寫 CIO polarity，只切 A 相 bit 0 並保留其他 bit；DLL 與驅動不提交、不假設存在。實作 `MeterWheel` 介面後由 `devices/factory.py` 選用。
+- [ ] Lifecycle 明確：`close()`／context manager；每個 Sapera 物件個別 guarded destroy／dispose 並記 log，清理失敗不得傳到 UI thread；關閉主程式一定斷線。不使用持有相機、影像或設定的 mutable module global。（GUI 層已完成：`CcdController.close()` 停止輪詢、預覽 thread 與存圖佇列並關閉 devices，存圖未完成時阻止關窗；Sapera 物件清理待綁定實作。）
+- [x] 相機與米輪 session 由 `MainWindow` composition root 擁有的 `CcdController` 管理，不由頁面擁有；切換頁面不斷線，只有斷線按鈕或關閉主程式才釋放。（2026-09-17）
 - [ ] 偵測 Sapera runtime 與 managed DLL 版本不符（開發機 9.12、現場 8.6 曾出現 `FileLoadException`），以繁中 inline notice 顯示「Sapera runtime 版本不符」與兩個版本號，不得當成「沒有擷取卡」。
 
 ### 相機連線與參數（Sapera）
 
 - [ ] 以 Qt 對話框取代 `AcqConfigDlg`：列舉 server／resource、選 CCF；只找到一個 AcqDevice 時自動選取並提示。
-- [ ] 保留「離線修改 → 套用 → 重新連線才寫入硬體」流程（Sapera 建立 acquisition／buffer／transfer 後部分參數會鎖定）；畫面明確標示「下次連線生效」與待寫入的差異。
+- [x] 保留「離線修改 → 套用 → 重新連線才寫入硬體」流程（Sapera 建立 acquisition／buffer／transfer 後部分參數會鎖定）：設定只在 `connect()` 寫入；已連線時套用會顯示「待重新連線寫入」與提示文字。（2026-09-17）
+- [ ] **產品層相機參數接 Recipe `camera` 區段**：目前 Exposure／Gain／Length／Line Rate／Trigger 只保存在本次執行的 `CcdController`，重開程式回到預設；需加入 Recipe 選用 `camera` 區段、Designer dirty tracking、`RecipeManager` 驗證，舊 Recipe 無此區段時不得改動相機設定。自動存圖旗標目前存在機台設定檔，接 Recipe 時一併搬移。
 - [ ] 只移植已實機確認的寫入路徑，禁止重新加入探測式寫法：
   - Internal Line Rate：在 `SapAcquisition.Create()` 前建立 `SapAcqDevice`，將 `AcquisitionLineRate` 以 Int64 寫入並 `UpdateFeaturesToDevice()`；`INT_LINE_TRIGGER_ENABLE／FREQ`、`EXT_LINE_TRIGGER_ENABLE=0`、`SHAFT_ENCODER_ENABLE=0` 僅作輔助。不改寫 CCF，不探測 `LineRateAbs` 等候選。
   - Exposure：在 line rate 之後經 `SapAcqDevice` 寫入；不得設定 `ExposureStart` trigger source。
@@ -716,22 +717,22 @@ vs 原本 `[255,255,20,20]`）。因此「標籤編號順序」對 202 的最終
 
 ### 取像、預覽、存圖與分析工具
 
-- [ ] Sapera callback 只做最少交接：把 `SapBuffer` 複製到預先配置的 `uint8` 全解析度 frame，放入有界佇列；背景 worker 產生降採樣預覽，UI 只畫最新一張，允許丟棄舊預覽；不得每張建立全解析度 `QPixmap`（與 P6「大圖預覽記憶體與 LOD」共用實作，不另做一套）。預覽解析度文字顯示原始 frame 尺寸。
-- [ ] 取像狀態機：`capture_in_progress` 期間不得第二次 `Snap()` 或開始 preview；Stop 在擷取中不呼叫 `Freeze()`，停止後續觸發並讓目前 frame 收完；stop 後短暫 cooldown；連線／斷線清除上述狀態。按鈕 enable 跟隨連線、預覽與忙碌狀態。
-- [ ] 狀態呈現遵守 GUI 契約：TopBar 只放全域狀態，CCD 頁顯示 Connection／Camera／Resolution／Trigger／Signal／Lines／State，status bar 只放短事件；狀態不得只靠顏色，並補鍵盤操作測試。
-- [ ] 存圖：BMP（檢測交接）與 PNG／TIF／TIF 不壓縮（保存），先寫 `.tmp` 再 rename；有界存圖佇列，最大並行數可設定（C# 固定 5，需在實機比較 2／3／5）；進度顯示在頁內，不另開 modal 視窗。手動保留影像存到可設定資料夾。
+- [ ] Sapera callback 只做最少交接：把 `SapBuffer` 複製到預先配置的 `uint8` 全解析度 frame，放入有界佇列；背景 worker 產生降採樣預覽，UI 只畫最新一張，允許丟棄舊預覽；不得每張建立全解析度 `QPixmap`（與 P6「大圖預覽記憶體與 LOD」共用實作，不另做一套）。預覽解析度文字顯示原始 frame 尺寸。（GUI 端已完成：frame listener 只交接，`PreviewFrameConverter` 單一背景 thread 只轉最新一張、`INTER_AREA` 降到 2048 px 內，UI 只建立預覽大小的 pixmap 並顯示原始／預覽尺寸；Sapera buffer 複製待綁定。）
+- [ ] 取像狀態機：`capture_in_progress` 期間不得第二次 `Snap()` 或開始 preview；Stop 在擷取中不呼叫 `Freeze()`，停止後續觸發並讓目前 frame 收完；stop 後短暫 cooldown；連線／斷線清除上述狀態。按鈕 enable 跟隨連線、預覽與忙碌狀態。（介面契約、模擬相機與按鈕 enable 已完成並有測試；Sapera `Freeze()` 語意與 stop cooldown 待綁定。）
+- [x] 狀態呈現遵守 GUI 契約：TopBar 只放標題與全域狀態，CCD 頁「相機狀態」顯示連線／相機／解析度／觸發／訊號／累計線數／狀態／設定寫入狀態，錯誤走 inline notice、status bar 只放短事件；狀態全部有文字，CCD 按鈕有鍵盤操作測試。（2026-09-17）
+- [ ] 存圖：BMP（檢測交接）與 PNG／TIF／TIF 不壓縮（保存），先寫 `.tmp` 再 rename；有界存圖佇列，最大並行數可設定（C# 固定 5，需在實機比較 2／3／5）；進度顯示在頁內，不另開 modal 視窗。手動保留影像存到可設定資料夾。（已完成：四種格式無損、`.tmp`→rename、失敗清除暫存、`SnapshotSaveQueue` 上限 16 筆、預設 2 workers、頁內進度與失敗計數、存圖未完成阻止關窗、可設定資料夾；待完成：GUI 調整並行數與實機 2／3／5 比較。）
 - [ ] 自動存圖依模式分開：External Trigger One Frame 與 Software Trigger 各自 gating，同一張 frame 不得存兩次。
 - [ ] 滾動式拍照：張數上限 100、上到下／下到上方向；存圖前先 snapshot 目前 frames，背景存完整合成圖。
 - [ ] 灰階波形：在 viewer 上拖線，Shift 依 0–30°水平、31–59°45°、60–90°垂直吸附；相機影像取全解析度 frame 而非預覽，大圖依 tile 分組批次取樣；波形視窗 Y 固定 0–255、每 16 灰階一條輔助線、滾輪縮放、左鍵框選、右鍵重設、可調整大小。一般載入影像也可使用。
 
 ### 米輪（LSI-8181）
 
-- [ ] 主程式啟動約 1 秒後依儲存的 card ID 自動連線；失敗寫 log 並以 inline notice 顯示，不跳 modal、不阻擋啟動。
-- [ ] 控制項：card ID 0–15、連線／斷線、encoder 每 200 ms 更新、encoder 清除／設定、compare 清除／設定（compare 值由使用者輸入，Set 時不得用即時 encoder 覆蓋）、auto increment、倍頻 X4／X2／X1（沿用原廠順序）、反向（讀寫 CIO polarity，只切 A 相 bit 0 並保留其他 bit）、CMP Out Width。
+- [x] 主程式啟動 1 秒後依儲存的 card ID 自動連線；後端不可用時略過，失敗寫 log 並以 warning inline notice 顯示，不跳 modal、不阻擋啟動。（2026-09-17，實機驗收見下方）
+- [x] 控制項：card ID 0–15、連線／斷線、encoder 每 200 ms 更新、encoder 清除／設定、compare 清除／設定（compare 值由使用者輸入，Set 時不得用即時 encoder 覆蓋；清除只寫 0 到卡片、不覆蓋已存原點值）、auto increment、倍頻 X4／X2／X1（沿用原廠順序）、反向、CMP Out Width；變更即保存到機台設定檔，已連線才寫硬體。（2026-09-17，CIO polarity 寫法屬 LSI 綁定項目）
 - [ ] 連線時套用已存設定：quadrature 模式、倍頻、方向、compare auto increment 與 increment、CMP_OUT pulse 輸出、`LSI8181_toggle_preset(card, 1)`、CMP0–7、以 compare 輸出模式啟動 counter。
-- [ ] Extension compare CMP0–7：mask、offset、pulse width、output state、status 每 200 ms 更新；mask 開啟時 output state 清除並停用；套用時寫入 8 個通道並保存。
+- [x] Extension compare CMP0–7（僅管理模式可見）：mask、offset、pulse width、output state、status 每 200 ms 更新並以 ON／OFF 文字顯示；mask 開啟時 output state 清除並停用；套用時寫入 8 個通道並保存。（2026-09-17）
 - [ ] 不得以 `LSI8181_CO_read == 1` 判斷 CMP OUT 已啟用（它是瞬時輸出狀態，脈衝之間可能是 0）。
-- [ ] 載入已存值到控制項時不得觸發寫硬體或存檔（比照 Designer 程式載入不產生 dirty）；encoder／compare 輸入值只保存，不在開頁時自動寫入硬體。
+- [x] 載入已存值到控制項時不得觸發寫硬體或存檔（比照 Designer 程式載入不產生 dirty）；encoder／compare 輸入值只保存，不在開頁時自動寫入硬體；attach 畫面不寫設定檔。（2026-09-17）
 
 ### 觸發自動化
 
@@ -740,13 +741,15 @@ vs 原本 `[255,255,20,20]`）。因此「標籤編號順序」對 202 的最終
 
 ### 與檢測流程整合
 
+- [x] **監控模式影像來源選擇**（2026-09-17 使用者需求）：Monitor「監控來源」可選「監控資料夾」（原模式）或「相機直連」；工程／管理模式可切換，OP 與監控執行中不可切換；選擇以 QSettings 保存；相機直連時隱藏資料夾控制、顯示唯讀相機狀態與觸發模式，因檢測後端尚未完成而停用「啟動」並以文字說明。
+- [ ] **相機直連監控的檢測後端**：相機觸發完成的 frame 自動送入檢測並顯示在監控表格；依下方第一／第二階段決定實作方式，完成後移除「尚未實作」阻擋。只檢測觸發完成的 frame，不檢測預覽 frame。
 - [ ] 第一階段（低耦合）：CCD 自動存 BMP 到 Monitor 資料夾，由既有 `FolderMonitorProcessor` 檢測；確認 `.tmp`→rename 不會被半檔讀取，並保留 stable checks。
 - [ ] 第二階段（記憶體交接）：`AOIPipeline.run()` 目前只收影像路徑；新增 ndarray＋來源 metadata（相機、trigger mode、encoder 值、時間）的入口，檔案路徑語意不變。GPU mode 把相機 frame 視為已解碼影像，只上傳一次。相機是單通道，pipeline 以 BGR `uint8` 為主，16384×50000 單通道約 819 MB、轉 BGR 約 2.4 GB，須先量測轉換成本並評估灰階直通，不得改變 Detector 判定。結果追溯保存取像 metadata，並可選擇保存原圖。以量測決定是否取代第一階段。
 - [ ] 檢測與取像並行時，相機 callback、存圖佇列、檢測 worker 與 GPU session 互不阻塞；GUI 保持可回應。
 
 ### 測試、打包與實機驗收
 
-- [ ] 自動測試（fake backend，無硬體）：設定 round trip 與預設值、載入不觸發寫入、Trigger 互斥矩陣、Software Trigger 狀態機、忙碌／Stop 語意、自動存圖不重複、滾動合成順序、`.tmp` 存檔、波形吸附與取樣、缺 Sapera／缺 DLL 時主程式可啟動且 CCD 頁顯示不可用、OP／工程／管理可見性、GUI offscreen smoke。
+- [ ] 自動測試（fake backend，無硬體）：設定 round trip 與預設值、載入不觸發寫入、Trigger 互斥矩陣、Software Trigger 狀態機、忙碌／Stop 語意、自動存圖不重複、滾動合成順序、`.tmp` 存檔、波形吸附與取樣、缺 Sapera／缺 DLL 時主程式可啟動且 CCD 頁顯示不可用、OP／工程／管理可見性、GUI offscreen smoke。（`tests/test_ccd_devices.py`、`tests/test_ccd_gui.py` 已涵蓋設定 round trip／損毀檔、載入不寫入、Trigger 16 種組合、忙碌／Stop、`.tmp` 與四格式無損、存圖佇列上限、米輪保存與寫入、不可用後端、權限可見性、鍵盤、監控來源與關窗；待補：Software Trigger 監控、自動存圖、滾動、波形。）
 - [ ] 打包：Sapera runtime、`LSI8181_64.dll` 與驅動由現場安裝、不打包；若採 pythonnet 則打包其 runtime。packaged `--smoke-test` 增加「無相機環境 CPU 檢測正常、CCD 顯示不可用」；README 補 Sapera 版本對齊的部署說明。
 - [ ] 實機驗收（在相機機台執行，未實測不得勾選）：連線／斷線重複；Exposure、Gain、Length、Internal Line Rate 讀回與畫面效果；Continuous 沒有 Sapera 警告視窗；External Trigger 一個脈衝一條線、湊滿 Length 才顯示；One Frame；Software Trigger 監控與擷取中 Stop；米輪自動連線、重開後設定保留、示波器確認 CMP_OUT 脈寬與 CMP0–7；16384×50000 各格式存圖時間；連續取像＋存圖＋檢測長時間穩定、記憶體平台與 GUI 回應。
 
@@ -895,6 +898,8 @@ vs 原本 `[255,255,20,20]`）。因此「標籤編號順序」對 202 的最終
 - [ ] 加速不得犧牲 GUI 回應、打包啟動、結果追溯、錯誤訊息或 CPU fallback。
 
 ## 完成紀錄
+
+- [x] 2026-09-17：**P11 CCD 控制 GUI 第一階段與監控來源選擇。** 新增頂層 `devices/`：`ccd_models.py`（Trigger／存圖／米輪／CMP0–7 typed value objects，Trigger 規則對照 `xx_ccd`：Software Trigger 強制關閉 One Frame、Compare 跟隨只在 External＋One Frame、Encoder 跟隨需先勾 Compare）、`interfaces.py`（`LineScanCamera`／`MeterWheel`）、`simulated.py`、`factory.py`（預設「不可用」並說明原因，`VISIONFLOW_CCD_SIMULATOR=1` 改用模擬器）、`ccd_settings_store.py`（機台層 JSON `config/ccd_machine.json`，schema `visionflow-ccd-machine/v1`，`.tmp` 原子寫入，損毀或型別錯誤回預設、保留原檔並提示）、`frame_writer.py`（BMP／PNG／TIF／TIF 不壓縮、`.tmp`→rename、有界背景佇列）。GUI：NavRail 新增「CCD 控制」（OP 不可見），`CcdScreen` 含相機連線／預覽／擷取／保留影像、Sapera 位置與取像參數、觸發、存圖、米輪、CMP0–7；以 fail-closed `AccessGate` 讓工程模式只能操作、管理模式才能改參數；`CcdController` 由 `MainWindow` 擁有，設定只在連線時寫入並標示待重連、預覽只轉最新一張並降到 2048 px 內、米輪 200 ms 輪詢與啟動 1 秒自動連線、存圖未完成阻止關窗。依使用者需求，Monitor「監控來源」可選監控資料夾或相機直連，選擇保存於 QSettings，相機直連顯示唯讀相機狀態，檢測後端未完成前停用「啟動」並說明。產品層相機參數尚未接 Recipe，Sapera／LSI-8181 實際綁定與觸發自動化未開始；本機無相機，未做任何硬體驗證。新增 `tests/test_ccd_devices.py`（15）與 `tests/test_ccd_gui.py`（15）。
 
 - [x] 2026-09-17：批量模式預先建立 CUDA context：確認 context 原本就在批量 session 建構時（計時前）建立，將監控的開始前預熱與 `gpu.mode` 檢查抽成 `GpuExecutionSession.warm_up_before_run()`／`warm_up_notice()`，批量以不帶樣本方式呼叫。strict CUDA 不可用時批量在第一張前失敗（先前 3 張合成圖各回報一筆 ERROR），`auto` 記錄原因並完整處理，CPU Recipe 不受影響；批量／監控摘要皆有 `gpu_warmup`。測試改為 `tests/test_batch_monitor_warmup.py`（session 層 `gpu.mode` 語意、監控樣本、批量呼叫順序與輸出順序、空資料夾不建 session）；本機以缺 DLL 的真實 session 跑批量／監控 CPU、auto、strict 三種模式確認行為。本機無 CUDA，未做實機驗證。
 

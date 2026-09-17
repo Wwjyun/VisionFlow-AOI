@@ -9,6 +9,10 @@ venv/
 
 outputs_validation/
 outputs/logs/
+outputs/ccd_snapshots/
+# Machine-level CCD camera and meter wheel settings written by the GUI.
+/config/ccd_machine.json
+/config/ccd_machine.json.tmp
 tmp_validation_input.png
 tmp_validation_pass.png
 tmp_validation_gui.png

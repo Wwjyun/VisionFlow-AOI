@@ -26,12 +26,22 @@ from PySide6.QtWidgets import (
 from core.logging_system import LogMixin, configure_logging
 from core.gpu_session import GpuExecutionSessionCache
 from core.recipe_manager import RecipeError, RecipeManager
+from devices.ccd_models import CAMERA_STATE_LABELS, TRIGGER_MODE_LABELS, CameraStatus
+from devices.ccd_settings_store import CcdMachineSettingsStore
+from devices.factory import CcdDevices, create_ccd_devices
 from gui import theme
+from gui.ccd_controller import CcdController
 from gui.permission_manager import MODE_LABELS, ModePasswordPrompt, PermissionManager
 from gui.preferences import GuiPreferences
 from gui.screens.batch_dashboard_screen import BatchDashboardScreen
+from gui.screens.ccd_screen import CcdScreen
 from gui.screens.designer_screen import DesignerScreen
-from gui.screens.monitor_screen import MonitorScreen
+from gui.screens.monitor_screen import (
+    MONITOR_SOURCE_CAMERA,
+    MONITOR_SOURCE_FOLDER,
+    MONITOR_SOURCES,
+    MonitorScreen,
+)
 from gui.screens.results_screen import ResultsScreen, flatten_defects, flatten_viewer_overlays
 from gui.screens.run_screen import RunScreen
 from gui.widgets.common import InlineNotice, Toggle
@@ -59,9 +69,11 @@ from gui.workers import (
 # AOI Console — main window shell (rail + topbar + screens + status bar)
 # ============================================================
 
-SCREEN_INDEX = {"run": 0, "monitor": 1, "designer": 2, "results": 3, "batch_dashboard": 4}
+SCREEN_INDEX = {"run": 0, "monitor": 1, "designer": 2, "results": 3, "batch_dashboard": 4, "ccd": 5}
 ALL_SCREENS = set(SCREEN_INDEX)
 HISTORY_LIMIT = 6
+METER_WHEEL_AUTO_CONNECT_DELAY_MS = 1000
+CAMERA_MONITOR_PENDING_MESSAGE = "相機直連檢測尚未實作（P11），目前請改用監控資料夾模式。"
 
 OUTPUT_TOGGLE_LABELS = {
     "save_overlay": "儲存 overlay 影像",
@@ -136,6 +148,8 @@ class MainWindow(QMainWindow, LogMixin):
         settings: QSettings | None = None,
         permission_manager: PermissionManager | None = None,
         password_prompt: ModePasswordPrompt | None = None,
+        ccd_devices: CcdDevices | None = None,
+        ccd_settings_store: CcdMachineSettingsStore | None = None,
     ):
         super().__init__()
         app = QApplication.instance()
@@ -186,6 +200,7 @@ class MainWindow(QMainWindow, LogMixin):
         self.monitor_move_dir: Path | None = None
         self.monitor_running = False
         self.monitor_result: dict | None = None
+        self.monitor_source = MONITOR_SOURCE_FOLDER
         self._current_screen = "run"
         self._restored_viewer_zoom = 0.0
         self._restored_monitor_splitter_sizes: list[int] | None = None
@@ -220,6 +235,11 @@ class MainWindow(QMainWindow, LogMixin):
 
         self.recipe_manager = RecipeManager()
         self.recipe_panel = _RecipePanelCompatibility(self)
+        self.ccd_controller = CcdController(
+            ccd_devices or create_ccd_devices(),
+            ccd_settings_store or CcdMachineSettingsStore(),
+            parent=self,
+        )
 
         self._build_ui()
         self._connect_signals()
@@ -232,6 +252,13 @@ class MainWindow(QMainWindow, LogMixin):
         self._refresh_image_chip()
         self._update_run_ready()
         self.statusBar().showMessage("就緒")
+        if self.ccd_controller.load_error:
+            self._notice(self.ccd_controller.load_error, "warning")
+        QTimer.singleShot(
+            METER_WHEEL_AUTO_CONNECT_DELAY_MS,
+            self.ccd_controller,
+            self.ccd_controller.auto_connect_meter_wheel,
+        )
 
     @property
     def _preview_thread(self):
@@ -346,6 +373,7 @@ class MainWindow(QMainWindow, LogMixin):
         self.designer_screen = DesignerScreen()
         self.results_screen = ResultsScreen()
         self.batch_dashboard_screen = BatchDashboardScreen()
+        self.ccd_screen = CcdScreen()
 
         self.stack = QStackedWidget()
         self.stack.addWidget(self.run_screen)
@@ -353,6 +381,7 @@ class MainWindow(QMainWindow, LogMixin):
         self.stack.addWidget(self.designer_screen)
         self.stack.addWidget(self.results_screen)
         self.stack.addWidget(self.batch_dashboard_screen)
+        self.stack.addWidget(self.ccd_screen)
 
         content_wrap = QWidget()
         content_layout = QVBoxLayout(content_wrap)
@@ -443,6 +472,7 @@ class MainWindow(QMainWindow, LogMixin):
         self.run_screen.start_batch_requested.connect(self._run_batch_inspection)
         self.monitor_screen.choose_folder_requested.connect(self._choose_monitor_folder)
         self.monitor_screen.choose_move_folder_requested.connect(self._choose_monitor_move_folder)
+        self.monitor_screen.source_changed.connect(self._on_monitor_source_changed)
         self.monitor_screen.open_original_requested.connect(self._open_monitor_original_image)
         self.monitor_screen.start_requested.connect(self._start_monitoring)
         self.monitor_screen.stop_requested.connect(self._stop_monitoring)
@@ -458,6 +488,14 @@ class MainWindow(QMainWindow, LogMixin):
         self.results_screen.view_requested.connect(self._on_view_defect)
         self.results_screen.go_to_run_requested.connect(lambda: self._set_screen("run"))
         self.batch_dashboard_screen.go_to_run_requested.connect(lambda: self._set_screen("run"))
+
+        self.ccd_controller.notice.connect(self._notice)
+        self.ccd_controller.camera_status_changed.connect(self._on_ccd_camera_status_changed)
+        self.ccd_controller.camera_settings_changed.connect(
+            lambda _view: self._on_ccd_camera_status_changed(self.ccd_controller.camera_status())
+        )
+        self.ccd_controller.attach(self.ccd_screen)
+        self._on_ccd_camera_status_changed(self.ccd_controller.camera_status())
 
     # ------------------------------------------------------------------
     # screen / mode switching
@@ -506,6 +544,8 @@ class MainWindow(QMainWindow, LogMixin):
         self.rail.set_settings_visible(self.mode != "op")
         self.run_screen.set_mode(self.mode)
         self.designer_screen.set_mode(self.mode)
+        self.ccd_screen.set_mode(self.mode)
+        self._update_monitor_source_selectable()
         self._update_mode_status_label()
         if self.stack.currentIndex() != SCREEN_INDEX["monitor"] and "monitor" in visible_screens and self.mode == "op":
             self._set_screen("monitor")
@@ -540,6 +580,11 @@ class MainWindow(QMainWindow, LogMixin):
         self.run_screen.set_batch_folder(str(self.batch_dir) if self.batch_dir else None)
         self.monitor_screen.set_folder(str(self.monitor_dir) if self.monitor_dir else None)
         self.monitor_screen.set_move_folder(str(self.monitor_move_dir) if self.monitor_move_dir else None)
+        monitor_source = str(self.preferences.value("monitor/source", MONITOR_SOURCE_FOLDER) or "")
+        self.monitor_source = monitor_source if monitor_source in MONITOR_SOURCES else MONITOR_SOURCE_FOLDER
+        self.monitor_screen.set_source(self.monitor_source)
+        if self.monitor_source == MONITOR_SOURCE_CAMERA:
+            self.monitor_screen.set_progress(0, CAMERA_MONITOR_PENDING_MESSAGE)
 
         recipe_path = self.preferences.existing_path("paths/recipe")
         if recipe_path is not None:
@@ -564,6 +609,7 @@ class MainWindow(QMainWindow, LogMixin):
         self.preferences.set_value("paths/batch", str(self.batch_dir or ""))
         self.preferences.set_value("paths/monitor", str(self.monitor_dir or ""))
         self.preferences.set_value("paths/monitor_move", str(self.monitor_move_dir or ""))
+        self.preferences.set_value("monitor/source", self.monitor_source)
         self.preferences.set_value(
             "paths/yolox_model_directory", str(self.yolox_model_directory or "")
         )
@@ -746,10 +792,48 @@ class MainWindow(QMainWindow, LogMixin):
         self.monitor_screen.set_move_folder(str(self.monitor_move_dir))
 
     def _update_monitor_ready(self) -> None:
-        ready = self.monitor_dir is not None and self.recipe_path is not None and not self.monitor_running
+        # Camera-direct inspection is selectable but not runnable until its pipeline handoff exists.
+        ready = (
+            self.monitor_source == MONITOR_SOURCE_FOLDER
+            and self.monitor_dir is not None
+            and self.recipe_path is not None
+            and not self.monitor_running
+        )
         self.monitor_screen.set_ready(ready, self.monitor_running)
+        self._update_monitor_source_selectable()
+
+    def _update_monitor_source_selectable(self) -> None:
+        self.monitor_screen.set_source_selectable(self.mode != "op" and not self.monitor_running)
+
+    def _on_monitor_source_changed(self, source: str) -> None:
+        if self.monitor_running or source not in MONITOR_SOURCES:
+            self.monitor_screen.set_source(self.monitor_source)
+            return
+        self.monitor_source = source
+        self.monitor_screen.set_source(source)
+        self._update_monitor_ready()
+        if source == MONITOR_SOURCE_CAMERA:
+            self.monitor_screen.set_progress(0, CAMERA_MONITOR_PENDING_MESSAGE)
+        else:
+            self.monitor_screen.set_progress(0, "監控已就緒" if self.monitor_dir else "等待選擇資料夾與 Recipe")
+
+    def _on_ccd_camera_status_changed(self, status: CameraStatus) -> None:
+        camera_availability = self.ccd_controller.devices.camera.availability()
+        if not camera_availability.available:
+            text = "相機：不可用（請至 CCD 控制查看原因）"
+        else:
+            trigger = self.ccd_controller.camera_settings_view().trigger
+            parts = [f"相機：{CAMERA_STATE_LABELS[status.state]}"]
+            if status.camera_name:
+                parts.append(status.camera_name)
+            parts.append(f"觸發：{TRIGGER_MODE_LABELS[trigger.mode]}")
+            text = " · ".join(parts)
+        self.monitor_screen.set_camera_status_text(text)
 
     def _start_monitoring(self) -> None:
+        if self.monitor_source == MONITOR_SOURCE_CAMERA:
+            self._notice(CAMERA_MONITOR_PENDING_MESSAGE, "warning")
+            return
         if not self.monitor_dir:
             self._notice("請先選擇監控資料夾。", "warning")
             return
@@ -1236,9 +1320,14 @@ class MainWindow(QMainWindow, LogMixin):
             QMessageBox.information(self, "關閉視窗", "監控模式仍在執行中，請先停止監控。")
             event.ignore()
             return
+        if self.ccd_controller.has_pending_saves():
+            QMessageBox.information(self, "背景作業", "CCD 影像仍在儲存中，請等待完成後再關閉。")
+            event.ignore()
+            return
         if not self._confirm_discard_designer_changes():
             event.ignore()
             return
+        self.ccd_controller.close()
         self._inspection_gpu_sessions.close()
         self._save_preferences()
         super().closeEvent(event)

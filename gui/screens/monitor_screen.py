@@ -24,6 +24,9 @@ from gui.table_models import RowTableModel, StatusFilterProxyModel, TableColumn
 
 MONITOR_HISTORY_LIMIT = 200
 MONITOR_SEQUENCE_SCATTER_LIMIT = 50
+MONITOR_SOURCE_FOLDER = "folder"
+MONITOR_SOURCE_CAMERA = "camera"
+MONITOR_SOURCES = (MONITOR_SOURCE_FOLDER, MONITOR_SOURCE_CAMERA)
 
 
 def _format_duration(value: object) -> str:
@@ -39,12 +42,20 @@ def _format_duration(value: object) -> str:
 class MonitorControlPanel(Panel):
     choose_folder_requested = Signal()
     choose_move_folder_requested = Signal()
+    source_changed = Signal(str)
     start_requested = Signal()
     stop_requested = Signal()
 
     def __init__(self, parent=None):
-        super().__init__(title="監控資料夾", parent=parent)
+        self.source_segmented = Segmented(
+            [(MONITOR_SOURCE_FOLDER, "監控資料夾"), (MONITOR_SOURCE_CAMERA, "相機直連")],
+            value=MONITOR_SOURCE_FOLDER,
+        )
+        self.source_segmented.setToolTip("選擇監控影像來源")
+        super().__init__(title="監控來源", actions=self.source_segmented, parent=parent)
         self._folder: str | None = None
+        self._source = MONITOR_SOURCE_FOLDER
+        self.source_segmented.currentChanged.connect(self.source_changed.emit)
 
         self.folder_label = QLabel("尚未選擇資料夾")
         self.folder_label.setProperty("mono", "true")
@@ -58,6 +69,13 @@ class MonitorControlPanel(Panel):
         move_label.setStyleSheet(f"color: {COLORS['text_3']}; font-size: 12px;")
         self.move_folder_label = move_label
         self.add_widget(move_label)
+
+        self.camera_status_label = QLabel("相機：離線")
+        self.camera_status_label.setProperty("mono", "true")
+        self.camera_status_label.setWordWrap(True)
+        self.camera_status_label.setStyleSheet(f"color: {COLORS['text_2']}; font-size: 12px;")
+        self.camera_status_label.setVisible(False)
+        self.add_widget(self.camera_status_label)
 
         button_row = QWidget()
         button_layout = QHBoxLayout(button_row)
@@ -128,6 +146,23 @@ class MonitorControlPanel(Panel):
         self.move_folder_label.setStyleSheet(
             f"color: {COLORS['text_2'] if folder else COLORS['text_3']}; font-size: 12px;"
         )
+
+    def set_source(self, source: str) -> None:
+        self._source = source if source in MONITOR_SOURCES else MONITOR_SOURCE_FOLDER
+        self.source_segmented.setCurrent(self._source)
+        is_folder = self._source == MONITOR_SOURCE_FOLDER
+        for widget in (self.folder_label, self.move_folder_label, self.choose_button, self.move_folder_button):
+            widget.setVisible(is_folder)
+        self.camera_status_label.setVisible(not is_folder)
+
+    def source(self) -> str:
+        return self._source
+
+    def set_source_selectable(self, selectable: bool) -> None:
+        self.source_segmented.setEnabled(selectable)
+
+    def set_camera_status_text(self, text: str) -> None:
+        self.camera_status_label.setText(text)
 
     def set_ready(self, ready: bool, running: bool) -> None:
         self.choose_button.setEnabled(not running)
@@ -257,6 +292,7 @@ class MonitorTablePanel(Panel):
 class MonitorScreen(QWidget):
     choose_folder_requested = Signal()
     choose_move_folder_requested = Signal()
+    source_changed = Signal(str)
     open_original_requested = Signal(dict)
     start_requested = Signal()
     stop_requested = Signal()
@@ -310,6 +346,7 @@ class MonitorScreen(QWidget):
 
         self.control_panel.choose_folder_requested.connect(self.choose_folder_requested.emit)
         self.control_panel.choose_move_folder_requested.connect(self.choose_move_folder_requested.emit)
+        self.control_panel.source_changed.connect(self.source_changed.emit)
         self.control_panel.start_requested.connect(self.start_requested.emit)
         self.control_panel.stop_requested.connect(self.stop_requested.emit)
         self.table_panel.table.selectionModel().selectionChanged.connect(self._on_table_selection_changed)
@@ -321,6 +358,18 @@ class MonitorScreen(QWidget):
 
     def set_move_folder(self, folder: str | None) -> None:
         self.control_panel.set_move_folder(folder)
+
+    def set_source(self, source: str) -> None:
+        self.control_panel.set_source(source)
+
+    def source(self) -> str:
+        return self.control_panel.source()
+
+    def set_source_selectable(self, selectable: bool) -> None:
+        self.control_panel.set_source_selectable(selectable)
+
+    def set_camera_status_text(self, text: str) -> None:
+        self.control_panel.set_camera_status_text(text)
 
     def set_ready(self, ready: bool, running: bool) -> None:
         self.control_panel.set_ready(ready, running)
