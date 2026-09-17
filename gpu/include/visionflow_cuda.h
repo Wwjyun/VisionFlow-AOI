@@ -117,6 +117,26 @@ typedef struct VfCudaTimingsV1 {
     float total_device_ms;
 } VfCudaTimingsV1;
 
+/* Optional detailed accounting for context-owned cudaMalloc allocations.
+ * Driver/context overhead and allocations owned by other libraries/processes are intentionally
+ * excluded; compare reserved_bytes with process-level VRAM diagnostics when investigating gaps.
+ */
+typedef struct VfCudaContextMemoryStatsV1 {
+    uint32_t struct_size;
+    uint32_t version;
+    uint64_t reserved_bytes;
+    uint64_t peak_reserved_bytes;
+    uint64_t allocation_count;
+    uint64_t plan_bytes;
+    uint64_t resident_bytes;
+    uint64_t template_match_bytes;
+    uint64_t contour_bytes;
+    uint64_t median_bytes;
+    uint64_t gaussian_f32_bytes;
+    uint64_t cnr_mask_bytes;
+    uint64_t cnr_candidate_bytes;
+} VfCudaContextMemoryStatsV1;
+
 VF_CUDA_API int vf_gpu_abi_version(void);
 VF_CUDA_API int vf_gpu_device_count(void);
 VF_CUDA_API int vf_gpu_compute_capability(void);
@@ -128,6 +148,8 @@ VF_CUDA_API int vf_context_create(void** context);
 VF_CUDA_API int vf_context_destroy(void* context);
 VF_CUDA_API int vf_context_stats(
     void* context, uint64_t* reserved_bytes, uint64_t* allocation_count);
+VF_CUDA_API int vf_context_memory_stats_v1(
+    void* context, VfCudaContextMemoryStatsV1* stats);
 VF_CUDA_API int vf_context_last_timings(void* context, VfCudaTimingsV1* timings);
 VF_CUDA_API int vf_context_upload_u8(
     void* context,

@@ -16,6 +16,10 @@ CUDA backend 支援：
 - Shared-gray/multi-output `VfDagPlanDescV1`。
 - Resident image/ROI 與 coordinate ROI batch。
 - `VfCudaTimingsV1` CUDA event 分項。
+- `VfCudaContextMemoryStatsV1` 完整統計 context-owned device buffers：plan、resident、template
+  match、contour、median、float Gaussian、CNR mask 與 CNR candidate，並回報 current/peak。
+  這不包含 CUDA driver/JIT/context overhead；Python 對缺少此 optional export 的舊 DLL 仍退回
+  `vf_context_stats` legacy total，且以 `accounting` 欄位明確標示口徑。
 - 舊版 `vf_preprocess_401_2_u8` compatibility adapter。
 
 Gaussian kernel 3/5/7/9 使用與 OpenCV 相同的固定係數，其他 kernel 使用 OpenCV

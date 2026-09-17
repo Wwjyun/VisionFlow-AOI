@@ -47,6 +47,27 @@ function Get-OptionalProperty {
     return $DefaultValue
 }
 
+function Get-Sha256Hex {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Path
+    )
+
+    # Use the framework implementation instead of Get-FileHash. Some developer shells inherit a
+    # PowerShell 7 module path while running Windows PowerShell 5.1, which can shadow the compatible
+    # Microsoft.PowerShell.Utility module and make Get-FileHash unavailable after a successful build.
+    $stream = [System.IO.File]::OpenRead($Path)
+    $algorithm = [System.Security.Cryptography.SHA256]::Create()
+    try {
+        $bytes = $algorithm.ComputeHash($stream)
+        return ([System.BitConverter]::ToString($bytes)).Replace("-", "")
+    }
+    finally {
+        $algorithm.Dispose()
+        $stream.Dispose()
+    }
+}
+
 if ($Architecture -notmatch '^sm_\d{2,3}$') {
     throw "Invalid architecture '$Architecture'. Expected sm_86, sm_89, etc."
 }
@@ -251,11 +272,10 @@ foreach ($artifact in $publishArtifacts) {
 Write-Host "Published validated CUDA artifacts to: $projectDirectory"
 
 $artifactHashes = foreach ($artifact in $publishArtifacts) {
-    $hash = Get-FileHash -LiteralPath $artifact -Algorithm SHA256
     [pscustomobject]@{
         name = Split-Path -Leaf $artifact
         bytes = (Get-Item -LiteralPath $artifact).Length
-        sha256 = $hash.Hash
+        sha256 = Get-Sha256Hex -Path $artifact
     }
 }
 $commit = (& git -C $repositoryRoot rev-parse HEAD 2>$null | Select-Object -First 1)

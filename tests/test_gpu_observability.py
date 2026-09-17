@@ -11,7 +11,13 @@ import cv2
 import numpy as np
 import yaml
 
-from core.gpu_runtime import GpuResidentImage, GpuRuntime, GpuRuntimeError, _VfCudaTimingsV1
+from core.gpu_runtime import (
+    GpuResidentImage,
+    GpuRuntime,
+    GpuRuntimeError,
+    _VfCudaContextMemoryStatsV1,
+    _VfCudaTimingsV1,
+)
 from core.performance import PipelineProfiler
 from core.pipeline import AOIPipeline
 from core.preprocess_plan import (
@@ -122,6 +128,30 @@ class _FusedDll:
         value.synchronize_ms = 3.5
         value.morphology_ms = 1.5
         value.total_device_ms = 3.5
+        return 0
+
+
+class _DetailedMemoryDll(_FusedDll):
+    def __init__(self):
+        super().__init__()
+        self.vf_context_memory_stats_v1 = _Function(self._memory_stats)
+
+    @staticmethod
+    def _memory_stats(_context, stats):
+        value = stats._obj
+        if value.struct_size != ctypes.sizeof(_VfCudaContextMemoryStatsV1) or value.version != 1:
+            return 1
+        value.reserved_bytes = 4096
+        value.peak_reserved_bytes = 8192
+        value.allocation_count = 7
+        value.plan_bytes = 1000
+        value.resident_bytes = 2000
+        value.template_match_bytes = 300
+        value.contour_bytes = 200
+        value.median_bytes = 100
+        value.gaussian_f32_bytes = 96
+        value.cnr_mask_bytes = 200
+        value.cnr_candidate_bytes = 200
         return 0
 
 
@@ -512,6 +542,9 @@ class GpuRuntimeMetricsTests(unittest.TestCase):
         self.assertEqual(metrics["functions"]["vf_preprocess_401_2_u8"]["calls"], 1)
         self.assertEqual(metrics["persistent_context"]["reserved_bytes"], 4096)
         self.assertEqual(metrics["persistent_context"]["allocation_count"], 7)
+        self.assertEqual(metrics["persistent_context"]["accounting"], "legacy_total")
+        self.assertIsNone(metrics["persistent_context"]["peak_reserved_bytes"])
+        self.assertEqual(metrics["persistent_context"]["breakdown"], {})
         self.assertEqual(metrics["native_timings_ms"]["context_create_ms"], 1.25)
         self.assertEqual(metrics["native_timings_ms"]["kernel_ms"], 2.5)
         self.assertEqual(metrics["native_timings_ms"]["morphology_ms"], 1.5)
@@ -520,6 +553,23 @@ class GpuRuntimeMetricsTests(unittest.TestCase):
         runtime.close()
         self.assertFalse(runtime.supports_fused_401_2)
         self.assertEqual(dll.destroyed, [1234])
+
+    def test_optional_detailed_context_memory_stats_are_preferred_and_sum_to_total(self):
+        runtime = GpuRuntime(enabled=False)
+        runtime._dll = _DetailedMemoryDll()
+        runtime.device_count = 1
+        runtime._load_optional_context()
+
+        context = runtime.performance_stats()["persistent_context"]
+
+        self.assertEqual(context["accounting"], "detailed_v1")
+        self.assertEqual(context["reserved_bytes"], 4096)
+        self.assertEqual(context["peak_reserved_bytes"], 8192)
+        self.assertEqual(context["allocation_count"], 7)
+        self.assertEqual(sum(context["breakdown"].values()), context["reserved_bytes"])
+        self.assertEqual(context["breakdown"]["resident_bytes"], 2000)
+        self.assertEqual(context["breakdown"]["cnr_candidate_bytes"], 200)
+        runtime.close()
 
     def test_generic_native_plan_is_cached_and_destroyed_before_context(self):
         runtime = GpuRuntime(enabled=False)

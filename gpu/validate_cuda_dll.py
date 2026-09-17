@@ -209,6 +209,12 @@ def validate_context_reuse_matrix(runtime: GpuRuntime) -> list[dict]:
             "Persistent context allocated again after shape/channel/parameter matrix warm-up: "
             f"warmed={warmed}, reused={reused}"
         )
+    if reused.get("accounting") == "detailed_v1":
+        breakdown = reused.get("breakdown", {})
+        if sum(int(value) for value in breakdown.values()) != reused.get("reserved_bytes"):
+            raise AssertionError(f"CUDA context memory breakdown does not sum to total: {reused}")
+        if int(reused.get("peak_reserved_bytes") or 0) < int(reused.get("reserved_bytes") or 0):
+            raise AssertionError(f"CUDA context peak memory is below current memory: {reused}")
     print(f"PASS context reuse matrix: warmed={warmed}, reused={reused}")
     return metrics
 

@@ -9,6 +9,7 @@ from pathlib import Path
 
 import numpy as np
 from core.gpu_abi import (
+    VfCudaContextMemoryStatsV1 as _VfCudaContextMemoryStatsV1,
     VfCudaTimingsV1 as _VfCudaTimingsV1, VfDagOutputV1 as _VfDagOutputV1,
     VfDagPlanDescV1 as _VfDagPlanDescV1, VfPlanDescV1 as _VfPlanDescV1,
     VfPlanOperatorV1 as _VfPlanOperatorV1, VfRoiV1 as _VfRoiV1,
@@ -1487,6 +1488,13 @@ class GpuRuntime:
                 ctypes.POINTER(ctypes.c_uint64),
             ]
             stats.restype = ctypes.c_int
+        memory_stats = getattr(self._dll, "vf_context_memory_stats_v1", None)
+        if memory_stats is not None:
+            memory_stats.argtypes = [
+                ctypes.c_void_p,
+                ctypes.POINTER(_VfCudaContextMemoryStatsV1),
+            ]
+            memory_stats.restype = ctypes.c_int
         timings = getattr(self._dll, "vf_context_last_timings", None)
         if timings is not None:
             timings.argtypes = [ctypes.c_void_p, ctypes.POINTER(_VfCudaTimingsV1)]
@@ -1882,19 +1890,78 @@ class GpuRuntime:
 
     def _context_stats_unlocked(self) -> dict:
         if self._context is None or self._dll is None:
-            return {"active": False, "reserved_bytes": 0, "allocation_count": 0}
+            return {
+                "active": False,
+                "reserved_bytes": 0,
+                "peak_reserved_bytes": 0,
+                "allocation_count": 0,
+                "accounting": "inactive",
+                "breakdown": {},
+            }
+        detailed = getattr(self._dll, "vf_context_memory_stats_v1", None)
+        if detailed is not None:
+            value = _VfCudaContextMemoryStatsV1()
+            value.struct_size = ctypes.sizeof(_VfCudaContextMemoryStatsV1)
+            value.version = 1
+            result = int(detailed(self._context, ctypes.byref(value)))
+            if result == 0:
+                breakdown = {
+                    "plan_bytes": int(value.plan_bytes),
+                    "resident_bytes": int(value.resident_bytes),
+                    "template_match_bytes": int(value.template_match_bytes),
+                    "contour_bytes": int(value.contour_bytes),
+                    "median_bytes": int(value.median_bytes),
+                    "gaussian_f32_bytes": int(value.gaussian_f32_bytes),
+                    "cnr_mask_bytes": int(value.cnr_mask_bytes),
+                    "cnr_candidate_bytes": int(value.cnr_candidate_bytes),
+                }
+                return {
+                    "active": True,
+                    "reserved_bytes": int(value.reserved_bytes),
+                    "peak_reserved_bytes": int(value.peak_reserved_bytes),
+                    "allocation_count": int(value.allocation_count),
+                    "accounting": "detailed_v1",
+                    "breakdown": breakdown,
+                }
+            return {
+                "active": True,
+                "reserved_bytes": None,
+                "peak_reserved_bytes": None,
+                "allocation_count": None,
+                "accounting": "detailed_v1_error",
+                "breakdown": {},
+                "error_code": result,
+            }
         stats = getattr(self._dll, "vf_context_stats", None)
         if stats is None:
-            return {"active": True, "reserved_bytes": None, "allocation_count": None}
+            return {
+                "active": True,
+                "reserved_bytes": None,
+                "peak_reserved_bytes": None,
+                "allocation_count": None,
+                "accounting": "unavailable",
+                "breakdown": {},
+            }
         reserved_bytes = ctypes.c_uint64()
         allocation_count = ctypes.c_uint64()
         result = int(stats(self._context, ctypes.byref(reserved_bytes), ctypes.byref(allocation_count)))
         if result != 0:
-            return {"active": True, "reserved_bytes": None, "allocation_count": None, "error_code": result}
+            return {
+                "active": True,
+                "reserved_bytes": None,
+                "peak_reserved_bytes": None,
+                "allocation_count": None,
+                "accounting": "legacy_error",
+                "breakdown": {},
+                "error_code": result,
+            }
         return {
             "active": True,
             "reserved_bytes": int(reserved_bytes.value),
+            "peak_reserved_bytes": None,
             "allocation_count": int(allocation_count.value),
+            "accounting": "legacy_total",
+            "breakdown": {},
         }
 
     def _native_timings_unlocked(self) -> dict | None:

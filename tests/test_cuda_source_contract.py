@@ -201,6 +201,10 @@ class CudaSourceContractTests(unittest.TestCase):
 
         self.assertIn("typedef struct VfCudaTimingsV1", header)
         self.assertIn("vf_context_last_timings", header)
+        self.assertIn("typedef struct VfCudaContextMemoryStatsV1", header)
+        self.assertIn("vf_context_memory_stats_v1", header)
+        self.assertIn("context_memory_breakdown", source)
+        self.assertIn("cnr_candidate_bytes", source)
         self.assertIn("cudaEventRecord", source)
         self.assertIn("cudaEventElapsedTime", source)
         self.assertIn("TIMING_GAUSSIAN_START", source)

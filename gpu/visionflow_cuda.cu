@@ -233,6 +233,7 @@ struct PersistentContext {
     float* cand_seq_std = nullptr;
     size_t cand_seq_std_capacity = 0;
     unsigned long long allocation_count = 0;
+    uint64_t peak_reserved_bytes = 0;
     cudaStream_t stream = nullptr;
     cudaError_t initialization_error = cudaSuccess;
     cudaEvent_t timing_events[TIMING_EVENT_COUNT]{};
@@ -314,6 +315,119 @@ struct PersistentContext {
         if (stream != nullptr) cudaStreamDestroy(stream);
     }
 };
+
+struct ContextMemoryBreakdown {
+    uint64_t plan_bytes = 0;
+    uint64_t resident_bytes = 0;
+    uint64_t template_match_bytes = 0;
+    uint64_t contour_bytes = 0;
+    uint64_t median_bytes = 0;
+    uint64_t gaussian_f32_bytes = 0;
+    uint64_t cnr_mask_bytes = 0;
+    uint64_t cnr_candidate_bytes = 0;
+
+    uint64_t total() const {
+        return plan_bytes + resident_bytes + template_match_bytes + contour_bytes + median_bytes +
+               gaussian_f32_bytes + cnr_mask_bytes + cnr_candidate_bytes;
+    }
+};
+
+uint64_t capacity_bytes(size_t capacity, size_t item_size) {
+    return static_cast<uint64_t>(capacity) * static_cast<uint64_t>(item_size);
+}
+
+ContextMemoryBreakdown context_memory_breakdown(const PersistentContext* context) {
+    ContextMemoryBreakdown memory{};
+    for (size_t capacity : context->u8_capacity) memory.plan_bytes += capacity_bytes(capacity, 1);
+    memory.plan_bytes += capacity_bytes(context->gaussian_capacity, sizeof(uint32_t));
+    for (size_t capacity : context->u64_capacity) {
+        memory.plan_bytes += capacity_bytes(capacity, sizeof(unsigned long long));
+    }
+    for (size_t capacity : context->dag_u8_capacity) memory.plan_bytes += capacity_bytes(capacity, 1);
+    memory.resident_bytes = capacity_bytes(context->resident_capacity, 1);
+
+    for (size_t capacity : context->match_plane_capacity) {
+        memory.template_match_bytes += capacity_bytes(capacity, sizeof(long long));
+    }
+    memory.template_match_bytes +=
+        capacity_bytes(context->match_candidate_capacity, sizeof(long long));
+
+    memory.contour_bytes =
+        capacity_bytes(context->contour_label_capacity, sizeof(signed char)) +
+        capacity_bytes(context->contour_offset_capacity, sizeof(int32_t)) +
+        capacity_bytes(context->contour_point_capacity, sizeof(int32_t)) +
+        capacity_bytes(context->contour_out_offset_capacity, sizeof(int32_t)) +
+        capacity_bytes(context->contour_out_point_capacity, sizeof(int32_t)) +
+        capacity_bytes(context->contour_count_capacity, sizeof(int)) +
+        capacity_bytes(context->contour_row_count_capacity, sizeof(int)) +
+        capacity_bytes(context->contour_row_start_capacity, sizeof(int)) +
+        capacity_bytes(context->contour_transition_capacity, sizeof(int32_t));
+
+    memory.median_bytes =
+        capacity_bytes(context->median_value_capacity, sizeof(float)) +
+        capacity_bytes(context->median_key_capacity, sizeof(uint32_t)) +
+        capacity_bytes(context->median_sorted_key_capacity, sizeof(uint32_t)) +
+        capacity_bytes(context->median_sort_scratch_capacity, 1) +
+        capacity_bytes(context->median_nan_flag_capacity, sizeof(int));
+
+    memory.gaussian_f32_bytes =
+        capacity_bytes(context->gaussian_f32_input_capacity, sizeof(float)) +
+        capacity_bytes(context->gaussian_f32_intermediate_capacity, sizeof(float)) +
+        capacity_bytes(context->gaussian_f32_output_capacity, sizeof(float));
+
+    memory.cnr_mask_bytes =
+        capacity_bytes(context->cnr_mask_image_capacity, sizeof(float)) +
+        capacity_bytes(context->cnr_mask_background_capacity, sizeof(float)) +
+        capacity_bytes(context->cnr_mask_residual_capacity, sizeof(float)) +
+        capacity_bytes(context->cnr_mask_absdev_capacity, sizeof(float)) +
+        capacity_bytes(context->cnr_mask_mask_capacity, sizeof(unsigned char));
+
+    memory.cnr_candidate_bytes =
+        capacity_bytes(context->cand_mask_scratch_capacity, sizeof(unsigned char)) +
+        capacity_bytes(context->ccl_parent_capacity, sizeof(int32_t)) +
+        capacity_bytes(context->cand_words_capacity, sizeof(int32_t)) +
+        capacity_bytes(context->cand_ramp_capacity, sizeof(int32_t)) +
+        capacity_bytes(context->cand_foreground_capacity, sizeof(int32_t)) +
+        capacity_bytes(context->cand_keys_capacity, sizeof(int32_t)) +
+        capacity_bytes(context->cand_sorted_keys_capacity, sizeof(int32_t)) +
+        capacity_bytes(context->cand_sorted_pixels_capacity, sizeof(int32_t)) +
+        capacity_bytes(context->cand_roots_capacity, sizeof(int32_t)) +
+        capacity_bytes(context->cand_areas_capacity, sizeof(int32_t)) +
+        capacity_bytes(context->cand_offsets_capacity, sizeof(int32_t)) +
+        capacity_bytes(context->cand_boxes_capacity, sizeof(int32_t)) +
+        capacity_bytes(context->cand_keep_capacity, sizeof(unsigned char)) +
+        capacity_bytes(context->cand_kept_capacity, sizeof(int32_t)) +
+        capacity_bytes(context->cand_windows_capacity, sizeof(int32_t)) +
+        capacity_bytes(context->cand_window_sizes_capacity, sizeof(long long)) +
+        capacity_bytes(context->cand_gather_offsets_capacity, sizeof(long long)) +
+        capacity_bytes(context->cand_gather_capacity, sizeof(float)) +
+        capacity_bytes(context->cand_out_ints_capacity, sizeof(int32_t)) +
+        capacity_bytes(context->cand_out_floats_capacity, sizeof(float)) +
+        capacity_bytes(context->cand_cub_scratch_capacity, 1) +
+        capacity_bytes(context->cand_flags_capacity, sizeof(unsigned char)) +
+        capacity_bytes(context->cand_values_capacity, sizeof(float)) +
+        capacity_bytes(context->cand_value_offsets_capacity, sizeof(long long)) +
+        capacity_bytes(context->cand_background_counts_capacity, sizeof(long long)) +
+        capacity_bytes(context->cand_background_offsets_capacity, sizeof(long long)) +
+        capacity_bytes(context->cand_segment_ends_capacity, sizeof(long long)) +
+        capacity_bytes(context->cand_seq_start_capacity, sizeof(long long)) +
+        capacity_bytes(context->cand_seq_length_capacity, sizeof(long long)) +
+        capacity_bytes(context->cand_leaf_counts_capacity, sizeof(long long)) +
+        capacity_bytes(context->cand_leaf_offsets_capacity, sizeof(long long)) +
+        capacity_bytes(context->cand_leaf_start_capacity, sizeof(long long)) +
+        capacity_bytes(context->cand_leaf_length_capacity, sizeof(int32_t)) +
+        capacity_bytes(context->cand_leaf_sequence_capacity, sizeof(int32_t)) +
+        capacity_bytes(context->cand_leaf_values_capacity, sizeof(float)) +
+        capacity_bytes(context->cand_seq_mean_capacity, sizeof(float)) +
+        capacity_bytes(context->cand_seq_std_capacity, sizeof(float));
+    return memory;
+}
+
+ContextMemoryBreakdown update_context_memory_peak(PersistentContext* context) {
+    ContextMemoryBreakdown memory = context_memory_breakdown(context);
+    context->peak_reserved_bytes = std::max(context->peak_reserved_bytes, memory.total());
+    return memory;
+}
 
 float elapsed_host_ms(std::chrono::steady_clock::time_point started) {
     return std::chrono::duration<float, std::milli>(
@@ -2805,16 +2919,36 @@ VF_CUDA_API int vf_context_stats(
         return VF_CUDA_INVALID_ARGUMENT;
     }
     PersistentContext* persistent = static_cast<PersistentContext*>(context);
-    uint64_t bytes = 0;
-    for (size_t capacity : persistent->u8_capacity) bytes += static_cast<uint64_t>(capacity);
-    bytes += static_cast<uint64_t>(persistent->gaussian_capacity) * sizeof(uint32_t);
-    for (size_t capacity : persistent->u64_capacity) {
-        bytes += static_cast<uint64_t>(capacity) * sizeof(unsigned long long);
-    }
-    for (size_t capacity : persistent->dag_u8_capacity) bytes += static_cast<uint64_t>(capacity);
-    bytes += static_cast<uint64_t>(persistent->resident_capacity);
-    *reserved_bytes = bytes;
+    const ContextMemoryBreakdown memory = update_context_memory_peak(persistent);
+    *reserved_bytes = memory.total();
     *allocation_count = persistent->allocation_count;
+    return VF_CUDA_OK;
+}
+
+VF_CUDA_API int vf_context_memory_stats_v1(
+    void* context,
+    VfCudaContextMemoryStatsV1* stats) {
+    if (context == nullptr || stats == nullptr ||
+        stats->struct_size != sizeof(VfCudaContextMemoryStatsV1) || stats->version != 1) {
+        return VF_CUDA_INVALID_ARGUMENT;
+    }
+    PersistentContext* persistent = static_cast<PersistentContext*>(context);
+    const ContextMemoryBreakdown memory = update_context_memory_peak(persistent);
+    VfCudaContextMemoryStatsV1 output{};
+    output.struct_size = sizeof(VfCudaContextMemoryStatsV1);
+    output.version = 1;
+    output.reserved_bytes = memory.total();
+    output.peak_reserved_bytes = persistent->peak_reserved_bytes;
+    output.allocation_count = persistent->allocation_count;
+    output.plan_bytes = memory.plan_bytes;
+    output.resident_bytes = memory.resident_bytes;
+    output.template_match_bytes = memory.template_match_bytes;
+    output.contour_bytes = memory.contour_bytes;
+    output.median_bytes = memory.median_bytes;
+    output.gaussian_f32_bytes = memory.gaussian_f32_bytes;
+    output.cnr_mask_bytes = memory.cnr_mask_bytes;
+    output.cnr_candidate_bytes = memory.cnr_candidate_bytes;
+    *stats = output;
     return VF_CUDA_OK;
 }
 
@@ -3712,6 +3846,7 @@ VF_CUDA_API int vf_match_template_gray_u8(
     if (result != VF_CUDA_OK) return result;
     // The gray ROI is fully rewritten by this call, so it must be exactly the requested size:
     // a larger leftover buffer from an earlier call would keep the old row pitch.
+    update_context_memory_peak(persistent);
     result = reserve_exact(
         &persistent->u8[MATCH_ROI_BUFFER], &persistent->u8_capacity[MATCH_ROI_BUFFER],
         static_cast<size_t>(search_width) * search_height, &persistent->allocation_count);

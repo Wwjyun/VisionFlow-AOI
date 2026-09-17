@@ -58,10 +58,23 @@ int main() {
     uint64_t reserved_bytes = 0;
     uint64_t allocation_count = 0;
     int stats_result = vf_context_stats(context, &reserved_bytes, &allocation_count);
+    VfCudaContextMemoryStatsV1 memory_stats{};
+    memory_stats.struct_size = sizeof(VfCudaContextMemoryStatsV1);
+    memory_stats.version = 1;
+    int memory_stats_result = vf_context_memory_stats_v1(context, &memory_stats);
     if (result != VF_CUDA_OK || stats_result != VF_CUDA_OK ||
-        reserved_bytes == 0 || allocation_count == 0) {
+        memory_stats_result != VF_CUDA_OK || reserved_bytes == 0 || allocation_count == 0 ||
+        memory_stats.reserved_bytes != reserved_bytes ||
+        memory_stats.peak_reserved_bytes < memory_stats.reserved_bytes ||
+        memory_stats.allocation_count != allocation_count ||
+        memory_stats.plan_bytes + memory_stats.resident_bytes +
+                memory_stats.template_match_bytes + memory_stats.contour_bytes +
+                memory_stats.median_bytes + memory_stats.gaussian_f32_bytes +
+                memory_stats.cnr_mask_bytes + memory_stats.cnr_candidate_bytes !=
+            memory_stats.reserved_bytes) {
         char message[256]{};
-        int failed = result != VF_CUDA_OK ? result : stats_result;
+        int failed = result != VF_CUDA_OK ? result :
+            (stats_result != VF_CUDA_OK ? stats_result : memory_stats_result);
         vf_gpu_error_message(failed, message, static_cast<int>(sizeof(message)));
         std::cerr << "Fused 401-2 smoke failed: " << message << "\n";
         return 7;
@@ -275,6 +288,23 @@ int main() {
             std::cerr << "resident CNR candidates disagree with the resident CNR mask chain\n";
             return 10;
         }
+    }
+    VfCudaContextMemoryStatsV1 exercised_memory_stats{};
+    exercised_memory_stats.struct_size = sizeof(VfCudaContextMemoryStatsV1);
+    exercised_memory_stats.version = 1;
+    int exercised_memory_result = result == VF_CUDA_OK
+        ? vf_context_memory_stats_v1(context, &exercised_memory_stats)
+        : result;
+    if (result == VF_CUDA_OK &&
+        (exercised_memory_result != VF_CUDA_OK ||
+         exercised_memory_stats.plan_bytes == 0 ||
+         exercised_memory_stats.resident_bytes == 0 ||
+         exercised_memory_stats.median_bytes == 0 ||
+         exercised_memory_stats.gaussian_f32_bytes == 0 ||
+         exercised_memory_stats.cnr_mask_bytes == 0 ||
+         exercised_memory_stats.cnr_candidate_bytes == 0)) {
+        std::cerr << "Detailed context memory accounting missed an exercised buffer family\n";
+        return 11;
     }
     // A real device OOM must not leave a stale error for the next ROI batch.
     const int oom_side = 4096;

@@ -66,6 +66,7 @@ OPTIONAL_EXPORT_GROUPS = {
         "vf_roi_batch_destroy",
     },
     "timings": {"vf_context_last_timings"},
+    "context_memory_stats": {"vf_context_memory_stats_v1"},
 }
 OPTIONAL_GENERIC_PLAN_EXPORTS = OPTIONAL_EXPORT_GROUPS["generic_plan"]
 OPTIONAL_RESIDENT_ROI_EXPORTS = OPTIONAL_EXPORT_GROUPS["resident_roi"]

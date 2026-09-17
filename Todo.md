@@ -52,6 +52,9 @@
 - [x] benchmark 記錄平均、median、P95、process CPU%、GPU utilization、VRAM、溫度與功耗快照。
 - [x] **修正 resident 模式的 GPU anchor 接線與 `device_host_split` 誤報**（2026-09-15 v1.6.0 發行驗收發現；同日完成，見完成紀錄與 `gpu/README.md`〈v1.6.0 後：anchor 接線修正〉）：16384×13000 正式尺寸 benchmark 的 GPU 呼叫統計只有 `vf_context_upload_u8`、`vf_plan_execute_roi`、`vf_cnr_mask_u8_roi`，沒有 `vf_match_template_gray_u8`，`template_match` 與 CPU 同為約 58.7 ms；搜尋區 512×512、template 64×64 都在 `gpu_anchor_shapes_supported` 界限內，因此不是形狀界限造成。(1) 接線：`core/pipeline.py` 以 `gpu_runtime if tiling_gpu_requested and resident_image is None else None` 建立 Tiler，resident 模式下 Tiler 拿到 `None`，`_find_grid_anchor_on_device` 直接回 CPU，GPU anchor 在 pipeline 中永遠不會執行；`tests/test_tiler_anchor_backend.py` 直接建構 Tiler，未覆蓋此接線。修正為 resident 模式把同一 runtime 交給 anchor（不得新增 H2D），補 pipeline 層級測試證明 export 被呼叫、座標與 CPU 相同，並重量 `template_match` 與端到端。(2) 回報：`core/pipeline_stages.py` 只要 `resident_image is not None` 就標 `device`，改為依本次實際呼叫的 export 判定，並補「resident 上傳但 anchor 走 CPU」回歸測試；GUI 與報告的 backend 標示依此修正。
 - [x] **`device_host_split` 與 `execution.gpu.metrics` 在共用 session 下是累計值**（2026-09-17 完成）：每輪在影像 GPU 操作前記錄 `performance_stats()` 基線，`execution.gpu.metrics` 改為本輪 calls／傳輸／host wrapper／native 累計計時差值，session 累計值另存 `metrics_cumulative`；`device_host_split` 只依本輪 export 差值判定。已補「第一輪曾呼叫、第二輪零呼叫仍回報 cpu」及單輪／累計 metrics schema 測試。
+- [x] **修正 CUDA context 顯存統計口徑**（2026-09-17 完成，見完成紀錄）：`vf_context_stats.reserved_bytes` 已涵蓋全部 context-owned device allocations；新增 optional `vf_context_memory_stats_v1` 回報 current/peak 與 plan、resident、template match、contour、median、Gaussian f32、CNR mask、CCL/ring candidate breakdown。舊 DLL 仍以 `legacy_total` 明確標示不完整口徑；driver/JIT/context overhead 不假裝成 context buffer。已重跑同尺寸零重配、shape/Recipe 切換與 10/100/1000 次 plateau，新口徑的 reserved/peak/allocation/free VRAM 全程固定。
+- [ ] **以完整 GPU working set 做 resident upload admission**：`_check_resident_upload_memory()` 不可只拿 `image.nbytes` 對比 free VRAM；估算或預留 resident frame、plan scratch、detector scratch、DAG outputs、可能的 in-flight slot 與安全 headroom。估算不足或配置失敗時仍須走既有 CPU fallback，且 telemetry 要能區分「容量預判拒絕」與真正 OOM。
+- [ ] **量測觀測機制本身的熱路徑成本**：以 warm A/B microbenchmark 分離 `GpuExecutionSession.performance_stats()` baseline/delta、CUDA event 記錄與 Python metrics 聚合的成本；若相對實際 kernel 時間不可忽略，production 改成取樣或精簡模式，完整 events 留給 diagnostic/benchmark。禁止在未量測前假設成本為零或直接移除診斷資料。
 
 ### CPU 與 fallback 正確性
 
@@ -63,6 +66,7 @@
 - [ ] 【實物】五個 production recipes 各準備至少一張 PASS 與一張 NG 樣本；`gpu/production_manifest.example.yaml` 已固定所需 10 個 case，影像待提供。
 - [x] 實機注入 kernel error、CUDA 初始化失敗與 OOM，確認 fallback 後無 stale pointer 或錯誤中間結果。（2026-09-14 RTX 3090 以 `gpu/validate_cuda_fault_injection.py` 完成：`CUDA_VISIBLE_DEVICES=-1`、超過 kernel grid 上限的真實 launch error、超過專用＋共用 GPU 記憶體的 ROI batch OOM；Detector／Pipeline 與 CPU 完全一致，同一 runtime／session 下一張圖恢復 CUDA。sticky context error 另列 P2 待辦）
 - [x] `fallback_to_cpu: false` 且 CUDA DLL 不可用時必須明確失敗，不可回報假的 GPU success。
+- [ ] **把 GPU 等價性分級做成版本化契約**：每個 GPU operator/detector 明確標示 `bit_exact`、`decision_exact` 或 `tolerance`；`tolerance` 必須是機器可讀的欄位與 golden test，而非散落在註解或 benchmark 判讀中。任何 kernel、編譯旗標或資料型別變更都須依該等級選擇驗收 gate。
 
 ## P1：共用 Preprocess Plan 架構
 
@@ -119,6 +123,10 @@
 - [x] 評估 Windows 驅動預設 CUDA sysmem fallback：佔滿專用 VRAM 時配置溢出到共用記憶體而不回傳 OOM（2026-09-14 4K plan 結果等價、新 context 首次 51 ms），需以正式大圖／批次量測溢出後的端到端延遲，決定是否以 `recommended_roi_batch_size`／監控告警限制專用 VRAM 使用量。（2026-09-14 以 16384×13000 合成圖／正式 401-AS-SN-1 量測：閒置佔用者時中位數不變，持續使用 VRAM 的佔用者使端到端 +58～105%，主要在整圖 resident 上傳；結果皆一致。決定不另限批次，改為上傳前記錄專用 VRAM 並在不足時警告）
 - [ ] 【實物】以正式真圖與實際並行 GPU 程式（例如其他檢測站或 AI 服務）量測 sysmem 溢出頻率與延遲，確認警告門檻與是否需要監控介面顯示。
 - [x] 評估 `cudaMallocAsync`/memory pool；只有相容且實測有收益時採用。（2026-09-14 評估後不採用：五份正式 Recipe 以 4K 圖在共用 session 連續 12 張，暖機後 context allocation 增量皆為 0；pool 只能加速首張、尺寸成長、plan 建立及 production 未使用的 stateless／ROI batch 路徑，且保留記憶體會壓縮其他程序可用的專用 VRAM）
+- [ ] **評估 scratch arena／生命週期別名與主動 trim**：目前 `PersistentContext` 含多組 grow-only buffers；先輸出各 buffer 高水位與 operator 生命週期，再只對互斥 scratch 做安全 alias/arena。補「大圖/大 Recipe 後切回小圖」測試與可控 trim API，禁止 alias resident/output/debug 仍在引用的記憶體。
+- [ ] **Adaptive Mean 低顯存路徑預研**：現行 padded u8 加兩張 u64 integral plane 在正式尺寸會形成數百 MiB scratch。比較 rolling/separable/tiled prefix 等方案；必須鎖定 OpenCV border、整數溢位、除法/四捨五入與 threshold 邊界，只有在等價性與端到端 VRAM/延遲均有實益時才取代現況。
+- [ ] **縮小全域 `--fmad=false` 的作用範圍**：將需要精確 INTER_AREA 行為的 translation unit/kernel 與其他算子分開 A/B，評估只對必要單元關閉 FMA；須跑完整 ABI、CPU/GPU equivalence 與正式尺寸 benchmark，沒有量測改善則維持全域設定。
+- [ ] **以 profiler 驅動 launch geometry 調校**：盤點固定 `16x16` block 的主要 kernel，依 kernel/shape 做少量候選或離線選型並記錄 occupancy、memory throughput、register pressure；只保留跨正式尺寸穩定且不破壞等價性的設定，避免把 autotune 放進每張影像熱路徑。
 
 ### Morphology
 
@@ -166,7 +174,7 @@
 - [x] 先以生成的 16384×13000 BMP／70 ROI／401-AS-SN-1 在 RTX 3090 驗證 5×5 shared-memory 形態學：舊／新 DLL 交錯 A/B 各 10 次，morphology warm median 165.0→69.8 ms、Detector 413.8→325.2 ms、整張圖 1429.1→1341.2 ms，三個指標逐對均 10/10 勝出；1960 次 kernel launch 不變，ROI／PASS-NG／完整 Tile 輸出一致。此項只代表合成圖，不替代上方真圖及 production 驗收。
 - [ ] Batch 單 stream 仍無法達標時才建立 2/4 execution slots；每 slot 獨立 stream/scratch/events/pinned output，縮小 Python lock 至 metadata/context lifecycle，不接受仍被全域 lock 序列化的 worker 數字。
 - [ ] 以相同 ROI/輸入/輸出條件比較 OpenCV CPU、自製 CUDA、OpenCV CUDA/hybrid；Gray-first 僅作 feature-flag 實驗，golden mask/PASS-NG 不等價時不得採用。
-- [ ] 最終 RTX 驗收：GPU warm median < 3.3 秒、目標 < 2 秒；ROI 座標與 PASS/NG 100% 相同、binary agreement >= 99.99%、無 silent fallback，完成 batch/stream/VRAM/100 次一致性/error/leak 報告後才調整 production backend。
+- [ ] 最終 RTX 驗收：先以真實 production Recipe/影像重建基準，再為各 Recipe 訂「相對 CPU 加速比 + 絕對 median/P95」雙 gate；舊的 `< 3.3 秒 / 目標 < 2 秒` 已失去鑑別力，不再作通過門檻。最低仍須符合文末 `GPU warm median 至少快 CPU 1.5x`，更嚴格的絕對值須由同機、同輸入 baseline 定案；ROI 座標與 PASS/NG 100% 相同、binary agreement >= 99.99%、無 silent fallback，完成 batch/stream/VRAM/100 次一致性/error/leak 報告後才調整 production backend。
 
 - [x] 偵測重複 GPU crop round trips，記錄傳輸量並輸出負優化警告。
 - [x] production/benchmark 在 device tiling 改善前預設關閉 GPU crop。
@@ -179,6 +187,16 @@
 - [x] 單張 GUI 採低延遲策略；資料夾、monitor、batch 採高吞吐策略。
 - [x] 使用 bounded 單一 GPU queue，避免多個 CPU workers 同時搶 GPU 或無限制累積 VRAM。
 - [x] 評估 pinned host memory 與 CUDA streams，量測 upload/kernel/download 重疊收益。（2026-09-14 評估後不採用：常駐 pinned 同一陣列可讓 609 MiB 上傳 79～89→55 ms，但產線每張圖都是 OpenCV 新配置的陣列，逐張 register／upload／unregister 週期 115.0 ms 與 pageable 113.3 ms 持平；單張 Pipeline 為單一序列 stream，跨圖片重疊需依 execution slots 待辦的觸發條件另行評估）
+
+### GPU mode 補強與吞吐待辦（2026-09-17 程式審查）
+
+- [ ] **建立跨張 bounded stage pipeline（監控／批次吞吐）**：以明確 ownership/backpressure 將 `read+decode(N+1)`、`GPU execute(N)`、`report/overlay/move(N-1)` 重疊；第一階段只讓 CPU I/O/report 與單一 GPU execution 重疊，不等同於多 worker 搶 GPU。驗收須涵蓋輸出順序、停止/例外、檔案只處理一次、host/device buffer 不被提早覆寫、fallback 語意、peak RAM/VRAM，以及單張 latency 與長跑 throughput；不得預先宣稱 2x。
+- [ ] **評估單張內 contour 的 GPU/CPU 分段流水線**：對多 ROI/多 tile 的 contour 類 detector，量測是否可讓 GPU preprocess 下一區與 CPU `findContours`/geometry 處理上一區重疊；必須保持 deterministic 結果/順序、共用 cache 正確性與同步 fallback。只在 CPU contour 與 GPU preprocess 都有足夠占比時投入。
+- [ ] **contour mask device summary + tight bbox gate（先 profile 後實作）**：先以真實 PASS/NG 與正式尺寸 synthetic 記錄 post-exclusion mask 的 zero-hit rate、非零 bbox 覆蓋率、D2H 與 `findContours` 成本；命中率足夠時，再新增可選 CUDA operator 回傳 `nonzero_count + tight_bbox`。零遮罩可直接略過 D2H/contour；非零只下載必要區域並補足 contour 邊界語意。驗收需覆蓋 `RETR_LIST/EXTERNAL`、holes、多 component、邊界接觸、全幅 bbox、點/offset/area/approx 與 PASS/NG，不可用「零遮罩等同一般 PASS」作假設。
+- [ ] **pageable vs pinned mask D2H 做條件式 A/B**：只有 profiler 顯示 mask D2H 為主要瓶頸時，才為 output buffer pool 加可重用 pinned lease；DAG multi-output、debug dump 與 fallback 必須在 consumer 完成前持有 lease。以 isolated D2H、kernel+D2H、detector 與端到端四層量測判定；若差異落在 run-to-run noise 內則不採用。
+- [ ] **強化 crossover calibration**：目前首次遇到 key 時以少量 warmup/sample 決定且只在 process 內保存。加入 warmup 穩定性、hysteresis/信心區間、`decision_source` telemetry，並評估把結果持久化到「GPU 型號/compute capability、driver、DLL build/provenance、plan hash、dtype、shape」完整 key；環境或版本變更必須失效，邊界 case 可週期性重驗，禁止把不同機台結果直接共用。
+- [ ] **非 BMP 格式採需求觸發的真圖 baseline**：目前 production handoff 以 BMP 為主且解碼維持 CPU。若現場改用 PNG/JPEG/TIFF，先量測各真實格式的 `image_load`、CPU 使用率與端到端占比，再決定 libjpeg-turbo、nvImageCodec 或其他路徑；在未確認格式與占比前不啟動大改，也不得用 BMP 加速數字外推。
+- [ ] **Anchor 平坦模板 fallback 量測與決策**：記錄 `TM_SQDIFF_NORMED`/flat-template 在 production Recipe 的出現率；只有實際命中且成本顯著時，才修正/啟用 CUDA diff path，並逐項比對 OpenCV normalization、最佳位置、score 與 threshold 邊界。否則保留 `VF_CUDA_UNSUPPORTED -> CPU` 的明確 telemetry。
 
 ### Phase2 GPU 加速簡報第 14 頁工作包對照（2026-09-14）
 
@@ -573,7 +591,8 @@ vs 原本 `[255,255,20,20]`）。因此「標籤編號順序」對 202 的最終
 
 - [x] 分別量測 `findContours`、幾何分析、Python tile/detector 迴圈、progress callback、aggregation 與 reporter。
 - [x] 降低 progress callback 頻率，避免每個小 primitive 更新 GUI。
-- [x] 移除不必要的 detector `image.copy()` 與完整尺寸 temporary masks；必要的 non-contiguous CUDA/QImage 邊界 copy 保留。
+- [x] 已移除先前盤點到的不必要 detector `image.copy()` 與完整尺寸 temporary masks；必要的 non-contiguous CUDA/QImage 邊界 copy 保留。
+- [ ] **重新盤點 contour detector 的 `_apply_edge_mask()` 無效 copy**：至少檢查 203/401/505/506 等註冊 detector；edge mask 關閉時，若 downstream 保證唯讀且不影響 debug/cache lifetime，直接回傳原 binary。開啟時評估共用 typed `MaskBorders` plan/operator 或專用 reusable output，禁止未驗證就修改可能被 `TilePreprocessCache`/debug 共用的 buffer；補 cache 命中、DAG 多 consumer、CPU/GPU fallback 與結果等價測試。
 - [x] 相同 tile 的 CPU detectors 共用一次 gray；GPU detectors 共用 resident source，避免各自重傳原圖。
 - [ ] RTX profiler 證明有收益後，再加入跨 detector 的 device-gray／完整 preprocessing result cache。（2026-09-14 前提未成立、暫不實作：五份正式 Recipe 各只啟用 1 個 Detector，沒有同 tile 跨 Detector 重算；產線配置 profiler 的 GPU Gray 僅 0.8 ms／preprocessing 172 ms。出現多 Detector Recipe 時再量測）
 - [x] 對小圖、小 ROI、少 tiles 建立 CPU/GPU crossover benchmark；低於門檻自動選 CPU。（2026-09-14：`gpu.mode: auto` 允許 fallback 時啟用實測路由，`gpu.mode: cuda` 不啟用；RTX 3090 小 tile、正式 512² 與 16384×13000 六個 2000×12000 ROI 皆 CPU／strict CUDA／auto 結果一致）
@@ -590,6 +609,8 @@ vs 原本 `[255,255,20,20]`）。因此「標籤編號順序」對 202 的最終
 - [x] GUI worker 不在 UI thread 等待 CUDA；monitor 取消、錯誤與進度以 stop callback／Qt signals 保持可回應。
 - [x] GUI 顯示實際 backend，不得因 recipe 勾選 GPU 就顯示 CUDA active。
 - [x] PyInstaller 有 DLL 時條件式包含 `gpu/visionflow_cuda.dll`，無 DLL 時建立 CPU-compatible package 且 runtime 可 fallback。
+- [ ] **定義 CUDA 發行架構相容策略**：目前 build 預設 `sm_86` 且未提供可稽核的 forward-compatibility contract。比較 exact-arch artifacts、multi-gencode cubins 與 PTX fallback 的大小/啟動/相容性取捨；將編譯 target、PTX 與 CUDA runtime/driver 資訊寫入 provenance，load-time 明確檢查 device capability。無相容 artifact 時須顯示清楚原因並依 mode fail-fast 或 fallback，不可只留下模糊的「GPU unavailable」。
+- [ ] **封裝環境加入 GPU health/長跑診斷**：在 1000 張與 soak test 週期性記錄可取得的 SM/memory clocks、throttle reasons、temperature、power、utilization、free/process VRAM 與其他 GPU process，並把 sustained slowdown 與 thermal/power/VRAM pressure 一同標註；不支援欄位須標成 unavailable。Windows/WDDM consumer GPU 不把 persistence mode 或鎖時脈當必要條件，但在支援的平台可作受控 A/B；另文件化 TDR/不可中斷 native call 的已知限制與復原流程。
 - [x] **GUI 狀態層級**：TopBar 只呈現全域進度，操作 panel 顯示目前步驟，Status Bar 僅保留短事件；就緒／執行中／PASS／NG／ERROR 狀態一致且不重複。
 - [x] **實際 backend chip**：TopBar 固定顯示 CPU、CUDA device 或 CPU FALLBACK；fallback 原因可由 tooltip 查看，未實際啟用 CUDA 不得顯示 CUDA active。
 - [x] **非阻塞提示**：可恢復警告與成功訊息改用既有視覺語言的 inline notice，只有阻止操作、不可恢復或離開確認保留 modal dialog。
@@ -907,6 +928,8 @@ vs 原本 `[255,255,20,20]`）。因此「標籤編號順序」對 202 的最終
 
 ## 完成紀錄
 
+- [x] 2026-09-17：**完成 CUDA context-owned 顯存完整統計。** 保留 ABI v1 `vf_context_stats` 簽名但修正其總量，新增 additive optional `VfCudaContextMemoryStatsV1`／`vf_context_memory_stats_v1`，逐類統計 shared plan、resident、template match、contour、exact median、float Gaussian、CNR mask 與 CCL/ring candidate buffers，並追蹤 current/peak/allocation count；match 的 exact-size buffer 在縮配前先保存 peak。Python bridge 優先使用 `detailed_v1`，舊 DLL 自動退回 `legacy_total`，錯誤與 inactive schema 亦明確區分。native smoke 實際走 plan、resident、median、Gaussian、CNR mask/candidate 後要求相應分類非零且 breakdown 加總等於 total；validator 鎖定 shape/channel/parameter 重用時 allocation 與記憶體不再成長。RTX 3090／Driver 610.62／CUDA 13.3 於 x64 Native Tools Command Prompt for VS 以 `sm_86` 重編，native smoke 與完整 `validate_cuda_dll.py --benchmark 20` 通過；獨立 2048² Adaptive Mean sanity check 的 context buffers 為 132,914,192 bytes、`cudaMemGetInfo` free drop 136,314,880 bytes，約 3.4 MB 差額符合未納入的 driver/JIT overhead。新口徑 `--stress 10 100 1000` 從 10 到 1000 次皆固定 reserved/peak 267,594,308 bytes、allocation count 393、free VRAM 24,188,551,168 bytes。另修正 `build_cuda_dll.ps1`：以 .NET SHA-256 取代會被不相容 PowerShell module path 遮蔽的 `Get-FileHash`，無 workaround 的 x64 Developer Prompt 完整建置／驗證成功。619 tests、compileall、CUDA preflight、CLI synthetic PASS 與 `git diff --check` 通過；DLL/LIB/EXE 與 build logs 依規則只留本機、不納入 git。
+- [x] 2026-09-17：重新審查 GPU mode 待辦與現有程式路徑，補入完整 VRAM accounting/working-set admission、scratch arena/trim、Adaptive Mean 低顯存預研、`--fmad=false` 範圍、launch geometry、跨張與單張內 stage pipeline、contour mask summary/tight bbox、條件式 pinned D2H、crossover calibration、非 BMP 基準、flat-template fallback、edge-mask no-op copy、CUDA 架構相容與長跑 health diagnostics；並將過時的 `<3.3 秒/<2 秒` gate 改為真圖 per-Recipe 相對+絕對雙 gate。本次只更新計畫與驗收契約，未修改 runtime code、未把任何新效能假設標記為完成。
 - [x] 2026-09-17：**Recipe 設計的 Detector 清單加寬，讓每個 Detector 的 GPU 小開關直接可見（使用者回報）。** 原本 `list_scroll` 固定 280 px，但每一列右側還有一個「GPU」開關欄；列內文字（編號、繁中名、英文 `display_name`）的一般 `QLabel` 會把完整文字寬度當成最小寬度，撐開列寬後把 GPU 開關推到視窗外，使用者只看得到最左邊的啟用開關、英文名也被切在邊界上。修正：（1）`gui/widgets/common.py` 新增 `ElidedLabel`：`sizeHint()` 仍回報完整文字寬度（清單才能量到真正需要的寬度）、`minimumSizeHint()` 只保留「…」寬度讓版面可以收斂、`text()` 仍回傳完整字串、hover 時以 tooltip 顯示完整文字；（2）Detector 列的繁中名與英文名改用 `ElidedLabel`；（3）`DesignerScreen._detector_list_width()` 依所有列實際 `sizeHint` 加上垂直捲軸寬度決定清單寬度，限制在 `DETECTOR_LIST_MIN_WIDTH` 280 與 `DETECTOR_LIST_MAX_WIDTH` 420 之間（超過上限才以省略號收斂），並把 `self.detector_list_scroll` 留給測試使用。實測本機 1920×1032 `MainWindow`（Recipe 設計頁）：清單 280 → 368 px，12 列 Detector 的 GPU 開關全部落在可視範圍內（x=322..356、viewport 368），水平捲軸範圍 0，英文 `display_name` 未被截斷；1180 px 視窗同樣全部可見。新增 `tests/test_gui_workflow.py` 兩項測試（每一列 GPU 開關都在 viewport 內且不需要水平捲動；`ElidedLabel` 的完整文字、tooltip 與省略行為）。完整 618 tests、compileall、CUDA preflight、`git diff --check`、GUI offscreen smoke 通過。
 
 - [x] 2026-09-17：**GUI 1000 張批量壓測與 worker 結果 signal 修正。** 以 offscreen `MainWindow` 走真實 GUI 批量路徑（自動背景預熱＋5 張單張暖機後，hard link 1000 張合成圖，輸出關閉，50 ms QTimer 量測事件迴圈延遲、每批 checkpoint 記 RSS／VRAM）。第一次壓測發現批量完成時 GUI 凍結約 3.8～4.0 s、RSS 另增約 530 MiB：根因是 `gui/workers.py` 的結果 signal 宣告為 `Signal(dict)`，PySide 在跨執行緒送出時把整份 1000 筆摘要轉成 QVariantMap 再轉回，且持有 GIL。全部 8 個 worker 結果 signal 改為 `Signal(object)`，只傳 Python 物件參照（worker 送出後不再修改）；新增 `tests/test_worker_signal_payloads.py`（真實 QThread 下收到的是同一物件、改動前程式會失敗；worker 檔案不得再有 `Signal(dict)`／`Signal(list)`）。另發現量測腳本若以 lambda 取代 `MainWindow` 處理函式，PySide 會以 DirectConnection 在 worker 執行緒執行而使 GUI 存取崩潰（0xC0000005，faulthandler 堆疊確認）；產品程式所有 worker signal 均連到 `MainWindow` bound method，已逐一檢查，腳本改為觀察 `batch_result` 狀態後重測。修正後結果（`outputs_validation/gui_batch_stress/*_final/report.json`、`negative_401_repeat4/repeat_report.json`）：202-CS-SN-1 正式尺寸 1000 張 0 error、全部 NG／558，單張 median／P95 226／234 ms，VRAM 2820～2871 MiB 無成長，事件迴圈 median／p99 12.9／27.1 ms；401-AS-SN-1 4000×3000 1000 張 0 error、全部 NG／243，119／135 ms，VRAM 1176～1186 MiB；批量結束後 RSS 不再跳增（+0.3 MiB）。批量中 RSS 每張約 +0.32 MiB 為保留的批量結果列（compact detail 每筆約 77～111 KB 加表格模型），401 同一 process 連續 4 批 RSS 557.9→865.1→865.1→865.7 MiB、private 1277.8→1586.2→1585.4→1586.4 MiB、VRAM 1168 MiB，第 2 批後持平（上一批結果保留到下一批取代），無洩漏、無崩潰。仍存在批量完成瞬間約 0.64～0.67 s 卡頓（`resizeColumnsToContents`），已列 P6 待辦，warm-up＋10／100／1000 張驗收項因此暫不勾選。完整 616 tests、compileall、CUDA preflight、`git diff --check`、GUI offscreen smoke 通過。
