@@ -196,7 +196,7 @@ gpu:
   dll_path: gpu/visionflow_cuda.dll
   fallback_to_cpu: true
   tiling: false
-  display: false
+  display: false               # 舊欄位，仍可載入；GUI 預覽色彩轉換固定在 CPU
 
 tile:
   mode: grid

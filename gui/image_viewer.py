@@ -335,6 +335,9 @@ class ImageViewer(QWidget):
         fallback_reason = str(status.get("fallback_reason", ""))
         if fallback_reason:
             tooltip_lines.append(fallback_reason)
+        display_note = str(status.get("display_gpu_note", ""))
+        if display_note:
+            tooltip_lines.append(display_note)
         performance = status.get("display_performance", {})
         worker = performance.get("worker", {})
         viewer = performance.get("viewer", {})

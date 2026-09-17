@@ -23,6 +23,9 @@ from core.recipe_manager import RecipeManager
 from core.tiler import create_tiler
 
 
+PREVIEW_DISPLAY_GPU_NOTE = "預覽色彩轉換固定在 CPU 執行（整圖往返 GPU 較慢），Recipe 的「GUI 預覽使用 GPU」不再生效。"
+
+
 @contextmanager
 def _shared_session(cache: GpuExecutionSessionCache | None, recipe_path: Path):
     """Hold the GUI session for one run, or yield ``None`` so the processor builds its own."""
@@ -53,24 +56,15 @@ class ImagePreviewWorker(QObject, LogMixin):
             with profiler.measure("image_load"):
                 bgr = self.image_loader.load_bgr(self.path)
             self.progress.emit(60, "正在轉換預覽")
-            requested = RecipeManager().gpu_feature_requested(self.gpu_config, "display")
+            # Preview color conversion always runs on the CPU and never loads CUDA. RTX 3090,
+            # 16384x13000: cv2.cvtColor 110 ms against 310 ms for vf_bgr_to_rgb_u8 on a warm runtime,
+            # because the whole image crosses PCIe twice; the pixels are identical. The legacy
+            # ``gpu.display`` Recipe value is still accepted and reported, but has no effect.
             with profiler.measure("color_conversion"):
-                runtime = GpuRuntime(
-                    self.gpu_config.get("dll_path", GpuRuntime.DEFAULT_DLL),
-                    fallback_to_cpu=RecipeManager().gpu_fallback_enabled(self.gpu_config),
-                    enabled=requested,
-                )
-                if requested and not runtime.available and not runtime.fallback_to_cpu:
-                    raise GpuRuntimeError(runtime.unavailable_reason)
-                if requested and runtime.available:
-                    try:
-                        image = runtime.bgr_to_rgb(bgr)
-                    except Exception as exc:
-                        runtime.fallback_or_raise(exc)
-                        image = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
-                else:
-                    image = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
-            backend_status = runtime.status(requested)
+                image = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+            backend_status = {"requested": False, "active": False, "backend": "cpu"}
+            if RecipeManager().gpu_feature_requested(self.gpu_config, "display"):
+                backend_status["display_gpu_note"] = PREVIEW_DISPLAY_GPU_NOTE
             height, width, channels = image.shape
             with profiler.measure("qimage_copy"):
                 qimage = QImage(

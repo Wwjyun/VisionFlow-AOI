@@ -489,6 +489,8 @@ class GuiWorkflowTests(unittest.TestCase):
                 config = screen.build_gpu_config()
                 self.assertEqual((config["mode"], config["fallback_to_cpu"]), (mode, fallback))
                 self.assertEqual(panel.tiling_toggle.isEnabled(), policy != Panel.POLICY_CPU)
+                # Preview conversion is CPU-only; the legacy display value is shown disabled and kept.
+                self.assertFalse(panel.display_toggle.isEnabled())
                 if (mode, fallback) == ("auto", False):
                     self.assertIn("行為等同「僅 GPU（嚴格）」", screen.gpu_status_label.text())
 
@@ -526,6 +528,19 @@ class GuiWorkflowTests(unittest.TestCase):
                 (screen.build_gpu_config()["mode"], screen.build_gpu_config()["fallback_to_cpu"]),
                 ("auto", True),
             )
+
+    def test_designer_keeps_legacy_gpu_display_value_without_dirty_state(self):
+        base = RecipeManager().load(Path("recipes/PRODUCT_A_AOI_01.yaml"))
+        for display in (True, False):
+            with self.subTest(display=display):
+                screen = DesignerScreen()
+                recipe = deepcopy(base)
+                recipe["gpu"] = {**recipe.get("gpu", {}), "mode": "auto", "display": display}
+                screen.set_recipe(recipe)
+                self.assertFalse(screen.is_dirty())
+                self.assertFalse(screen.gpu_panel.display_toggle.isEnabled())
+                self.assertIn("已停用", screen.gpu_panel.display_toggle.toolTip())
+                self.assertEqual(screen.build_gpu_config()["display"], display)
 
     def test_designer_round_trips_optional_pixel_size(self):
         screen = DesignerScreen()

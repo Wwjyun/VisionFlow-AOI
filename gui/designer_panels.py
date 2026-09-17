@@ -181,11 +181,15 @@ class GpuSettingsPanel(Panel):
         self.tiling_toggle = Toggle(checked=False)
         self.tiling_toggle.setToolTip("整圖上傳 GPU 後，切小圖（ROI）也在 GPU 上處理。")
         self.display_toggle = Toggle(checked=False)
-        self.display_toggle.setToolTip("GUI 載入影像預覽時，色彩轉換使用 GPU。")
+        # Kept only so older Recipes round-trip their ``gpu.display`` value; preview is CPU-only.
+        self.display_toggle.setToolTip(
+            "已停用：預覽色彩轉換固定在 CPU 執行（RTX 3090 正式尺寸 CPU 約 110 ms，GPU 含整圖往返約 310 ms）。"
+            "Recipe 原值照常保存。"
+        )
         self.dll_path_edit = QLineEdit(GpuRuntime.DEFAULT_DLL)
         self.dll_path_edit.setProperty("mono", "true")
         self._advanced_labels = (
-            _label("切小圖使用 GPU"), _label("GUI 預覽使用 GPU"), _label("CUDA DLL 路徑"),
+            _label("切小圖使用 GPU"), _label("GUI 預覽使用 GPU（已停用）"), _label("CUDA DLL 路徑"),
         )
         form.addRow(self._advanced_labels[0], self.tiling_toggle)
         form.addRow(self._advanced_labels[1], self.display_toggle)
@@ -252,8 +256,9 @@ class GpuSettingsPanel(Panel):
 
     def _apply_policy_enablement(self) -> None:
         gpu_allowed = self.policy() != self.POLICY_CPU
-        for widget in (self.tiling_toggle, self.display_toggle, self.dll_path_edit, *self._advanced_labels):
+        for widget in (self.tiling_toggle, self.dll_path_edit, *self._advanced_labels):
             widget.setEnabled(gpu_allowed)
+        self.display_toggle.setEnabled(False)
         self.detector_hint_label.setVisible(gpu_allowed)
 
 
