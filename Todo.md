@@ -623,6 +623,8 @@ vs 原本 `[255,255,20,20]`）。因此「標籤編號順序」對 202 的最終
 - [x] **VRAM 與整圖上傳狀態**（2026-09-17 完成，見完成紀錄）：runtime 已回報 `resident_image.device_memory_before_upload`（可用 VRAM、上傳大小、`dedicated_vram_low`）與 crossover 略過上傳，但 GUI 未顯示。於 TopBar backend chip tooltip 或效能面板顯示，VRAM 不足時以 inline notice 提示，狀態不得只依賴顏色。
 - [x] **CPU／GPU 對照執行（工程／管理模式）**（2026-09-17 完成，見完成紀錄）：同一張影像、同一份 Recipe 各跑一次 CPU 與 GPU，顯示判定欄位（PASS/NG、defect 數、bbox、area、confidence、metadata）是否一致與各階段倍數，比較邏輯沿用 `tools/benchmark_pipeline_production.py`，不修改 Recipe、不產生 dirty 狀態；OP 模式不可見。
 
+- [x] **Detector 清單看不到 GPU 小開關**（2026-09-17 使用者回報，同日完成，見完成紀錄）：Recipe 設計的 Detector 清單固定 280 px，每列右側的 GPU 開關被列內文字的最小寬度推出視窗，使用者只看得到最左邊的啟用開關。改為依列內容計算清單寬度，過長文字改用省略號收斂。
+
 ## P7：CI、GitHub Actions 與發布
 
 - [x] 一般 Windows runner 執行 unit tests、compileall、recipe/CLI/GUI smoke 與 CUDA headers/API 靜態檢查。
@@ -904,6 +906,8 @@ vs 原本 `[255,255,20,20]`）。因此「標籤編號順序」對 202 的最終
 - [ ] 加速不得犧牲 GUI 回應、打包啟動、結果追溯、錯誤訊息或 CPU fallback。
 
 ## 完成紀錄
+
+- [x] 2026-09-17：**Recipe 設計的 Detector 清單加寬，讓每個 Detector 的 GPU 小開關直接可見（使用者回報）。** 原本 `list_scroll` 固定 280 px，但每一列右側還有一個「GPU」開關欄；列內文字（編號、繁中名、英文 `display_name`）的一般 `QLabel` 會把完整文字寬度當成最小寬度，撐開列寬後把 GPU 開關推到視窗外，使用者只看得到最左邊的啟用開關、英文名也被切在邊界上。修正：（1）`gui/widgets/common.py` 新增 `ElidedLabel`：`sizeHint()` 仍回報完整文字寬度（清單才能量到真正需要的寬度）、`minimumSizeHint()` 只保留「…」寬度讓版面可以收斂、`text()` 仍回傳完整字串、hover 時以 tooltip 顯示完整文字；（2）Detector 列的繁中名與英文名改用 `ElidedLabel`；（3）`DesignerScreen._detector_list_width()` 依所有列實際 `sizeHint` 加上垂直捲軸寬度決定清單寬度，限制在 `DETECTOR_LIST_MIN_WIDTH` 280 與 `DETECTOR_LIST_MAX_WIDTH` 420 之間（超過上限才以省略號收斂），並把 `self.detector_list_scroll` 留給測試使用。實測本機 1920×1032 `MainWindow`（Recipe 設計頁）：清單 280 → 368 px，12 列 Detector 的 GPU 開關全部落在可視範圍內（x=322..356、viewport 368），水平捲軸範圍 0，英文 `display_name` 未被截斷；1180 px 視窗同樣全部可見。新增 `tests/test_gui_workflow.py` 兩項測試（每一列 GPU 開關都在 viewport 內且不需要水平捲動；`ElidedLabel` 的完整文字、tooltip 與省略行為）。完整 618 tests、compileall、CUDA preflight、`git diff --check`、GUI offscreen smoke 通過。
 
 - [x] 2026-09-17：**GUI 1000 張批量壓測與 worker 結果 signal 修正。** 以 offscreen `MainWindow` 走真實 GUI 批量路徑（自動背景預熱＋5 張單張暖機後，hard link 1000 張合成圖，輸出關閉，50 ms QTimer 量測事件迴圈延遲、每批 checkpoint 記 RSS／VRAM）。第一次壓測發現批量完成時 GUI 凍結約 3.8～4.0 s、RSS 另增約 530 MiB：根因是 `gui/workers.py` 的結果 signal 宣告為 `Signal(dict)`，PySide 在跨執行緒送出時把整份 1000 筆摘要轉成 QVariantMap 再轉回，且持有 GIL。全部 8 個 worker 結果 signal 改為 `Signal(object)`，只傳 Python 物件參照（worker 送出後不再修改）；新增 `tests/test_worker_signal_payloads.py`（真實 QThread 下收到的是同一物件、改動前程式會失敗；worker 檔案不得再有 `Signal(dict)`／`Signal(list)`）。另發現量測腳本若以 lambda 取代 `MainWindow` 處理函式，PySide 會以 DirectConnection 在 worker 執行緒執行而使 GUI 存取崩潰（0xC0000005，faulthandler 堆疊確認）；產品程式所有 worker signal 均連到 `MainWindow` bound method，已逐一檢查，腳本改為觀察 `batch_result` 狀態後重測。修正後結果（`outputs_validation/gui_batch_stress/*_final/report.json`、`negative_401_repeat4/repeat_report.json`）：202-CS-SN-1 正式尺寸 1000 張 0 error、全部 NG／558，單張 median／P95 226／234 ms，VRAM 2820～2871 MiB 無成長，事件迴圈 median／p99 12.9／27.1 ms；401-AS-SN-1 4000×3000 1000 張 0 error、全部 NG／243，119／135 ms，VRAM 1176～1186 MiB；批量結束後 RSS 不再跳增（+0.3 MiB）。批量中 RSS 每張約 +0.32 MiB 為保留的批量結果列（compact detail 每筆約 77～111 KB 加表格模型），401 同一 process 連續 4 批 RSS 557.9→865.1→865.1→865.7 MiB、private 1277.8→1586.2→1585.4→1586.4 MiB、VRAM 1168 MiB，第 2 批後持平（上一批結果保留到下一批取代），無洩漏、無崩潰。仍存在批量完成瞬間約 0.64～0.67 s 卡頓（`resizeColumnsToContents`），已列 P6 待辦，warm-up＋10／100／1000 張驗收項因此暫不勾選。完整 616 tests、compileall、CUDA preflight、`git diff --check`、GUI offscreen smoke 通過。
 

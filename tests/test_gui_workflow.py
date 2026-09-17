@@ -13,7 +13,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PySide6.QtCore import QSettings
 from PySide6.QtGui import QImage, QPalette
-from PySide6.QtWidgets import QApplication, QComboBox
+from PySide6.QtWidgets import QApplication, QComboBox, QLabel
 
 from core.detector_manager import DetectorManager
 from core.recipe_manager import RecipeManager
@@ -25,6 +25,7 @@ from gui.screens.designer_screen import DesignerScreen, YoloXModelFilePicker
 from gui.screens.results_screen import ResultsScreen
 from gui.table_models import RowTableModel, StatusFilterProxyModel, TableColumn, deterministic_sample
 from gui.theme import COLORS, build_stylesheet
+from gui.widgets.common import ElidedLabel
 from gui.widgets.topbar import TopBar
 
 
@@ -616,6 +617,49 @@ class GuiWorkflowTests(unittest.TestCase):
         confidence.edit.editingFinished.emit()
         self.assertTrue(screen.is_dirty())
         self.assertEqual(screen.editor_state_badge.text(), "未儲存")
+
+    def test_designer_detector_rows_show_gpu_switch_without_horizontal_scrolling(self):
+        """The per-Detector GPU switch is the right-hand column of a row; the list must be
+        wide enough to show it, otherwise the user only sees the enable switch."""
+
+        screen = DesignerScreen()
+        screen.resize(1400, 860)
+        screen.show()
+        self.app.processEvents()
+
+        list_area = screen.detector_list_scroll
+        viewport = list_area.viewport()
+        self.assertEqual(list_area.horizontalScrollBar().maximum(), 0)
+        self.assertGreaterEqual(list_area.width(), screen.DETECTOR_LIST_MIN_WIDTH)
+        self.assertLessEqual(list_area.width(), screen.DETECTOR_LIST_MAX_WIDTH)
+
+        for detector_id, widgets in screen._row_widgets.items():
+            gpu_toggle = widgets["gpu_toggle"]
+            top_left = gpu_toggle.mapTo(viewport, gpu_toggle.rect().topLeft())
+            right_edge = top_left.x() + gpu_toggle.width()
+            self.assertGreaterEqual(top_left.x(), 0, detector_id)
+            self.assertLessEqual(right_edge, viewport.width(), detector_id)
+
+    def test_elided_label_keeps_full_text_and_shrinks(self):
+        label = ElidedLabel("401-CS-AP-1 adaptive circle contour detector")
+        label.show()
+        self.app.processEvents()
+
+        full_text = "401-CS-AP-1 adaptive circle contour detector"
+        self.assertEqual(label.text(), full_text)
+        self.assertEqual(label.toolTip(), full_text)
+        self.assertLess(label.minimumSizeHint().width(), label.sizeHint().width())
+
+        label.resize(80, 18)
+        self.app.processEvents()
+        painted = QLabel.text(label)
+        self.assertNotEqual(painted, full_text)
+        self.assertTrue(painted.endswith("…"), painted)
+        self.assertLess(len(painted), len(full_text))
+
+        label.resize(600, 18)
+        self.app.processEvents()
+        self.assertEqual(QLabel.text(label), full_text)
 
     def test_designer_enforces_outer_parameters_for_engineer_and_all_for_admin(self):
         screen = DesignerScreen()

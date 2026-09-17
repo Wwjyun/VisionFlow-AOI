@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from PySide6.QtCore import QRectF, Qt, Signal
+from PySide6.QtCore import QRectF, QSize, Qt, Signal
 from PySide6.QtGui import QColor, QPainter
 from PySide6.QtWidgets import (
     QAbstractButton,
@@ -72,6 +72,59 @@ class Badge(QLabel):
         self.setProperty("kind", kind)
         self.style().unpolish(self)
         self.style().polish(self)
+
+
+class ElidedLabel(QLabel):
+    """Label that shrinks with an ellipsis instead of forcing its full text width.
+
+    Plain ``QLabel`` reports its whole text as the minimum width, so a label with a
+    long string forces every ancestor layout to stay wide. Inside a fixed-width
+    column that used to push neighbouring controls (for example the per-Detector GPU
+    switch) outside the visible area. ``text()`` still returns the full string; only
+    the painted text is shortened.
+    """
+
+    def __init__(
+        self,
+        text: str = "",
+        parent=None,
+        mode: Qt.TextElideMode = Qt.TextElideMode.ElideRight,
+    ):
+        super().__init__("", parent)
+        self._full_text = ""
+        self._elide_mode = mode
+        self.setText(text)
+
+    def setText(self, text: str) -> None:
+        self._full_text = str(text or "")
+        if self._full_text:
+            self.setToolTip(self._full_text)
+        self._refresh_elided()
+
+    def text(self) -> str:
+        return self._full_text
+
+    def sizeHint(self) -> QSize:
+        metrics = self.fontMetrics()
+        width = metrics.horizontalAdvance(self._full_text) if self._full_text else 0
+        return QSize(width, super().sizeHint().height())
+
+    def minimumSizeHint(self) -> QSize:
+        height = super().minimumSizeHint().height()
+        return QSize(self.fontMetrics().horizontalAdvance("…"), height)
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        self._refresh_elided()
+
+    def _refresh_elided(self) -> None:
+        width = self.width()
+        if width <= 0:
+            elided = self._full_text
+        else:
+            elided = self.fontMetrics().elidedText(self._full_text, self._elide_mode, width)
+        if elided != super().text():
+            super().setText(elided)
 
 
 class InlineNotice(QFrame):

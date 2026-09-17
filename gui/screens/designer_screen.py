@@ -37,7 +37,15 @@ from gui.designer_model import (
 from gui.designer_panels import CameraRecipePanel, GpuSettingsPanel, PreviewPanel, RecipeInfoPanel
 from gui.detector_labels import detector_zh_name
 from gui.theme import COLORS, R_MD
-from gui.widgets.common import Badge, NumStepper, Segmented, Toggle, make_param_widget, param_value
+from gui.widgets.common import (
+    Badge,
+    ElidedLabel,
+    NumStepper,
+    Segmented,
+    Toggle,
+    make_param_widget,
+    param_value,
+)
 from gui.widgets.panel import Panel
 
 # ============================================================
@@ -251,6 +259,11 @@ class DesignerScreen(QWidget):
     dirty_changed = Signal(bool)
     validation_changed = Signal(bool, str)
     yolox_model_directory_changed = Signal(str)
+
+    # Detector list column: wide enough for the enable/GPU switches plus the text,
+    # capped so a long detector name cannot squeeze the parameter form.
+    DETECTOR_LIST_MIN_WIDTH = 280
+    DETECTOR_LIST_MAX_WIDTH = 420
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -826,9 +839,9 @@ class DesignerScreen(QWidget):
 
         list_scroll = QScrollArea()
         list_scroll.setWidgetResizable(True)
-        list_scroll.setFixedWidth(280)
         list_scroll.setFrameShape(QFrame.Shape.NoFrame)
         list_scroll.setStyleSheet(f"QScrollArea {{ border-right: 1px solid {COLORS['border']}; }}")
+        self.detector_list_scroll = list_scroll
 
         list_widget = QWidget()
         list_layout = QVBoxLayout(list_widget)
@@ -840,6 +853,7 @@ class DesignerScreen(QWidget):
         list_layout.addStretch(1)
 
         list_scroll.setWidget(list_widget)
+        list_scroll.setFixedWidth(self._detector_list_width())
         body_layout.addWidget(list_scroll)
 
         params_scroll = QScrollArea()
@@ -884,6 +898,23 @@ class DesignerScreen(QWidget):
         self._select_detector("401-CS-AP-1")
         return panel
 
+    def _detector_list_width(self) -> int:
+        """Width that keeps every detector row (including its GPU switch) fully visible.
+
+        Rows reserve a fixed switch column on the right, so the list must be at least
+        as wide as the widest row or that column is pushed out of the viewport. The
+        width is measured from the rows themselves so it follows the active font and
+        detector metadata instead of a hard-coded guess.
+        """
+
+        rows = [widgets["row"] for widgets in self._row_widgets.values()]
+        content = max((row.sizeHint().width() for row in rows), default=0)
+        scrollbar = self.detector_list_scroll.verticalScrollBar().sizeHint().width()
+        return min(
+            max(self.DETECTOR_LIST_MIN_WIDTH, content + scrollbar),
+            self.DETECTOR_LIST_MAX_WIDTH,
+        )
+
     def _build_detector_row(self, detector_id: str) -> QWidget:
         definition = self.detector_definitions[detector_id]
 
@@ -917,13 +948,13 @@ class DesignerScreen(QWidget):
         id_label = QLabel(detector_id)
         id_label.setProperty("mono", "true")
         id_label.setStyleSheet("font-weight: 600;")
-        zh_label = QLabel(detector_zh_name(detector_id))
+        zh_label = ElidedLabel(detector_zh_name(detector_id))
         zh_label.setStyleSheet(f"color: {COLORS['text_2']}; font-size: 12px;")
         title_row.addWidget(id_label)
         title_row.addWidget(zh_label, 1)
         text_col.addLayout(title_row)
 
-        display_label = QLabel(definition["display_name"])
+        display_label = ElidedLabel(definition["display_name"])
         display_label.setStyleSheet(f"color: {COLORS['text_3']}; font-size: 11px;")
         text_col.addWidget(display_label)
 
