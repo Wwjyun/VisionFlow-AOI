@@ -22,7 +22,7 @@ from core.provenance import (
     sha256_bytes,
 )
 from core.recipe_manager import RecipeError, RecipeManager
-from core.report_artifacts import CsvExporter
+from core.report_artifacts import CsvExporter, MatrixCsvExporter
 from gpu.benchmark_gate import compare_p95
 
 
@@ -345,6 +345,46 @@ class ReporterAreaCalibrationTests(unittest.TestCase):
 
         self.assertEqual(float(row["area"]), 250.0)
         self.assertEqual(row["area_unit"], "px^2")
+
+
+
+class MatrixCsvDefectTypeTests(unittest.TestCase):
+    @staticmethod
+    def _tile(row, col, result, detectors):
+        return {"tile": {"tile_id": f"r{row}c{col}", "row": row, "col": col}, "result": result, "detectors": detectors}
+
+    def test_ng_cells_list_distinct_defect_types_and_pass_cells_stay_empty(self):
+        cnr = {"type": "202-1_auto_cnr_ng"}
+        circle = {"type": "401_1_circle_detected_ng"}
+        result = {
+            "image_name": "IMG.bmp",
+            "tiles": [
+                self._tile(0, 0, "PASS", [{"detector_id": "202-1", "pass": True, "defects": []}]),
+                self._tile(0, 1, "NG", [
+                    {"detector_id": "202-1", "pass": False, "defects": [cnr, dict(cnr), dict(cnr)]},
+                    {"detector_id": "401-1", "pass": False, "defects": [circle]},
+                ]),
+                self._tile(1, 0, "NG", [{"detector_id": "401-1", "pass": False, "defects": [circle]}]),
+                # Detector NG without defect entries still marks the cell with the NG detector.
+                self._tile(1, 1, "NG", [
+                    {"detector_id": "202-1", "pass": True, "defects": []},
+                    {"detector_id": "900-DOMAIN", "pass": False, "defects": []},
+                ]),
+            ],
+        }
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "IMG_matrix.csv"
+            MatrixCsvExporter.write_matrix_csv(path, result)
+            with path.open(encoding="utf-8-sig", newline="") as handle:
+                rows = list(csv.DictReader(handle))
+
+        self.assertEqual(
+            rows,
+            [
+                {"id": "IMG-2", "c1": "", "c2": "202-1_auto_cnr_ng; 401_1_circle_detected_ng"},
+                {"id": "IMG-1", "c1": "401_1_circle_detected_ng", "c2": "900-DOMAIN"},
+            ],
+        )
 
 
 class ContinuousValidationContractTests(unittest.TestCase):

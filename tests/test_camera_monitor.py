@@ -3,10 +3,12 @@ from __future__ import annotations
 import json
 import os
 import tempfile
+import threading
 import time
 import unittest
 from copy import deepcopy
 from pathlib import Path
+from unittest.mock import MagicMock, patch
 
 import numpy as np
 import yaml
@@ -16,7 +18,13 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 from PySide6.QtCore import QSettings
 from PySide6.QtWidgets import QApplication
 
-from core.camera_monitor_processor import CameraFrameQueue, CameraMonitorProcessor, CapturedFrame
+from core.camera_monitor_processor import (
+    RAW_FRAME_SUBDIR,
+    CameraFrameQueue,
+    CameraMonitorProcessor,
+    CapturedFrame,
+    RawFrameSaver,
+)
 from core.image_loader import ImageLoadError, frame_to_bgr, load_image
 from core.pipeline import AOIPipeline
 from devices.ccd_models import (
@@ -162,6 +170,86 @@ class CameraMonitorProcessorTests(unittest.TestCase):
         self.assertEqual((summary["processed"], summary["dropped"], summary["source"]), (2, 1, "camera"))
         self.assertTrue(queue.closed)
 
+    def test_raw_frames_are_saved_while_the_same_frame_is_inspected(self):
+        frames = [_gray_frame(index) for index in range(2)]
+        write_started = threading.Event()
+        writer_threads: list[str] = []
+        overlapped: list[bool] = []
+
+        def write(frame, path):
+            writer_threads.append(threading.current_thread().name)
+            write_started.set()
+            return write_frame_atomic(frame, path, ImageSaveFormat.BMP)
+
+        original_run_frame = AOIPipeline.run_frame
+
+        def run_frame(pipeline, frame, source_name, metadata=None):
+            # Inspection must not wait for the save to finish, and the save must not wait for inspection.
+            overlapped.append(write_started.wait(5.0))
+            write_started.clear()
+            return original_run_frame(pipeline, frame, source_name, metadata)
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            recipe_path = _write_recipe(root, save_json=False)
+            queue = CameraFrameQueue(capacity=2)
+            for index, frame in enumerate(frames):
+                queue.put(CapturedFrame(frame, f"camera_{index}", time.perf_counter(), {"frame_index": index}))
+            queue.put(CapturedFrame(_gray_frame(9), "camera_dropped", time.perf_counter(), {}))
+            items: list[dict] = []
+            processor = CameraMonitorProcessor(
+                queue,
+                recipe_path,
+                root / "out",
+                item_callback=items.append,
+                stop_callback=lambda: True,
+                raw_frame_saver=RawFrameSaver(".bmp", write),
+            )
+            with patch.object(AOIPipeline, "run_frame", run_frame):
+                summary = processor.run()
+            raw_dir = Path(summary["raw_dir"])
+            saved = sorted(path.name for path in raw_dir.iterdir())
+            reloaded = [load_image(raw_dir / f"camera_{index}.bmp") for index in range(2)]
+
+        self.assertEqual(overlapped, [True, True])
+        self.assertTrue(all(name.startswith("camera-raw") for name in writer_threads))
+        self.assertEqual(raw_dir.name, RAW_FRAME_SUBDIR)
+        self.assertEqual(saved, ["camera_0.bmp", "camera_1.bmp"], "no .tmp leftovers and dropped frames are not saved")
+        for frame, pixels in zip(frames, reloaded):
+            np.testing.assert_array_equal(pixels, frame_to_bgr(frame))
+        *inspected, dropped = items
+        self.assertIn("原圖也未存入監控資料夾", dropped["error"])
+        self.assertNotIn("raw_image_path", dropped)
+        self.assertEqual([Path(item["raw_image_path"]).name for item in inspected], ["camera_0.bmp", "camera_1.bmp"])
+        for item in inspected:
+            self.assertIn(item["final_result"], {"PASS", "NG"})
+            self.assertGreaterEqual(item["timing"]["raw_save_sec"], 0.0)
+            self.assertGreaterEqual(item["timing"]["raw_save_wait_sec"], 0.0)
+        self.assertEqual((summary["raw_saved"], summary["raw_failed"]), (2, 0))
+
+    def test_raw_save_failure_keeps_the_inspection_result(self):
+        def failing_write(frame, path):
+            raise OSError("disk full")
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            queue = CameraFrameQueue()
+            queue.put(CapturedFrame(_gray_frame(), "camera_0", time.perf_counter(), {}))
+            items: list[dict] = []
+            summary = CameraMonitorProcessor(
+                queue,
+                _write_recipe(root, save_json=False),
+                root / "out",
+                item_callback=items.append,
+                stop_callback=lambda: True,
+                raw_frame_saver=RawFrameSaver(".bmp", failing_write),
+            ).run()
+
+        self.assertIn(items[0]["final_result"], {"PASS", "NG"})
+        self.assertIn("disk full", items[0]["raw_image_error"])
+        self.assertNotIn("raw_image_path", items[0])
+        self.assertEqual((summary["raw_saved"], summary["raw_failed"]), (0, 1))
+
     def test_worker_failure_is_reported_and_closes_the_queue(self):
         app = QApplication.instance() or QApplication([])
         queue = CameraFrameQueue()
@@ -224,6 +312,39 @@ class ControllerHandOffTests(unittest.TestCase):
         self.assertLess(captured[0].source_name, captured[1].source_name)
         self.assertTrue(captured[0].source_name.startswith("camera_"))
 
+    def test_monitor_saved_frames_skip_the_duplicate_snapshot_auto_save(self):
+        self.controller.apply_camera_settings(
+            CameraConnectionSettings(),
+            CameraRecipeSettings(trigger=TriggerSettings(TriggerMode.SOFTWARE), auto_save_software_trigger=True),
+        )
+        self.controller.connect_camera()
+        submit = MagicMock(return_value=Path("snapshot.bmp"))
+        self.controller._save_queue.submit = submit
+
+        queue = CameraFrameQueue(capacity=1)
+        self.controller.attach_inspection_queue(queue, monitor_saves_raw=True)
+        self.camera.emit_frame()
+        self.assertEqual((queue.pending(), submit.call_count), (1, 0), "the monitor saves the accepted frame")
+        rejected = self.camera.emit_frame()
+        self.assertEqual(submit.call_count, 1, "a frame the full queue rejected keeps its auto-save")
+        self.assertIs(submit.call_args.args[0], rejected)
+
+        self.controller.attach_inspection_queue(CameraFrameQueue(), monitor_saves_raw=False)
+        self.camera.emit_frame()
+        self.assertEqual(submit.call_count, 2)
+        self.controller.detach_inspection_queue()
+        self.camera.emit_frame()
+        self.assertEqual(submit.call_count, 3)
+
+    def test_raw_frame_saver_uses_the_machine_save_format(self):
+        saver = self.controller.raw_frame_saver()
+        self.assertEqual(saver.extension, ImageSaveFormat(self.controller._machine.save.image_format).extension)
+        with tempfile.TemporaryDirectory() as directory:
+            frame = _gray_frame(shape=(8, 12))
+            path = saver.write(frame, Path(directory) / "raw" / f"camera_1{saver.extension}")
+            self.assertTrue(path.exists())
+            self.assertFalse(path.with_name(path.name + ".tmp").exists())
+
 
 class MainWindowCameraMonitorTests(unittest.TestCase):
     @classmethod
@@ -274,7 +395,13 @@ class MainWindowCameraMonitorTests(unittest.TestCase):
                 self.assertEqual(window.monitor_result["processed"], 2)
                 self.assertTrue(Path(window.monitor_result["output_dir"]).name.endswith("_camera"))
 
-                window._open_monitor_original_image(items[0])
+                raw_paths = [Path(item["raw_image_path"]) for item in items]
+                self.assertTrue(all(path.exists() for path in raw_paths))
+                self.assertEqual(window.monitor_result["raw_saved"], 2)
+                with patch("gui.main_window.QDesktopServices.openUrl") as open_url:
+                    window._open_monitor_original_image(items[0])
+                self.assertEqual(Path(open_url.call_args.args[0].toLocalFile()), raw_paths[0])
+                window._open_monitor_original_image({"source": "camera"})
                 self.assertEqual(window.notice_bar.label.text(), CAMERA_MONITOR_NO_ORIGINAL_MESSAGE)
             finally:
                 window.ccd_controller.close()

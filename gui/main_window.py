@@ -82,9 +82,7 @@ ALL_SCREENS = set(SCREEN_INDEX)
 HISTORY_LIMIT = 6
 METER_WHEEL_AUTO_CONNECT_DELAY_MS = 1000
 CAMERA_MONITOR_READY_MESSAGE = "相機直連已就緒：按「啟動」後會檢測每張觸發完成的影像。"
-CAMERA_MONITOR_NO_ORIGINAL_MESSAGE = (
-    "相機直連影像沒有另存原圖；需要原圖時請在 Recipe 相機設定開啟自動存圖，影像會存到 CCD 控制的存圖資料夾。"
-)
+CAMERA_MONITOR_NO_ORIGINAL_MESSAGE = "這張相機影像沒有保存原圖（檢測佇列已滿或存圖失敗），詳見錯誤欄位與 log。"
 
 OUTPUT_TOGGLE_LABELS = {
     "save_overlay": "儲存 overlay 影像",
@@ -903,7 +901,9 @@ class MainWindow(QMainWindow, LogMixin):
 
         if camera_source:
             frame_queue = CameraFrameQueue()
-            self.ccd_controller.attach_inspection_queue(frame_queue)
+            # Every inspected frame is saved to the monitor folder while it is inspected, from the same
+            # in-memory frame, so the original is kept without a write-then-read round trip.
+            self.ccd_controller.attach_inspection_queue(frame_queue, monitor_saves_raw=True)
             worker = CameraMonitorWorker(
                 frame_queue=frame_queue,
                 recipe_path=self.recipe_path,
@@ -911,6 +911,7 @@ class MainWindow(QMainWindow, LogMixin):
                 output_overrides=dict(self.output_opts),
                 warmup_image_path=self.image_path,
                 gpu_session_cache=self._inspection_gpu_sessions,
+                raw_frame_saver=self.ccd_controller.raw_frame_saver(),
             )
         else:
             worker = FolderMonitorWorker(
@@ -958,9 +959,15 @@ class MainWindow(QMainWindow, LogMixin):
 
     def _open_monitor_original_image(self, item: dict) -> None:
         if item.get("source") == "camera":
-            self._notice(CAMERA_MONITOR_NO_ORIGINAL_MESSAGE, "info")
-            return
-        image_path = Path(str(item.get("image_path") or item.get("moved_image_path") or item.get("source_image_path") or ""))
+            if not item.get("raw_image_path"):
+                message = str(item.get("raw_image_error") or CAMERA_MONITOR_NO_ORIGINAL_MESSAGE)
+                self._notice(message, "info")
+                return
+            image_path = Path(str(item["raw_image_path"]))
+        else:
+            image_path = Path(
+                str(item.get("image_path") or item.get("moved_image_path") or item.get("source_image_path") or "")
+            )
         if not image_path.exists():
             self._notice(f"找不到原圖：{image_path}", "warning")
             return

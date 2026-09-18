@@ -107,7 +107,7 @@ $env:AOI_LOG_DIR = 'outputs\logs'
 4. 在「檢測結果」查看缺陷、NG 縮圖及輸出路徑。
 5. 在「批量數據圖表」查看 PASS／NG／ERROR 與缺陷分布。
 
-「監控模式」可監看資料夾新檔，也可接收相機觸發完成的 frame。兩種來源都走相同 Pipeline 與輸出格式。
+「監控模式」可監看資料夾新檔，也可接收相機觸發完成的 frame。兩種來源都走相同 Pipeline 與輸出格式。相機直連時每張檢測的 frame 會一邊檢測、一邊以 CCD 機台設定的存圖格式存到本次監控資料夾的 `raw/`，檢測直接使用記憶體中的 frame，不需先寫檔再讀回。
 
 ## 系統架構
 
@@ -316,7 +316,7 @@ $env:VISIONFLOW_CCD_SIMULATOR = '1'
 | Overlay | 原圖上的 Tile、缺陷框、標籤與結果 |
 | NG Tiles | 含缺陷的 Tile 小圖 |
 | CSV | 缺陷明細與跨圖片 `summary.csv` |
-| Matrix CSV | 依 Tile 列欄排列的結果矩陣 |
+| Matrix CSV | 依 Tile 列欄排列的結果矩陣；NG 格列出該 Tile 的缺陷類型（去重，以 `; ` 分隔），PASS 格留空 |
 | JSON | 完整 Recipe、結果、座標、metadata 與實際 backend |
 | Logs | 輪替應用程式日誌 |
 | Debug images | 僅 `--debug` 且 Detector 支援時產生 |

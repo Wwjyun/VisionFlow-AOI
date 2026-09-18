@@ -11,7 +11,7 @@ import numpy as np
 
 from core.backend_comparison import BackendComparison
 from core.batch_processor import BatchInspectionProcessor
-from core.camera_monitor_processor import CameraFrameQueue, CameraMonitorProcessor
+from core.camera_monitor_processor import CameraFrameQueue, CameraMonitorProcessor, RawFrameSaver
 from core.csv_summary import CsvSummaryExporter
 from core.gpu_runtime import GpuRuntime, GpuRuntimeError
 from core.gpu_session import GpuExecutionSessionCache
@@ -337,9 +337,11 @@ class CameraMonitorWorker(QObject, LogMixin):
         output_overrides: dict | None = None,
         warmup_image_path: Path | None = None,
         gpu_session_cache: GpuExecutionSessionCache | None = None,
+        raw_frame_saver: RawFrameSaver | None = None,
     ):
         super().__init__()
         self.frame_queue = frame_queue
+        self.raw_frame_saver = raw_frame_saver
         self.recipe_path = Path(recipe_path)
         self.output_dir = Path(output_dir)
         self.output_overrides = output_overrides
@@ -365,6 +367,7 @@ class CameraMonitorWorker(QObject, LogMixin):
                     stop_callback=lambda: self._stop_requested,
                     warmup_image_path=self.warmup_image_path,
                     gpu_session=gpu_session,
+                    raw_frame_saver=self.raw_frame_saver,
                 )
                 result = processor.run()
         except Exception as exc:

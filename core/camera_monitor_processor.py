@@ -5,6 +5,8 @@ import gc
 import threading
 import time
 from collections import deque
+from collections.abc import Callable
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -26,6 +28,20 @@ from core.result_compactor import compact_inspection_result
 # a full queue reports the frame as not inspected instead of growing without bound.
 CAMERA_FRAME_QUEUE_CAPACITY = 4
 QUEUE_POLL_SEC = 0.1
+RAW_FRAME_SUBDIR = "raw"
+
+
+@dataclass(frozen=True)
+class RawFrameSaver:
+    """How camera monitoring keeps the original pixels of every inspected frame.
+
+    ``write(frame, path)`` must write atomically (for example through a ``.tmp`` file) and return
+    the final path. The writer only reads the frame, so it runs on the same array the inspection
+    uses: saving overlaps inspection instead of writing a file and reading it back.
+    """
+
+    extension: str
+    write: Callable[[np.ndarray, Path], Path]
 
 
 @dataclass(frozen=True)
@@ -112,6 +128,7 @@ class CameraMonitorProcessor(LogMixin):
         stop_callback: MonitorStopCallback | None = None,
         warmup_image_path: Path | None = None,
         gpu_session: GpuExecutionSession | None = None,
+        raw_frame_saver: RawFrameSaver | None = None,
     ):
         self.frame_queue = frame_queue
         self.recipe_path = Path(recipe_path)
@@ -122,15 +139,32 @@ class CameraMonitorProcessor(LogMixin):
         self.stop_callback = stop_callback
         self.warmup_image_path = Path(warmup_image_path) if warmup_image_path else None
         self.gpu_session = gpu_session
+        self.raw_frame_saver = raw_frame_saver
+        self._raw_executor: ThreadPoolExecutor | None = None
         self._processed_count = 0
         self._dropped_count = 0
+        self._raw_saved_count = 0
+        self._raw_failed_count = 0
 
     def run(self) -> dict:
         started_at = datetime.datetime.now()
         monitor_output_dir = self.output_dir / "monitor" / f"{started_at:%Y%m%d_%H%M%S}_camera"
         monitor_output_dir.mkdir(parents=True, exist_ok=True)
         self.logger.info("Camera monitor started: recipe=%s output=%s", self.recipe_path, monitor_output_dir)
+        if self.raw_frame_saver is not None:
+            # One writer: each frame's save overlaps its own inspection and finishes before the next
+            # frame starts, so at most one frame is being written at a time.
+            self._raw_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="camera-raw")
         session_started = time.perf_counter()
+        try:
+            summary = self._run(started_at, monitor_output_dir, session_started)
+        finally:
+            if self._raw_executor is not None:
+                self._raw_executor.shutdown(wait=True)
+                self._raw_executor = None
+        return summary
+
+    def _run(self, started_at: datetime.datetime, monitor_output_dir: Path, session_started: float) -> dict:
         with GpuExecutionSession.scoped(self.recipe_path, self.gpu_session) as gpu_session:
             session_ms = round((time.perf_counter() - session_started) * 1000.0, 1)
             gpu_warmup = {
@@ -167,6 +201,10 @@ class CameraMonitorProcessor(LogMixin):
             "dropped": self._dropped_count,
             "gpu_warmup": gpu_warmup,
         }
+        if self.raw_frame_saver is not None:
+            summary["raw_dir"] = str(monitor_output_dir / RAW_FRAME_SUBDIR)
+            summary["raw_saved"] = self._raw_saved_count
+            summary["raw_failed"] = self._raw_failed_count
         csv_summary_path = CsvSummaryExporter.write_summary(monitor_output_dir / "csv")
         if csv_summary_path is not None:
             summary["csv_summary"] = str(csv_summary_path)
@@ -175,6 +213,7 @@ class CameraMonitorProcessor(LogMixin):
 
     def _inspect(self, frame: CapturedFrame, monitor_output_dir: Path, gpu_session: GpuExecutionSession) -> None:
         processing_started = time.perf_counter()
+        raw_save = self._start_raw_save(frame, monitor_output_dir)
         pipeline_duration = 0.0
         result = None
         try:
@@ -206,17 +245,54 @@ class CameraMonitorProcessor(LogMixin):
         finally:
             result = None
             gc.collect(0)
-        self._emit(item, frame.received_at, processing_started, pipeline_duration, frame.metadata)
+        raw_info = self._finish_raw_save(frame.source_name, raw_save)
+        self._emit(item, frame.received_at, processing_started, pipeline_duration, frame.metadata, raw_info)
         self._processed_count += 1
         self._progress(100, f"已處理 {frame.source_name}")
+
+    def _start_raw_save(self, frame: CapturedFrame, monitor_output_dir: Path) -> Future | None:
+        if self.raw_frame_saver is None or self._raw_executor is None:
+            return None
+        saver = self.raw_frame_saver
+        path = monitor_output_dir / RAW_FRAME_SUBDIR / f"{frame.source_name}{saver.extension}"
+
+        def write() -> tuple[Path, float]:
+            started = time.perf_counter()
+            saved = saver.write(frame.image, path)
+            return Path(saved), time.perf_counter() - started
+
+        return self._raw_executor.submit(write)
+
+    def _finish_raw_save(self, source_name: str, raw_save: Future | None) -> dict:
+        if raw_save is None:
+            return {}
+        wait_started = time.perf_counter()
+        try:
+            saved_path, save_sec = raw_save.result()
+        except Exception as exc:
+            self._raw_failed_count += 1
+            self.logger.exception("Camera raw frame save failed: frame=%s", source_name)
+            return {
+                "raw_image_error": f"原圖保存失敗：{exc}",
+                "timing": {"raw_save_wait_sec": round(time.perf_counter() - wait_started, 6)},
+            }
+        self._raw_saved_count += 1
+        return {
+            "raw_image_path": str(saved_path),
+            "timing": {
+                "raw_save_sec": round(save_sec, 6),
+                "raw_save_wait_sec": round(time.perf_counter() - wait_started, 6),
+            },
+        }
 
     def _report_dropped(self) -> None:
         for dropped in self.frame_queue.take_dropped():
             self._dropped_count += 1
             self.logger.warning("Camera frame dropped: frame=%s capacity=%s", dropped.source_name, self.frame_queue.capacity)
+            not_saved = "，原圖也未存入監控資料夾" if self.raw_frame_saver is not None else ""
             item = self._error_item(
                 dropped.source_name,
-                f"檢測佇列已滿（上限 {self.frame_queue.capacity} 張），此影像未檢測。",
+                f"檢測佇列已滿（上限 {self.frame_queue.capacity} 張），此影像未檢測{not_saved}。",
             )
             now = time.perf_counter()
             self._emit(item, dropped.received_at, now, 0.0, dropped.metadata)
@@ -243,19 +319,23 @@ class CameraMonitorProcessor(LogMixin):
         processing_started: float,
         pipeline_duration: float,
         metadata: dict,
+        raw_info: dict | None = None,
     ) -> None:
         finished = time.perf_counter()
+        raw_info = dict(raw_info or {})
         # Camera frames skip file discovery and moving: end-to-end runs from the driver hand-off.
         timing = {
             "queue_wait_sec": round(max(0.0, processing_started - received_at), 6),
             "pipeline_and_reports_sec": round(max(0.0, pipeline_duration), 6),
             "end_to_end_sec": round(max(0.0, finished - received_at), 3),
+            **raw_info.pop("timing", {}),
         }
         data = item.to_dict()
         data["duration_sec"] = timing["end_to_end_sec"]
         data["timing"] = timing
         data["source"] = "camera"
         data["camera"] = dict(metadata)
+        data.update(raw_info)
         if self.item_callback is not None:
             self.item_callback(data)
 

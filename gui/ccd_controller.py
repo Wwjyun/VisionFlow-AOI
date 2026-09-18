@@ -12,7 +12,7 @@ import numpy as np
 from PySide6.QtCore import QObject, Qt, QTimer, Signal
 from PySide6.QtGui import QImage
 
-from core.camera_monitor_processor import CameraFrameQueue, CapturedFrame
+from core.camera_monitor_processor import CameraFrameQueue, CapturedFrame, RawFrameSaver
 from core.logging_system import LogMixin
 from devices.ccd_models import (
     CAMERA_STATE_LABELS,
@@ -25,6 +25,7 @@ from devices.ccd_models import (
     DeviceAvailability,
     DeviceError,
     ExtensionCompareChannel,
+    ImageSaveFormat,
     MeterWheelSettings,
     MeterWheelSnapshot,
     MultipleRate,
@@ -34,7 +35,7 @@ from devices.ccd_models import (
 )
 from devices.ccd_settings_store import CcdMachineSettingsStore
 from devices.factory import CcdDevices
-from devices.frame_writer import SaveQueueStats, SnapshotSaveQueue
+from devices.frame_writer import SaveQueueStats, SnapshotSaveQueue, write_frame_atomic
 from devices.trigger_automation import (
     SOFTWARE_TRIGGER_POLL_SEC,
     AutoSaveRequests,
@@ -163,6 +164,7 @@ class CcdController(QObject, LogMixin):
         self._software_capture_lock = threading.Lock()
         self._software_capture_queued = False
         self._inspection_queue: CameraFrameQueue | None = None
+        self._inspection_saves_raw = True
         self._inspection_sequence = 0
 
         self._converter = PreviewFrameConverter(self.preview_image_ready.emit)
@@ -293,12 +295,26 @@ class CcdController(QObject, LogMixin):
             return "相機以連續取像連線；相機直連檢測只檢測觸發影像，請改用外部觸發或軟體觸發並重新連線。"
         return ""
 
-    def attach_inspection_queue(self, queue: CameraFrameQueue) -> None:
+    def attach_inspection_queue(self, queue: CameraFrameQueue, monitor_saves_raw: bool = True) -> None:
+        """Hand trigger frames to camera monitoring.
+
+        When the monitor saves every inspected frame itself, the snapshot auto-save skips the frames it
+        accepted so an 819 MB frame is not written twice; frames the queue rejects keep auto-save.
+        """
         self._inspection_sequence = 0
+        self._inspection_saves_raw = bool(monitor_saves_raw)
         self._inspection_queue = queue
 
     def detach_inspection_queue(self) -> None:
         self._inspection_queue = None
+
+    def raw_frame_saver(self) -> RawFrameSaver:
+        """Camera-monitor raw saver in the machine-level save format, written through ``.tmp``."""
+        image_format = ImageSaveFormat(self._machine.save.image_format)
+        return RawFrameSaver(
+            extension=image_format.extension,
+            write=lambda frame, path: write_frame_atomic(frame, path, image_format),
+        )
 
     def has_pending_saves(self) -> bool:
         return self._save_queue.stats().pending > 0
@@ -403,25 +419,26 @@ class CcdController(QObject, LogMixin):
     def _on_device_frame(self, frame: np.ndarray) -> None:
         # Driver thread: hand off only; display conversion, saving and status refresh happen elsewhere.
         self._converter.submit(frame)
+        saved_by_monitor = self._hand_off_for_inspection(frame) and self._inspection_saves_raw
         if software_frame_requests_auto_save(self.hardware_trigger(), self._product):
             self._auto_save_requests.request()
-        if self._auto_save_requests.consume():
+        # Consume the request either way so each frame uses up exactly one auto-save.
+        if self._auto_save_requests.consume() and not saved_by_monitor:
             saved = self._save_queue.submit(frame, self.snapshot_directory(), self._machine.save.image_format)
             if saved is None:
                 self._auto_save_rejected.emit()
-        self._hand_off_for_inspection(frame)
         self._frame_arrived.emit()
 
-    def _hand_off_for_inspection(self, frame: np.ndarray) -> None:
+    def _hand_off_for_inspection(self, frame: np.ndarray) -> bool:
         # Driver thread. Only trigger frames are inspected; continuous free-run frames are preview only.
         queue = self._inspection_queue
         hardware = self.hardware_trigger()
         if queue is None or hardware is None or hardware.mode == TriggerMode.CONTINUOUS:
-            return
+            return False
         self._inspection_sequence += 1
         sequence = self._inspection_sequence
         now = datetime.datetime.now()
-        queue.put(
+        return queue.put(
             CapturedFrame(
                 image=frame,
                 source_name=f"camera_{now:%Y%m%d_%H%M%S}_{now.microsecond // 1000:03d}_{sequence:06d}",

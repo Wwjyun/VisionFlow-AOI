@@ -377,12 +377,18 @@ class CsvExporter:
 
 
 class MatrixCsvExporter:
-    """Write the grid-oriented NG matrix CSV."""
+    """Write the grid-oriented NG matrix CSV.
+
+    An NG cell lists the tile's distinct defect types in detector/defect order, joined by
+    ``DEFECT_TYPE_SEPARATOR``; PASS cells stay empty. An NG tile without defect entries names the
+    NG detectors instead, so every NG cell is non-empty and matrix summaries keep counting it.
+    """
+
+    DEFECT_TYPE_SEPARATOR = "; "
 
     @staticmethod
     def write_matrix_csv(path: Path, result: dict) -> None:
         tiles = result.get("tiles", [])
-        check_mark = "\u2713"
         max_row = max(
             (MatrixCsvExporter._safe_int(tile_result.get("tile", {}).get("row", 0)) for tile_result in tiles),
             default=0,
@@ -407,13 +413,29 @@ class MatrixCsvExporter:
             if tile_result.get("result") == "NG":
                 column_name = f"c{col + 1}"
                 if column_name in matrix_rows[row]:
-                    matrix_rows[row][column_name] = check_mark
+                    matrix_rows[row][column_name] = MatrixCsvExporter.ng_cell_text(tile_result)
 
         with path.open("w", encoding="utf-8-sig", newline="") as handle:
             writer = csv.DictWriter(handle, fieldnames=fields)
             writer.writeheader()
             for row in sorted(matrix_rows):
                 writer.writerow(matrix_rows[row])
+
+    @staticmethod
+    def ng_cell_text(tile_result: dict) -> str:
+        detectors = tile_result.get("detectors", []) or []
+        types = [
+            str(defect.get("type") or "defect")
+            for detector_result in detectors
+            for defect in detector_result.get("defects", []) or []
+        ]
+        if not types:
+            types = [
+                str(detector_result.get("detector_id") or "NG")
+                for detector_result in detectors
+                if not detector_result.get("pass", True)
+            ]
+        return MatrixCsvExporter.DEFECT_TYPE_SEPARATOR.join(dict.fromkeys(types)) or "NG"
 
     @staticmethod
     def _safe_int(value: object) -> int:
