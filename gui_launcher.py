@@ -18,6 +18,7 @@ def bundled_recipe_path() -> Path:
 def run_packaged_smoke_test() -> int:
     """Exercise bundled Qt startup, recipe loading, and packaged GPU fallback policy."""
     os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    from PySide6.QtCore import QSettings
     from PySide6.QtWidgets import QApplication
 
     from gui.main_window import MainWindow
@@ -26,12 +27,17 @@ def run_packaged_smoke_test() -> int:
     if not recipe_path.is_file():
         return 2
     app = QApplication.instance() or QApplication([])
-    window = MainWindow()
-    window.recipe_panel.load_recipe(recipe_path)
-    app.processEvents()
-    valid = bool(window.windowTitle()) and window.recipe_panel.detector_list.count() > 0
-    window.close()
-    app.processEvents()
+    # Isolated settings: the operator's saved image, folders and screen must neither be restored
+    # (a restored large image starts background work that blocks close) nor overwritten.
+    with tempfile.TemporaryDirectory(prefix="visionflow_smoke_settings_") as settings_dir:
+        settings = QSettings(str(Path(settings_dir) / "gui.ini"), QSettings.Format.IniFormat)
+        window = MainWindow(settings=settings)
+        window.recipe_panel.load_recipe(recipe_path)
+        app.processEvents()
+        valid = bool(window.windowTitle()) and window.recipe_panel.detector_list.count() > 0
+        window.close()
+        app.processEvents()
+        settings.sync()
     if not valid:
         return 3
     fallback_status = run_packaged_gpu_fallback_smoke_test()

@@ -31,6 +31,29 @@ class GuiThreadingPackagingContractTests(unittest.TestCase):
         self.assertIn("window.recipe_panel.load_recipe(recipe_path)", launcher)
         self.assertIn("window.recipe_panel.detector_list.count() > 0", launcher)
 
+    def test_packaged_smoke_uses_isolated_gui_settings(self):
+        import gui.main_window
+        import gui_launcher
+
+        created = []
+        real_main_window = gui.main_window.MainWindow
+
+        def recording_main_window(*args, **kwargs):
+            window = real_main_window(*args, **kwargs)
+            created.append((kwargs.get("settings"), window))
+            return window
+
+        with patch.object(gui.main_window, "MainWindow", recording_main_window), \
+                patch.object(gui_launcher, "run_packaged_gpu_fallback_smoke_test", return_value=0), \
+                patch.object(gui_launcher, "run_packaged_yolox_smoke_test", return_value=0):
+            self.assertEqual(gui_launcher.run_packaged_smoke_test(), 0)
+
+        settings, window = created[0]
+        self.assertIsNotNone(settings, "the smoke must never read or write the operator's QSettings")
+        self.assertIn("visionflow_smoke_settings_", settings.fileName())
+        window._inspection_gpu_sessions.close()
+        window.deleteLater()
+
     def test_packaged_smoke_exercises_missing_dll_fallback_policy(self):
         self.assertEqual(run_packaged_gpu_fallback_smoke_test(), 0)
 
