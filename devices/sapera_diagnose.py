@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import struct
 import time
 from collections.abc import Callable, Mapping
@@ -144,12 +145,60 @@ class DiagnoseReport:
     def lines(self) -> tuple[str, ...]:
         return tuple(step.line() for step in self.steps)
 
+    def numeric_lines(self) -> tuple[str, ...]:
+        """One all-digit code per step; the field writes these down instead of Chinese prose."""
+
+        return tuple(numeric_code(step) for step in self.steps)
+
+    def numeric_line(self) -> str:
+        """All step codes on one line, space separated, for a single hand-copied row."""
+
+        return " ".join(self.numeric_lines())
+
     def summary(self) -> str:
         return self.summary_text or _summary_text(self.steps)
 
     @property
     def passed(self) -> bool:
         return bool(self.steps) and all(step.status == "PASS" for step in self.steps)
+
+
+_ERROR_CODE_RE = re.compile(r"E-(\d{4})")
+# Numeric causes that are not error codes. The four digits of an `E-xxxx` code are used verbatim, so
+# the whole field report is digits and the operator never has to transcribe Chinese.
+_NUMERIC_PASS = "0000"
+_NUMERIC_SKIP = "9999"
+_NUMERIC_FAIL_NO_CODE = "9998"
+_NUMERIC_LEGEND = {
+    _NUMERIC_PASS: "PASS",
+    _NUMERIC_SKIP: "SKIP（前一步失敗）",
+    _NUMERIC_FAIL_NO_CODE: "FAIL，無錯誤碼（看報告檔）",
+}
+
+
+def numeric_code(step: DiagnoseStep) -> str:
+    """`<step 2 digits><cause 4 digits>`: `060602` = S6 failed with E-0602, `010000` = S1 passed.
+
+    The cause digits are the `E-xxxx` code without its `E-`, so the documented error-code table is
+    also the decode table: 0000 PASS, 9999 SKIP, 9998 FAIL without a code.
+    """
+
+    digits = "".join(character for character in str(step.code) if character.isdigit())
+    step_part = (digits or "0")[-2:].rjust(2, "0")
+    if step.status == "PASS":
+        cause = _NUMERIC_PASS
+    elif step.status == "SKIP":
+        cause = _NUMERIC_SKIP
+    else:
+        match = _ERROR_CODE_RE.search(str(step.short))
+        cause = match.group(1) if match else _NUMERIC_FAIL_NO_CODE
+    return f"{step_part}{cause}"
+
+
+def numeric_legend() -> dict[str, str]:
+    """The non-error-code causes, for docs and tests."""
+
+    return dict(_NUMERIC_LEGEND)
 
 
 def _summary_text(steps: tuple[DiagnoseStep, ...]) -> str:
@@ -750,6 +799,7 @@ def _steps_payload(steps: tuple[DiagnoseStep, ...]) -> list[dict]:
             "code": step.code,
             "title": step.title,
             "status": step.status,
+            "numeric": numeric_code(step),
             "short": step.short,
             "details": [note.line() for note in step.details],
         }
@@ -767,8 +817,13 @@ def _text_report(step_payload: list[dict], context: _Context, versions: SaperaVe
         f"managed 路徑：{versions.assembly_path or '未知'}",
         f"native 路徑：{versions.native_path or '未知'}",
         "",
-        "== 短碼（可人工抄回） ==",
+        "== 數字短碼（優先抄這一組） ==",
+        "  格式：<步驟 2 位><原因 4 位>；原因＝錯誤碼去掉 E-（0000 PASS、9999 SKIP、9998 FAIL 無碼）",
+        "  " + " ".join(entry.get("numeric", "") for entry in step_payload),
     ]
+    lines.extend(f"  第 {entry['code']} 步：{entry.get('numeric', '')}" for entry in step_payload)
+    lines.append("")
+    lines.append("== 短碼（可人工抄回） ==")
     lines.extend(f"  {entry['short']}" for entry in step_payload)
     lines.append("")
     lines.append("== 步驟細節 ==")
@@ -921,6 +976,7 @@ def run_sapera_diagnose(
         "schema": DIAGNOSE_SCHEMA,
         "timestamp": stamp,
         "summary": summary,
+        "numeric": " ".join(numeric_code(step) for step in steps),
         "passed": bool(steps) and all(step.status == "PASS" for step in steps),
         "versions": {
             "assembly_path": versions.assembly_path,

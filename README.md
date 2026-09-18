@@ -8,7 +8,7 @@ CPU-only 是完整支援的執行模式，也是結果正確性的基準。專�
 
 | 項目 | 現況 |
 |---|---|
-| 最新發行版 | [VisionFlow AOI v1.7.1](https://github.com/wjcudalearning/VisionFlow/releases/tag/v1.7.1)，Windows x64、CUDA `sm_86` |
+| 最新發行版 | [VisionFlow AOI v1.7.2](https://github.com/wjcudalearning/VisionFlow/releases/tag/v1.7.2)，Windows x64、CUDA `sm_86` |
 | 支援環境 | Windows 10／11、Python 3.13 |
 | 檢測方式 | 10 個傳統 CV Detector + 1 個 YOLOX Detector |
 | 操作入口 | CLI、PySide6 GUI、批次資料夾、資料夾監控、相機直連監控 |
@@ -308,7 +308,9 @@ YOLOX 的 `models/yolox/yolox_tiny_fixture.onnx` 只輸出固定測試資料。�
 - CCD 畫面、型別化設定、模擬相機、觸發自動化、背景存圖與相機 frame 檢測已整合。
 - LSI-8181 使用選用的 vendor DLL；DLL／驅動缺少時只會讓米輪功能不可用，不影響 GUI 或檢測。
 - Sapera LT 線掃相機以 `pythonnet` 綁定（`devices/sapera_api.py`、`devices/sapera_camera.py`）。`SapClassBasic.dll` 一律從相機機台自己的 Sapera LT 安裝載入，**不打包、不隨程式散佈**；找不到時 CCD 畫面顯示含短碼的不可用原因，其餘功能照常運作。
-- 產線硬體：Teledyne DALSA **Xtium-CL MX4**（`OR-Y4C0-XMX00`）擷取卡 ＋ **Linea Mono 16K**（`LA-HM-16K05A-00-R`）Camera Link 線掃相機；Sapera 中分別是 `Acq` 與 `AcqDevice` resource（server 名形如 `Xtium-CL_MX4_1`，以現場列舉為準）。預期 frame 為 **16384 × CROP_HEIGHT**、8-bit 單色（CCF 需為 Mono8，否則回報 `E-0704`）、線速率最高 48 kHz。server／resource／CCF 一律現場選取後存機台設定檔，不預填。
+- 產線硬體：Teledyne DALSA **Xtium-CL MX4**（`OR-Y4C0-XMX00`）擷取卡 ＋ **Linea Mono 16K**（`LA-HM-16K05A-00-R`）Camera Link 線掃相機；Sapera 中分別是 `Acq` 與 `AcqDevice` resource（server 名形如 `Xtium-CL_MX4_1`，以現場列舉為準）。預期 frame 為 **16384 × CROP_HEIGHT**、8-bit 單色（CCF 需為 Mono8，否則回報 `E-0704`）、線速率最高 48 kHz。server／resource／CCF 一律現場選取後存機台設定檔，不預填；Sapera 的主機虛擬 server `System` 沒有 Acq resource，選位置時不會被列出（連線前也會以 `E-0402` 擋下）。
+- 米輪 DLL：CCD 頁「瀏覽 LSI DLL」可直接指定 `LSI8181_64.dll`（例如原廠安裝資料夾）並存進機台設定檔，不需要設定環境變數；**打包版不會用檔名搜尋系統路徑，必須用完整路徑或把 DLL 放在 EXE 同一資料夾**。載入失敗時畫面顯示具體原因（找不到、位元數不符、或缺少哪個相依 DLL），`--self-check` 另會列出搜尋順序、位元數與相依清單。
+- Sapera 現場診斷同時輸出**數字短碼**（`<步驟 2 位><錯誤碼 4 位>`，例如 `060602` ＝ S6 失敗 `E-0602`），方便在無法複製檔案的機台上手抄回報；對照表見 [`docs/sapera-diagnose.md`](docs/sapera-diagnose.md)。
 - 相機參數分兩層：機台層（Sapera server／resource、CCF、米輪卡片與 CMP0–7）存 `config/ccd_machine.json`；產品層（曝光、增益、影像長度、內部線速率、觸發、自動存圖）存 Recipe 選用 `camera` 區段。
 - 相機機台沒有 Python、IDE 與網路，且檔案只能帶進去。因此相機綁定以相機機台為目標在本機完成，帶進現場的 EXE 提供 `--sapera-diagnose` 分步診斷；完整錯誤碼與短碼對照見 [`docs/sapera-diagnose.md`](docs/sapera-diagnose.md)。
 - 開發與展示可先啟用模擬裝置：

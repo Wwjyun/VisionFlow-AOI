@@ -399,6 +399,41 @@ class ConnectSequenceTests(SaperaCameraTestBase):
             self.camera.connect(self.connection(server_name=""), AcquisitionSettings(), TriggerSettings())
         self.assertEqual(self.interop.calls, [])
 
+    def test_a_server_without_an_acq_resource_is_refused_with_e0402(self):
+        """Field report: `System` was selected, so `SapAcquisition.Create()` always failed."""
+
+        self.assertIn("System", self.interop.servers, "the fixture models Sapera's host pseudo-server")
+        self.assertEqual(self.interop.resource_count("System", "Acq"), 0)
+        with self.assertRaises(SaperaError) as caught:
+            self.camera.connect(
+                self.connection(server_name="System"), AcquisitionSettings(), TriggerSettings()
+            )
+        self.assertEqual(caught.exception.code, "E-0402")
+        self.assertIn("System", caught.exception.detail)
+        self.assertIn("沒有 Acq resource", caught.exception.detail)
+        self.assertEqual(self.interop.calls, [], "no Sapera object may be created for a bad server")
+
+    def test_acquisition_create_failure_names_the_full_ccf_path_and_create_result(self):
+        self.interop.fail_create.add("SapAcquisition")
+        with self.assertRaises(SaperaError) as caught:
+            self.connect()
+        self.assertEqual(caught.exception.code, "E-0502")
+        detail = caught.exception.detail
+        self.assertIn(str(self.ccf), detail, "the field must see which CCF was used")
+        self.assertIn("Create()", detail)
+
+    def test_an_acquisition_constructor_exception_keeps_the_underlying_dotnet_text(self):
+        from tests.test_sapera_camera import FakeDotNetException  # noqa: PLC0415 - same module
+
+        self.interop.raise_on["new_acquisition"] = FakeDotNetException(
+            "System.Runtime.InteropServices.COMException", "CCF 與擷取卡不符"
+        )
+        with self.assertRaises(SaperaError) as caught:
+            self.connect()
+        self.assertEqual(caught.exception.code, "E-0502")
+        self.assertIn("COMException", caught.exception.detail)
+        self.assertIn(str(self.ccf), caught.exception.detail)
+
     def test_fatal_create_failure_cleans_up_and_allows_retry(self):
         self.interop.fail_create.add("SapAcquisition")
         with self.assertRaises(SaperaError) as caught:

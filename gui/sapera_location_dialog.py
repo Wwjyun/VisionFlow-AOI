@@ -60,6 +60,20 @@ class SaperaLocationCatalog:
     def acq_count(self, server: str) -> int:
         return len(self.acq_resources.get(server, ()))
 
+    def capture_servers(self) -> tuple[str, ...]:
+        """Servers that expose at least one Acq resource, i.e. the actual frame grabber(s).
+
+        Sapera always reports a virtual ``System`` server for the host; it owns no Acq resource, so
+        selecting it can only end in `E-0502 SapAcquisition 建立失敗`.
+        """
+
+        return tuple(server for server in self.servers if self.acq_count(server) > 0)
+
+    def host_servers(self) -> tuple[str, ...]:
+        """Servers without any Acq resource; reported so the operator knows what was skipped."""
+
+        return tuple(server for server in self.servers if self.acq_count(server) == 0)
+
     def device_options(self) -> tuple[tuple[str, int, str], ...]:
         """Every AcqDevice on the machine as ``(server, index, name)``, in enumeration order."""
 
@@ -132,7 +146,9 @@ class SaperaLocationDialog(QDialog):
         form.setVerticalSpacing(8)
 
         self.server_combo = QComboBox()
-        for server in self.catalog.servers:
+        # Only Acq-capable servers are offered: the first server Sapera reports is usually the host
+        # pseudo-server `System`, and defaulting to it made `connect()` fail on the camera machine.
+        for server in self.catalog.capture_servers() or self.catalog.servers:
             self.server_combo.addItem(server, server)
         form.addRow("擷取伺服器", self.server_combo)
 
@@ -191,8 +207,16 @@ class SaperaLocationDialog(QDialog):
 
         self.server_combo.currentIndexChanged.connect(self._on_server_changed)
         self.ccf_edit.textChanged.connect(self._refresh_ready)
+        self._select_initial_server()
         self._on_server_changed()
         self._apply_catalog_state()
+
+    def _select_initial_server(self) -> None:
+        """Prefer the saved capture server; never default to a server without an Acq resource."""
+
+        current = str(self._current.server_name or "")
+        index = self.server_combo.findData(current) if current else -1
+        self.server_combo.setCurrentIndex(index if index >= 0 else 0)
 
     # ------------------------------------------------------------------
     @staticmethod
@@ -230,7 +254,17 @@ class SaperaLocationDialog(QDialog):
             self.reason_label.setStyleSheet(f"color: {COLORS['text_2']}; font-size: 11px;")
             self.reason_label.setVisible(True)
         else:
-            self.reason_label.setVisible(False)
+            skipped = self.catalog.host_servers()
+            if skipped:
+                self.reason_label.setText(
+                    "已略過沒有 Acq resource 的 server："
+                    + "、".join(skipped)
+                    + "（Sapera 回報的主機虛擬 server，不是擷取卡）。"
+                )
+                self.reason_label.setStyleSheet(f"color: {COLORS['text_2']}; font-size: 11px;")
+                self.reason_label.setVisible(True)
+            else:
+                self.reason_label.setVisible(False)
         if self.catalog.ccf_dir:
             self.device_hint.setToolTip(self.catalog.ccf_dir)
         self._refresh_ready()

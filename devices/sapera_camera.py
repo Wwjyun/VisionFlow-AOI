@@ -218,6 +218,7 @@ class SaperaLineScanCamera(LineScanCamera):
             raise DeviceError("尚未選擇 Sapera 擷取卡（server），請先在「Sapera 位置」選擇。")
         if not connection.config_file_path or not Path(connection.config_file_path).is_file():
             raise SaperaError("E-0403", connection.config_file_path or "未設定 CCF 檔")
+        self._require_capture_resource(interop, connection)
 
         log = _ApplyLog()
         with self._lifecycle_lock:
@@ -524,15 +525,38 @@ class SaperaLineScanCamera(LineScanCamera):
             return False
         return any(self._quiet(lambda value=value: interop.set_feature_string(device, feature, value)) for value in values)
 
-    def _open_acquisition(self, interop, connection, acquisition, trigger, log: _ApplyLog) -> None:
-        location = interop.location(connection.server_name, connection.resource_index)
-        self._acquisition = interop.new_acquisition(
-            location, connection.config_file_path, self._on_acq_event, self._on_signal
+    def _require_capture_resource(self, interop, connection: CameraConnectionSettings) -> None:
+        """Refuse a server with no Acq resource before touching hardware.
+
+        The first server Sapera reports is usually `System`, the host pseudo-server; selecting it made
+        `SapAcquisition.Create()` fail with only E-0502, which does not tell the operator what to fix.
+        """
+
+        count = self._quiet(lambda: interop.resource_count(connection.server_name, "Acq"), None)
+        if count is None or count > 0:
+            return
+        raise SaperaError(
+            "E-0402",
+            f"server「{connection.server_name}」沒有 Acq resource（擷取卡）。"
+            "Sapera 的 System 是主機虛擬 server；請在「Sapera 位置」選擇擷取卡（例如 Xtium-CL_MX4_1）。",
         )
+
+    def _open_acquisition(self, interop, connection, acquisition, trigger, log: _ApplyLog) -> None:
+        target = f"{connection.server_name}#{connection.resource_index}、CCF {connection.config_file_path}"
+        location = interop.location(connection.server_name, connection.resource_index)
+        try:
+            self._acquisition = interop.new_acquisition(
+                location, connection.config_file_path, self._on_acq_event, self._on_signal
+            )
+        except Exception as exc:  # noqa: BLE001 - report the underlying .NET text, not only the code
+            error = translate_exception(exc, "E-0502")
+            # `translate_exception` promotes a version mismatch to E-0203; keep that code, not E-0502.
+            raise SaperaError(error.code, f"{target}；{error.detail}") from exc
         if not interop.create(self._acquisition):
             raise SaperaError(
                 "E-0502",
-                f"{connection.server_name}#{connection.resource_index}，CCF {Path(connection.config_file_path).name}",
+                f"{target}；SapAcquisition.Create() 回傳 false"
+                "（常見原因：CCF 與這張擷取卡不符、卡被其他程式佔用、或 server／resource 選錯）",
             )
         acq = self._acquisition
         if trigger.mode == TriggerMode.CONTINUOUS:

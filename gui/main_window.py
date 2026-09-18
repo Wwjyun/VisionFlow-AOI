@@ -258,9 +258,15 @@ class MainWindow(QMainWindow, LogMixin):
 
         self.recipe_manager = RecipeManager()
         self.recipe_panel = _RecipePanelCompatibility(self)
+        # The machine settings file is the single source of truth for the CCD machine location and the
+        # LSI-8181 DLL path, so the device factory reads it lazily instead of duplicating it.
+        machine_settings_store = ccd_settings_store or CcdMachineSettingsStore()
         self.ccd_controller = CcdController(
-            ccd_devices or create_ccd_devices(),
-            ccd_settings_store or CcdMachineSettingsStore(),
+            ccd_devices
+            or create_ccd_devices(
+                meter_wheel_dll_path=lambda: machine_settings_store.load().meter_wheel.dll_path
+            ),
+            machine_settings_store,
             parent=self,
         )
 
@@ -468,7 +474,7 @@ class MainWindow(QMainWindow, LogMixin):
         machine_id_edit.setReadOnly(True)
         machine_form.addRow("Machine ID", machine_id_edit)
 
-        pipeline_version_edit = QLineEdit("1.7.1")
+        pipeline_version_edit = QLineEdit("1.7.2")
         pipeline_version_edit.setProperty("mono", "true")
         pipeline_version_edit.setReadOnly(True)
         machine_form.addRow("Pipeline 版本", pipeline_version_edit)
@@ -521,6 +527,20 @@ class MainWindow(QMainWindow, LogMixin):
             lambda _view: self._on_ccd_camera_status_changed(self.ccd_controller.camera_status())
         )
         self.ccd_controller.attach(self.ccd_screen)
+        self.ccd_controller.meter_wheel_dll_requested.connect(self._choose_meter_wheel_dll)
+        self._on_ccd_camera_status_changed(self.ccd_controller.camera_status())
+
+    def _choose_meter_wheel_dll(self) -> None:
+        """Point the meter wheel at this machine's `LSI8181_64.dll` and remember it."""
+
+        current = str(self.ccd_controller.machine_settings.meter_wheel.dll_path or "")
+        start_dir = str(Path(current).parent) if current else str(Path.cwd())
+        path, _selected = QFileDialog.getOpenFileName(
+            self, "選擇 LSI8181_64.dll", start_dir, "LSI-8181 DLL (LSI8181*.dll);;所有 DLL (*.dll)"
+        )
+        if not path:
+            return
+        self.ccd_controller.set_meter_wheel_dll_path(path)
         self._on_ccd_camera_status_changed(self.ccd_controller.camera_status())
 
     # ------------------------------------------------------------------

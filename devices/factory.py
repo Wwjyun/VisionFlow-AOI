@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import os
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 
 import numpy as np
@@ -172,12 +172,27 @@ def create_line_scan_camera(environ: Mapping[str, str] | None = None) -> LineSca
     return SaperaLineScanCamera(lambda: load_runtime(environ=env))
 
 
-def create_ccd_devices(environ: Mapping[str, str] | None = None) -> CcdDevices:
+def create_ccd_devices(
+    environ: Mapping[str, str] | None = None,
+    *,
+    meter_wheel_dll_path: str | Callable[[], str] | None = None,
+) -> CcdDevices:
     env = os.environ if environ is None else environ
     if str(env.get(SIMULATOR_ENV, "")).strip().lower() in {"1", "true", "yes", "on"}:
         return CcdDevices(SimulatedLineScanCamera(), SimulatedMeterWheel(auto_advance_per_read=25))
     # The LSI-8181 DLL is loaded lazily; a missing driver only makes the meter wheel unavailable.
+    # `meter_wheel_dll_path` may be a callable so the machine settings store stays the single source
+    # of truth: the path is read when the DLL is actually loaded, not when the application starts.
     return CcdDevices(
         create_line_scan_camera(env),
-        Lsi8181MeterWheel(loader=lambda: Lsi8181Library.load(environ=env)),
+        Lsi8181MeterWheel(
+            loader=lambda: Lsi8181Library.load(dll_path=_stored_dll_path(meter_wheel_dll_path), environ=env)
+        ),
     )
+
+
+def _stored_dll_path(source: str | Callable[[], str] | None) -> str | None:
+    if source is None:
+        return None
+    value = source() if callable(source) else source
+    return str(value).strip() or None

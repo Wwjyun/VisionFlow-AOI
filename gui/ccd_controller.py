@@ -37,6 +37,7 @@ from devices.ccd_models import (
 from devices.ccd_settings_store import CcdMachineSettingsStore
 from devices.factory import CcdDevices
 from devices.frame_writer import SaveQueueStats, SnapshotSaveQueue, write_frame_atomic
+from devices.meter_wheel_dll import MeterWheelDllReport, diagnose_meter_wheel_dll
 from devices.sapera_api import (
     DEFAULT_CCF_SUBDIR,
     DEFAULT_SAPERA_DIR,
@@ -205,6 +206,7 @@ class CcdController(QObject, LogMixin):
     #: True while a diagnose run is in flight. Emitted when the controller's own running flag
     #: changes, so the screen's disable/enable state never depends on signal delivery order.
     sapera_diagnose_running_changed = Signal(bool)
+    meter_wheel_dll_requested = Signal()
     diagnose_finished = Signal(bool)
     diagnose_report_ready = Signal(object)
     status_message = Signal(str)
@@ -223,6 +225,8 @@ class CcdController(QObject, LogMixin):
     #: S1-S8 runner; injectable so the GUI test never touches Sapera. Defaults to the fixed
     #: `devices.sapera_diagnose.run_sapera_diagnose` interface.
     diagnose_runner: Callable | None = None
+    #: Set while a screen is attached; availability updates are pushed through it.
+    _screen = None
 
     def __init__(self, devices: CcdDevices, store: CcdMachineSettingsStore, parent=None):
         super().__init__(parent)
@@ -243,6 +247,8 @@ class CcdController(QObject, LogMixin):
         self._inspection_queue: CameraFrameQueue | None = None
         self._inspection_saves_raw = True
         self._inspection_sequence = 0
+        self._meter_wheel_diagnosis: MeterWheelDllReport | None = None
+        self._meter_wheel_diagnosis_ready = False
         # One diagnose run at a time; the workflow controller owns the QThread lifetime.
         self._diagnose_controller = SaperaDiagnoseWorkflowController(self)
         self._diagnose_lock = threading.Lock()
@@ -281,6 +287,7 @@ class CcdController(QObject, LogMixin):
         return self._machine
 
     def attach(self, screen) -> None:
+        self._screen = screen
         screen.camera_connect_requested.connect(self.connect_camera)
         screen.camera_disconnect_requested.connect(self.disconnect_camera)
         screen.preview_start_requested.connect(self.start_preview)
@@ -303,6 +310,7 @@ class CcdController(QObject, LogMixin):
         screen.sapera_location_requested.connect(self.request_sapera_location)
         screen.sapera_diagnose_requested.connect(self.start_camera_diagnose)
         screen.sapera_diagnostics_export_requested.connect(self.export_camera_diagnostics)
+        screen.meter_wheel_dll_requested.connect(self.request_meter_wheel_dll)
 
         self.camera_status_changed.connect(screen.set_camera_status)
         self.camera_settings_changed.connect(screen.set_camera_settings)
@@ -315,7 +323,7 @@ class CcdController(QObject, LogMixin):
         self.sapera_diagnose_running_changed.connect(screen.set_sapera_diagnose_running)
         self.diagnose_report_ready.connect(screen.set_sapera_diagnose_report)
 
-        screen.set_availability(self.devices.camera.availability(), self.devices.meter_wheel.availability())
+        self._publish_availability()
         screen.set_camera_settings(self.camera_settings_view())
         screen.set_meter_wheel_settings(self._machine.meter_wheel)
         screen.set_camera_status(self.camera_status())
@@ -323,8 +331,27 @@ class CcdController(QObject, LogMixin):
         screen.set_save_stats(self._save_queue.stats())
         self._publish_sapera_versions()
 
+    def _publish_availability(self) -> None:
+        screen = self._screen
+        if screen is not None:
+            screen.set_availability(*self.availability())
+
+    def refresh_availability(self) -> None:
+        """Republish camera/meter-wheel availability after a DLL or location change."""
+
+        self._publish_availability()
+
     def availability(self) -> tuple[DeviceAvailability, DeviceAvailability]:
-        return self.devices.camera.availability(), self.devices.meter_wheel.availability()
+        camera = self.devices.camera.availability()
+        meter_wheel = self.devices.meter_wheel.availability()
+        if not meter_wheel.available:
+            # Name the concrete DLL problem (missing dependency, wrong bitness) on the CCD page: the
+            # machine's files cannot be copied out, so the reason has to be readable there.
+            report = self.meter_wheel_diagnosis()
+            summary = report.summary() if report is not None else ""
+            if summary and summary not in meter_wheel.reason:
+                meter_wheel = DeviceAvailability(False, f"{meter_wheel.reason}｜{summary}")
+        return camera, meter_wheel
 
     def camera_status(self) -> CameraStatus:
         return self.devices.camera.status()
@@ -773,6 +800,52 @@ class CcdController(QObject, LogMixin):
             return False
         self.meter_wheel_settings_changed.emit(settings)
         return True
+
+    def meter_wheel_diagnosis(self) -> MeterWheelDllReport | None:
+        """Cached DLL diagnosis (PE parse plus one load attempt); computed only while it fails."""
+
+        if self.devices.meter_wheel.availability().available:
+            self._meter_wheel_diagnosis = None
+            self._meter_wheel_diagnosis_ready = True
+            return None
+        if not self._meter_wheel_diagnosis_ready:
+            try:
+                self._meter_wheel_diagnosis = diagnose_meter_wheel_dll()
+            except Exception as exc:  # noqa: BLE001 - a diagnosis must never break the GUI
+                self.logger.warning("meter wheel diagnosis failed: %s", exc)
+                self._meter_wheel_diagnosis = None
+            self._meter_wheel_diagnosis_ready = True
+        return self._meter_wheel_diagnosis
+
+    def set_meter_wheel_dll_path(self, path: str) -> bool:
+        """Remember where this machine keeps `LSI8181_64.dll`, then retry the load immediately."""
+
+        settings = replace(self._machine.meter_wheel, dll_path=str(path or "").strip())
+        if not self._save_meter_wheel(settings):
+            return False
+        self._meter_wheel_diagnosis = None
+        self._meter_wheel_diagnosis_ready = False
+        # Only the vendor binding can reload a DLL; the simulator and the unavailable placeholder
+        # must keep working, so the interface stays backend-neutral here.
+        reload_library = getattr(self.devices.meter_wheel, "reload_library", None)
+        if callable(reload_library):
+            try:
+                reload_library()
+            except DeviceError as exc:
+                self.notice.emit(str(exc), "warning")
+                return False
+        availability = self.devices.meter_wheel.availability()
+        if availability.available:
+            self.notice.emit(f"米輪 DLL 載入成功：{settings.dll_path}", "success")
+        else:
+            self.notice.emit(f"米輪 DLL 仍無法載入：{availability.reason}", "error")
+        self.refresh_availability()
+        return availability.available
+
+    def request_meter_wheel_dll(self) -> None:
+        """Ask the window for a file dialog; the window answers with `set_meter_wheel_dll_path`."""
+
+        self.meter_wheel_dll_requested.emit()
 
     def _publish_meter_snapshot(self, snapshot: MeterWheelSnapshot) -> None:
         if snapshot != self._last_meter_snapshot:

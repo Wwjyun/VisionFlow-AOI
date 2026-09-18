@@ -33,6 +33,7 @@ def _run_sapera_diagnose() -> int:
 
     report = run_sapera_diagnose()
     print(report.summary())
+    print(f"數字短碼（優先抄這組）：{report.numeric_line()}")
     for step in report.steps:
         print(step.line())
     print(f"完整報告：{report.report_path}")

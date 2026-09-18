@@ -220,6 +220,7 @@ class CcdScreen(QWidget):
     sapera_location_requested = Signal(object)
     sapera_diagnose_requested = Signal()
     sapera_diagnostics_export_requested = Signal()
+    meter_wheel_dll_requested = Signal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -524,6 +525,15 @@ class CcdScreen(QWidget):
         )
         self.meter_wheel_disconnect_button.clicked.connect(self.meter_wheel_disconnect_requested.emit)
 
+        # The camera machine cannot set environment variables conveniently, so the vendor DLL can be
+        # pointed at here and is remembered in the machine settings file.
+        self.meter_wheel_dll_label = _hint(color=COLORS["text_2"])
+        self.meter_wheel_dll_label.setProperty("mono", "true")
+        self.meter_wheel_dll_label.setWordWrap(True)
+        self.meter_wheel_dll_button = self.gate.register(_button("瀏覽 LSI DLL", icon_name="folder"))
+        self.meter_wheel_dll_button.clicked.connect(self.meter_wheel_dll_requested.emit)
+        panel.add_widget(_row(QLabel("LSI DLL"), self.meter_wheel_dll_label, self.meter_wheel_dll_button))
+
         live = QWidget()
         live_layout = QGridLayout(live)
         live_layout.setContentsMargins(0, 0, 0, 0)
@@ -773,6 +783,7 @@ class CcdScreen(QWidget):
 
         lines = tuple(str(line) for line in getattr(report, "lines", lambda: ())())
         summary = str(getattr(report, "summary", lambda: "")())
+        numeric = tuple(str(code) for code in getattr(report, "numeric_lines", lambda: ())())
         self.sapera_diagnose_lines = lines
         self._refresh_sapera_diagnostics_controls()
         if not lines and not summary:
@@ -780,6 +791,9 @@ class CcdScreen(QWidget):
             self.sapera_diagnose_result_label.setVisible(False)
             return
         display = [f"總結：{summary}"] if summary else []
+        if numeric:
+            # The digits are what the field writes down; the prose lines stay for reading.
+            display.append("數字短碼（優先抄這組）：" + " ".join(numeric))
         display.extend(lines)
         failures = [
             str(getattr(step, "code", "")) for step in getattr(report, "steps", ()) or ()
@@ -809,6 +823,7 @@ class CcdScreen(QWidget):
         self._loading = True
         try:
             self.card_id_combo.setCurrentIndex(max(0, self.card_id_combo.findData(settings.card_id)))
+            self.meter_wheel_dll_label.setText(str(settings.dll_path or "（預設搜尋順序）"))
             self.encoder_input.setValue(settings.encoder_value)
             self.compare_input.setValue(settings.compare_value)
             self.increment_input.setValue(settings.compare_increment)

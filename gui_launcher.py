@@ -379,6 +379,9 @@ def sapera_diagnose_text(report) -> str:
     """The manually-copyable diagnosis text: step summary, one short line per step, report paths."""
 
     lines = [report.summary(), ""]
+    numeric = getattr(report, "numeric_line", None)
+    if callable(numeric):
+        lines.extend([f"數字短碼（優先抄這組）：{numeric()}", ""])
     lines.extend(report.lines())
     lines.extend(["", f"完整報告：{report.report_path}", f"機器可讀報告：{report.log_path}"])
     return "\n".join(lines)
@@ -557,11 +560,19 @@ def self_check_lines(*, environ=None, deep_sapera: bool = True) -> tuple[tuple[s
         record(".NET Framework runtime", False, detail)
 
     try:
-        from devices import lsi8181
+        from devices.meter_wheel_dll import diagnose_meter_wheel_dll
 
-        library = lsi8181.Lsi8181Library.load(environ=env)
-        record("LSI-8181 DLL 載入", True, str(getattr(library, "path", "") or "已載入"))
-    except Exception as exc:  # noqa: BLE001
+        saved_dll = ""
+        try:
+            from devices.ccd_settings_store import CcdMachineSettingsStore
+
+            saved_dll = CcdMachineSettingsStore().load().meter_wheel.dll_path
+        except Exception:  # noqa: BLE001 - the store is optional for this check
+            saved_dll = ""
+        wheel = diagnose_meter_wheel_dll(dll_path=saved_dll or None, environ=env)
+        record("LSI-8181 DLL 載入", wheel.loadable, wheel.summary())
+        lines.extend(wheel.lines())
+    except Exception as exc:  # noqa: BLE001 - the diagnosis itself must never fail the check
         record("LSI-8181 DLL 載入", False, f"{type(exc).__name__}: {exc}")
 
     if deep_sapera:

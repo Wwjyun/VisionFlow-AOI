@@ -118,6 +118,25 @@ class FakeSaperaCamera(SimulatedLineScanCamera):
         return self._fake_notes
 
 
+class _ReloadableWheel(SimulatedMeterWheel):
+    """A meter wheel whose DLL arrives only after the operator points at it."""
+
+    def __init__(self) -> None:
+        super().__init__(present_card_ids=(0,))
+        self.reloads = 0
+        self.loaded = False
+
+    def availability(self) -> DeviceAvailability:
+        if self.loaded:
+            return DeviceAvailability(True)
+        return DeviceAvailability(False, "找不到 LSI-8181 DLL：LSI8181_64.dll")
+
+    def reload_library(self) -> DeviceAvailability:
+        self.reloads += 1
+        self.loaded = True
+        return self.availability()
+
+
 def _ok_catalog(**overrides) -> SaperaLocationCatalog:
     values = dict(
         servers=(SERVER_A, SERVER_B),
@@ -192,13 +211,44 @@ class SaperaGuiTests(unittest.TestCase):
     def test_location_dialog_probes_through_an_injected_catalog(self):
         dialog, probe_calls = self._dialog(_ok_catalog())
         self.assertEqual(probe_calls, [1], "the injected prober is what fills the dialog")
+        # Only Acq-capable servers are offered: `System` is Sapera's host pseudo-server and has no
+        # Acq resource, so offering it is what produced the camera machine's E-0502 report.
         self.assertEqual([dialog.server_combo.itemText(i) for i in range(dialog.server_combo.count())],
-                         [SERVER_A, SERVER_B])
+                         [SERVER_A])
+        self.assertEqual(dialog.selected_server(), SERVER_A)
+        self.assertIn("已略過沒有 Acq resource", dialog.reason_label.text())
+        self.assertIn(SERVER_B, dialog.reason_label.text())
         self.assertEqual(dialog.acq_combo.count(), 1)
         self.assertEqual(
             [dialog.ccf_list.item(i).text() for i in range(dialog.ccf_list.count())],
             ["C:/Sapera/CamFiles/User/line.ccf"],
         )
+
+    def test_location_dialog_never_defaults_to_a_host_server_without_acq_resources(self):
+        """Field report: `System` was preselected, so SapAcquisition could never be created."""
+
+        catalog = _ok_catalog(servers=(SERVER_B, SERVER_A))  # `System` enumerated first, as on site
+        dialog, _calls = self._dialog(catalog)
+        self.assertEqual(dialog.selected_server(), SERVER_A)
+        self.assertEqual(dialog.selected_resource_index(), 0)
+        self.assertEqual(dialog.server_combo.count(), 1)
+
+    def test_location_dialog_prefers_the_saved_capture_server(self):
+        catalog = _ok_catalog(
+            servers=(SERVER_A, "Xtium-CL_MX4_2"),
+            acq_resources={SERVER_A: ("a",), "Xtium-CL_MX4_2": ("b",)},
+        )
+        dialog, _calls = self._dialog(
+            catalog, current=CameraConnectionSettings(server_name="Xtium-CL_MX4_2", resource_index=0)
+        )
+        self.assertEqual(dialog.selected_server(), "Xtium-CL_MX4_2")
+
+    def test_location_dialog_still_lists_servers_when_none_has_an_acq_resource(self):
+        dialog, _calls = self._dialog(
+            _ok_catalog(servers=(SERVER_B,), acq_resources={SERVER_B: ()}, acq_devices={})
+        )
+        self.assertEqual(dialog.server_combo.count(), 1, "the operator must see what Sapera reported")
+        self.assertEqual(dialog.selected_server(), SERVER_B)
 
     def test_location_dialog_auto_selects_a_single_acq_device_with_a_hint(self):
         dialog, _calls = self._dialog(_ok_catalog())
@@ -326,6 +376,37 @@ class SaperaGuiTests(unittest.TestCase):
     # ------------------------------------------------------------------
     # B. version mismatch and API self-check
     # ------------------------------------------------------------------
+
+    def test_screen_asks_the_window_for_the_meter_wheel_dll(self):
+        """The camera machine cannot set environment variables, so the DLL is chosen in the GUI."""
+
+        screen, _controller = self._screen(SimulatedLineScanCamera(auto_emit=False))
+        screen.set_mode("admin")
+        requested: list[int] = []
+        screen.meter_wheel_dll_requested.connect(lambda: requested.append(1))
+        screen.meter_wheel_dll_button.click()
+        self.assertEqual(requested, [1])
+
+    def test_controller_saves_the_meter_wheel_dll_path_and_retries_the_load(self):
+        wheel = _ReloadableWheel()
+        screen = CcdScreen()
+        controller = CcdController(CcdDevices(SimulatedLineScanCamera(auto_emit=False), wheel), self.store)
+        controller.attach(screen)
+        self.addCleanup(controller.close)
+
+        self.assertFalse(controller.availability()[1].available)
+        self.assertTrue(controller.set_meter_wheel_dll_path(r"C:\vendor\LSI8181_64.dll"))
+
+        self.assertEqual(wheel.reloads, 1, "the new path must be tried immediately")
+        self.assertEqual(self.store.load().meter_wheel.dll_path, r"C:\vendor\LSI8181_64.dll")
+        self.assertTrue(controller.availability()[1].available)
+
+    def test_the_meter_wheel_dll_row_is_admin_only(self):
+        screen, _controller = self._screen(SimulatedLineScanCamera(auto_emit=False))
+        screen.set_mode("admin")
+        self.assertTrue(screen.meter_wheel_dll_button.isEnabled())
+        screen.set_mode("eng")
+        self.assertFalse(screen.meter_wheel_dll_button.isEnabled())
     def test_version_mismatch_is_shown_but_the_camera_stays_available(self):
         camera = FakeSaperaCamera(
             versions=SaperaVersions(

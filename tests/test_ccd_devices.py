@@ -34,7 +34,7 @@ from devices.factory import (
     UnavailableMeterWheel,
     create_ccd_devices,
 )
-from devices.lsi8181 import DLL_PATH_ENV, Lsi8181MeterWheel
+from devices.lsi8181 import DLL_PATH_ENV, Lsi8181LoadError, Lsi8181MeterWheel
 from devices.frame_writer import SnapshotSaveQueue, write_frame_atomic
 from devices.sapera_api import DLL_PATH_ENV as SAPERA_DLL_PATH_ENV
 from devices.sapera_camera import SaperaLineScanCamera
@@ -367,6 +367,67 @@ class FactoryTests(unittest.TestCase):
             self.assertFalse(devices.meter_wheel.availability().available)
         finally:
             devices.close()
+
+    def test_meter_wheel_dll_path_round_trips_through_the_machine_store(self):
+        with tempfile.TemporaryDirectory(prefix="visionflow_lsi_") as directory:
+            store = CcdMachineSettingsStore(Path(directory) / "ccd_machine.json")
+            store.save(
+                CcdMachineSettings(meter_wheel=MeterWheelSettings(dll_path=r"C:\vendor\LSI8181_64.dll"))
+            )
+            loaded = store.load()
+        self.assertEqual(loaded.meter_wheel.dll_path, r"C:\vendor\LSI8181_64.dll")
+
+    def test_the_factory_reads_the_meter_wheel_dll_path_lazily(self):
+        with tempfile.TemporaryDirectory(prefix="visionflow_lsi_") as directory:
+            missing = Path(directory) / "LSI8181_64.dll"  # not a real DLL: the path must still be used
+            missing.write_bytes(b"")
+            devices = create_ccd_devices(
+                {DLL_PATH_ENV: str(Path(directory) / "absent.dll")},
+                meter_wheel_dll_path=lambda: str(missing),
+            )
+            try:
+                availability = devices.meter_wheel.availability()
+            finally:
+                devices.close()
+        self.assertFalse(availability.available)
+        self.assertIn(str(missing), availability.reason, "the stored path wins over the environment")
+
+    def test_the_factory_falls_back_to_the_search_order_without_a_stored_path(self):
+        with tempfile.TemporaryDirectory(prefix="visionflow_lsi_") as directory:
+            devices = create_ccd_devices(
+                {DLL_PATH_ENV: str(Path(directory) / "absent.dll")}, meter_wheel_dll_path=lambda: ""
+            )
+            try:
+                reason = devices.meter_wheel.availability().reason
+            finally:
+                devices.close()
+        self.assertIn("absent.dll", reason)
+
+    def test_reload_library_retries_a_cached_failure_and_clears_it(self):
+        state = {"fail": True}
+        attempts: list[int] = []
+
+        def loader():
+            attempts.append(1)
+            if state["fail"]:
+                raise Lsi8181LoadError("找不到 LSI-8181 DLL")
+            return object()
+
+        wheel = Lsi8181MeterWheel(loader=loader)
+        self.assertFalse(wheel.availability().available)
+        self.assertFalse(wheel.availability().available)
+        self.assertEqual(len(attempts), 1, "a load failure stays cached until the path changes")
+
+        state["fail"] = False
+        self.assertTrue(wheel.reload_library().available)
+        self.assertEqual(len(attempts), 2)
+        self.assertTrue(wheel.availability().available)
+
+    def test_reload_library_refuses_while_the_meter_wheel_is_connected(self):
+        wheel = Lsi8181MeterWheel(loader=lambda: object())
+        wheel._initialized = True
+        with self.assertRaises(DeviceError):
+            wheel.reload_library()
 
     def test_simulator_environment_switch(self):
         devices = create_ccd_devices({SIMULATOR_ENV: "1"})

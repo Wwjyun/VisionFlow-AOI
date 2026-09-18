@@ -123,27 +123,62 @@ class Lsi8181Library:
             raise Lsi8181LoadError(f"{DLL_NAME} 需要 64 位元 Python。{_SIMULATOR_HINT}")
         env = os.environ if environ is None else environ
         explicit = dll_path if dll_path is not None else env.get(DLL_PATH_ENV) or None
-        if explicit is not None:
-            candidates = [str(Path(explicit))]
-            if not Path(explicit).is_file():
-                raise Lsi8181LoadError(f"找不到 LSI-8181 DLL：{explicit}。{_SIMULATOR_HINT}")
-        else:
-            # Application directory first (packaged EXE or python.exe), then the driver's system install.
-            application_dll = Path(sys.executable).resolve().parent / DLL_NAME
-            candidates = [str(application_dll)] if application_dll.is_file() else []
-            candidates.append(DLL_NAME)
+        if explicit is not None and not Path(explicit).is_file():
+            raise Lsi8181LoadError(
+                f"找不到 LSI-8181 DLL：{explicit}。請確認路徑，或以「瀏覽」重新指定。{_SIMULATOR_HINT}"
+            )
+        candidates = dll_candidates(dll_path=dll_path, environ=env)
         errors = []
         for candidate in candidates:
             try:
                 handle = _load_windows_dll(candidate)
             except OSError as exc:
-                errors.append(f"{candidate}（{exc}）")
+                errors.append(f"{candidate}（{_windows_error_text(exc)}）")
                 continue
             return cls(handle, source=candidate)
         raise Lsi8181LoadError(
             f"無法載入 {DLL_NAME}：{'；'.join(errors)}。請安裝 JS Automation LSI-8181 驅動，"
             f"或以環境變數 {DLL_PATH_ENV} 指定 DLL 路徑。{_SIMULATOR_HINT}"
         )
+
+
+def dll_candidates(
+    dll_path: str | os.PathLike | None = None,
+    environ: Mapping[str, str] | None = None,
+) -> tuple[str, ...]:
+    """The paths `Lsi8181Library.load` tries, in order. One source of truth for the diagnostics."""
+
+    env = os.environ if environ is None else environ
+    explicit = dll_path if dll_path is not None else env.get(DLL_PATH_ENV) or None
+    if explicit:
+        return (str(Path(explicit)),)
+    application_dll = Path(sys.executable).resolve().parent / DLL_NAME
+    candidates = [str(application_dll)] if application_dll.is_file() else []
+    candidates.append(DLL_NAME)
+    return tuple(candidates)
+
+
+def _windows_error_text(exc: OSError) -> str:
+    """Name the Windows loader failure so the field can tell "missing" from "wrong bitness"."""
+
+    code = getattr(exc, "winerror", None)
+    text = str(exc)
+    if "frozen" in text.lower() or "dynlib" in text.lower():
+        # PyInstaller intercepts `ctypes.WinDLL("name.dll")`: in a packaged EXE a bare file name can
+        # never reach the system search path, so the DLL has to be given by full path.
+        return (
+            "打包版無法用檔名載入系統 DLL：請以完整路徑指定 LSI8181_64.dll"
+            "（CCD 頁「瀏覽 LSI DLL」，或環境變數 VISIONFLOW_LSI8181_DLL）"
+        )
+    if code == 126:
+        return f"Windows 錯誤 126 找不到指定的模組：{DLL_NAME} 本身或它的相依 DLL 缺少"
+    if code == 193:
+        return f"Windows 錯誤 193：{DLL_NAME} 不是 64 位元 DLL（位元數不符）"
+    if code == 5:
+        return f"Windows 錯誤 5：存取被拒（權限或防毒阻擋）"
+    if code == 127:
+        return f"Windows 錯誤 127：找不到指定的程序（DLL 版本不符）"
+    return f"{exc}" if code is None else f"Windows 錯誤 {code}：{exc}"
 
 
 def _load_windows_dll(path: str):
@@ -194,6 +229,20 @@ class Lsi8181MeterWheel(MeterWheel):
     @property
     def is_connected(self) -> bool:
         return self._initialized
+
+    def reload_library(self) -> DeviceAvailability:
+        """Forget a cached load failure so a newly chosen DLL path is actually tried.
+
+        The CCD page lets the operator point at the vendor folder; without this the first failure
+        would be cached for the rest of the session.
+        """
+
+        with self._lock:
+            if self._initialized:
+                raise DeviceError("米輪已連線，請先斷線再重新載入 LSI-8181 DLL。")
+            self._load_error = ""
+            self._library = None
+        return self.availability()
 
     @property
     def card_id(self) -> int:

@@ -246,6 +246,10 @@ class MeterWheelSettings:
     encoder_value: int = 0
     compare_value: int = 0
     extension_channels: tuple[ExtensionCompareChannel, ...] = field(default_factory=_default_extension_channels)
+    # Machine-level: where this machine keeps `LSI8181_64.dll`. Empty means "use the loader's search
+    # order" (env var, then the application folder, then the Windows search path). The camera machine
+    # cannot set environment variables conveniently, so the CCD page can point at the vendor folder.
+    dll_path: str = ""
 
     def normalized(self) -> "MeterWheelSettings":
         channels = list(self.extension_channels)[:EXTENSION_CHANNEL_COUNT]
@@ -259,6 +263,7 @@ class MeterWheelSettings:
             encoder_value=int(_clamp(int(self.encoder_value), COUNTER_RANGE)),
             compare_value=int(_clamp(int(self.compare_value), COUNTER_RANGE)),
             extension_channels=tuple(channel.normalized() for channel in channels),
+            dll_path=str(self.dll_path).strip(),
         )
 
 

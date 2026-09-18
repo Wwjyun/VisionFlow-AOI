@@ -19,6 +19,7 @@ from devices.sapera_api import (
     ACQ_CAPABILITIES,
     ACQ_PARAMETERS,
     ACQ_VALUES,
+    DLL_PATH_ENV as VISIONFLOW_SAPERA_DLL,
     BufferFormat,
     SaperaError,
     SaperaRuntime,
@@ -27,8 +28,12 @@ from devices.sapera_api import (
 from devices.sapera_camera import SaperaLineScanCamera
 from devices.sapera_diagnose import (
     DIAGNOSE_LOG_SUBDIR,
+    STEP_TITLES,
+    DiagnoseReport,
+    DiagnoseStep,
     _file_version_text,
     _short,
+    numeric_code,
     run_sapera_diagnose,
 )
 
@@ -332,6 +337,12 @@ class StubReport:
     def lines(self):
         return tuple(step.line() for step in self.steps)
 
+    def numeric_lines(self):
+        return tuple(numeric_code(step) for step in self.steps)
+
+    def numeric_line(self):
+        return " ".join(self.numeric_lines())
+
     def summary(self):
         return self.summary_text
 
@@ -558,6 +569,63 @@ class CleanupFailureAtS5Tests(DiagnoseHarness):
         self.assertIn("E-0801", report.steps[4].short)
         self.assertTrue(all(step.status == "SKIP" for step in report.steps[5:]))
         self.assertEqual([step.code for step in report.steps], list(STEP_CODES))
+
+
+class NumericShortCodeTests(unittest.TestCase):
+    """The field writes digits down, so every step must reduce to `<step 2><cause 4>`."""
+
+    @staticmethod
+    def _step(code: str, status: str, short: str) -> DiagnoseStep:
+        return DiagnoseStep(code, STEP_TITLES[code], status, short)
+
+    @staticmethod
+    def _report(steps) -> DiagnoseReport:
+        return DiagnoseReport(tuple(steps), "outputs/logs/camera/r.txt", "outputs/logs/camera/r.json", "")
+
+    def test_pass_skip_and_failure_codes_are_all_digits(self):
+        steps = (
+            self._step("S1", "PASS", "S1 PASS Sapera 8.60"),
+            self._step("S2", "FAIL", "S2 FAIL E-0201 找不到 DLL"),
+            self._step("S3", "SKIP", "S3 SKIP 前一步失敗"),
+            self._step("S4", "FAIL", "S4 FAIL 沒有錯誤碼的失敗"),
+        )
+        self.assertEqual(
+            tuple(numeric_code(step) for step in steps),
+            ("010000", "020201", "039999", "049998"),
+        )
+        for step in steps:
+            self.assertTrue(numeric_code(step).isdigit(), numeric_code(step))
+
+    def test_report_numeric_line_is_one_hand_copyable_row(self):
+        report = self._report(
+            (
+                self._step("S1", "PASS", "S1 PASS Sapera 8.60"),
+                self._step("S6", "FAIL", "S6 FAIL E-0602 Exposure 寫入失敗"),
+                self._step("S7", "SKIP", "S7 SKIP 前一步失敗"),
+            )
+        )
+        self.assertEqual(report.numeric_lines(), ("010000", "060602", "079999"))
+        self.assertEqual(report.numeric_line(), "010000 060602 079999")
+
+    def test_a_step_number_is_never_lost_or_misaligned(self):
+        for index in range(1, 9):
+            with self.subTest(step=index):
+                code = numeric_code(self._step(f"S{index}", "PASS", f"S{index} PASS"))
+                self.assertEqual(code[:2], f"{index:02d}")
+                self.assertEqual(len(code), 6)
+
+    def test_written_report_starts_with_the_numeric_block(self):
+        with tempfile.TemporaryDirectory() as directory:
+            report = run_sapera_diagnose(
+                runtime_loader=lambda: (_ for _ in ()).throw(SaperaError("E-0202", "載入失敗")),
+                environ={VISIONFLOW_SAPERA_DLL: "does-not-exist"},
+                log_dir=Path(directory),
+                clock=lambda: STAMP,
+            )
+            text = Path(report.report_path).read_text(encoding="utf-8")
+        self.assertIn("數字短碼（優先抄這一組）", text)
+        self.assertIn(report.numeric_line(), text)
+        self.assertIn(numeric_code(report.steps[0]), text)
 
 
 class FrameTests(DiagnoseHarness):
