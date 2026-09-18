@@ -8,12 +8,12 @@ CPU-only 是完整支援的執行模式，也是結果正確性的基準。專�
 
 | 項目 | 現況 |
 |---|---|
-| 最新發行版 | [VisionFlow AOI v1.6.3](https://github.com/wjcudalearning/VisionFlow/releases/tag/v1.6.3)，Windows x64、CUDA `sm_86` |
+| 最新發行版 | [VisionFlow AOI v1.7.0](https://github.com/wjcudalearning/VisionFlow/releases/tag/v1.7.0)，Windows x64、CUDA `sm_86` |
 | 支援環境 | Windows 10／11、Python 3.13 |
 | 檢測方式 | 10 個傳統 CV Detector + 1 個 YOLOX Detector |
 | 操作入口 | CLI、PySide6 GUI、批次資料夾、資料夾監控、相機直連監控 |
 | GPU | 選用 `visionflow_cuda.dll`；`cpu`／`auto`／`cuda` 三種模式 |
-| CCD | GUI、Recipe、模擬器、觸發流程與 LSI-8181 已有；Sapera LT 相機綁定仍待相機機台實作與驗證 |
+| CCD | GUI、Recipe、模擬器、觸發流程、LSI-8181 與 Sapera LT 相機綁定（含 `--sapera-diagnose` 現場診斷）已實作；相機機台實機驗證待做 |
 | 開發進度 | 以 [`Todo.md`](Todo.md) 為唯一準據 |
 
 > 生產提醒：Repository 內的 YOLOX fixture 只用於軟體測試；專案目前也沒有完整的量產標註資料集。範例結果與合成影像 benchmark 不代表量產良率或驗收完成。

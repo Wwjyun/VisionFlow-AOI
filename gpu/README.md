@@ -765,6 +765,13 @@ RTX 3090 正式尺寸（202-CS-SN-1，4 張批量各 3 次，median）：
 操作（其間開始的檢測在 session 上排隊）。offscreen `MainWindow` 全新 process 各 3 次，第一次檢測使用者等待
 median 467.8 ms（無自動預熱）→ 268.9 ms（自動預熱後），與第二次 266 ms 相當，判定全部 NG／558 defects。
 
+### v1.7.0 CUDA-enabled 發行範圍
+
+v1.7.0 為 Sapera LT 相機綁定與現場診斷版本，**未修改任何 CUDA source/header**（自 v1.6.3 建置點 `96ab85f`
+之後 `gpu/` 只有本 README 變更），因此沿用同一個已於 RTX 3090 驗證的 DLL，SHA-256 仍為
+`38433800568FAB7BBD8E7007A970ADE20B11B2960FEDD319829C78B8167B2345`，未重新編譯、未重跑 validator。
+GPU 行為、ABI v1 與 optional exports 與 v1.6.3 完全相同。
+
 ### v1.6.3 CUDA-enabled 發行範圍
 
 v1.6.3 收錄本頁「Session 重用 host 影像緩衝與 pinned 註冊」「GUI／批量／監控共用 GPU session」與 CUDA context
