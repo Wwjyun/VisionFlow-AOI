@@ -16,9 +16,11 @@ from devices.ccd_models import (
     AcquisitionSettings,
     CameraConnectionSettings,
     CameraState,
+    CcdMachineSettings,
     DeviceError,
     TriggerSettings,
 )
+from devices.ccd_settings_store import CcdMachineSettingsStore
 from devices.sapera_api import (
     DEFAULT_CCF_SUBDIR,
     DEFAULT_SAPERA_DIR,
@@ -235,12 +237,16 @@ def _badge(code: str, extra: str = "") -> str:
 
 
 def _failure_detail(error: SaperaError, label: str = "") -> str:
-    """Short operator text: the localized message first, then a trimmed form of the raw detail."""
+    """Short operator text: the code, the localized message, then a trimmed form of the raw detail.
+
+    The code comes first so it survives `_short` truncation and the numeric line can decode it;
+    without it every exception-path failure read `9998` in the field.
+    """
 
     summary = ERROR_MESSAGES.get(error.code, "")
     if label and (label in summary or summary in label):
         label = ""  # the localized message already names this item
-    head = " ".join(part for part in (label, summary) if part)
+    head = " ".join(part for part in (error.code, label, summary) if part)
     text = str(error.detail or "").strip()
     if not text:
         return head or ""
@@ -574,6 +580,11 @@ def _step_s5(context: _Context, connection: CameraConnectionSettings, state: _Ru
     """S5: create and release every Sapera object the camera uses, in the camera's own order."""
 
     interop = state.interop
+    if not connection.server_name:
+        # An empty location made every Create() fail while S5 still read PASS; S6 then failed with
+        # no code at all. Stop here, before touching hardware, and say which settings were used.
+        context.add_note("E-0404", "機台設定檔沒有 server；請在 CCD 頁「Sapera 位置」選擇擷取卡後再診斷")
+        return "FAIL", _badge("E-0404")
     location = interop.location(connection.server_name, connection.resource_index)
     context.add(f"位置：{connection.server_name}#{connection.resource_index}")
 
@@ -587,6 +598,9 @@ def _step_s5(context: _Context, connection: CameraConnectionSettings, state: _Ru
     except Exception as exc:  # noqa: BLE001 - one failing object must not abort the others
         context.add_note(translate_exception(exc, "E-0501").code, f"SapAcqDevice 建立失敗：{dotnet_exception_name(exc)}")
 
+    # The camera treats a missing SapAcqDevice as a feature-write note, but it cannot connect without
+    # the acquisition, buffers, and transfer; their failures fail S5 once every object was tried.
+    required_from = len(context.notes)
     acquisition = None
     try:
         acquisition = interop.new_acquisition(location, connection.config_file_path, _ignore_event, _ignore_signal)
@@ -624,12 +638,13 @@ def _step_s5(context: _Context, connection: CameraConnectionSettings, state: _Ru
     if memory:
         context.add(f"buffer 記憶體類型：{memory}")
 
+    required_failures = [note for note in context.notes[required_from:] if note.code]
     cleanup = _release(context, interop, objects.created + objects.extra)
+    if required_failures:
+        return "FAIL", _badge(required_failures[0].code)
     if cleanup:
         return "FAIL", _badge(cleanup[0].code, cleanup[0].label.split()[0])
-    if objects.created:
-        return "PASS", f"建立並釋放 {len(objects.created)} 個物件"
-    return "PASS", "無物件可建立（已回報個別失敗）"
+    return "PASS", f"建立並釋放 {len(objects.created)} 個物件"
 
 
 @dataclass(frozen=True)
@@ -905,8 +920,13 @@ def run_sapera_diagnose(
     log_dir=None,
     camera: SaperaLineScanCamera | None = None,
     clock: Callable[[], datetime] | None = None,
+    settings_source: str = "",
 ) -> DiagnoseReport:
-    """Run S1-S8 and always return a report; this function never raises."""
+    """Run S1-S8 and always return a report; this function never raises.
+
+    `settings_source` is one report line naming where `connection` came from (the machine settings
+    file for the CLI and packaged entry), so the field can tell a missing file from a wrong server.
+    """
 
     env = environ if environ is not None else _default_environ()
     settings = (connection or CameraConnectionSettings()).normalized()
@@ -926,6 +946,12 @@ def run_sapera_diagnose(
     devices_logger = logging.getLogger("devices")
     devices_logger.addHandler(handler)
     connected = False
+    if settings_source:
+        context.add(settings_source)
+    context.add(
+        f"診斷使用的位置：server={settings.server_name or '（未設定）'}#{settings.resource_index}、"
+        f"CCF={settings.config_file_path or '（未設定）'}"
+    )
     try:
         note_from = len(context.notes)
         status, short = _run_guarded(context, "S1", lambda: _step_s1(context, state, env))
@@ -995,6 +1021,32 @@ def run_sapera_diagnose(
     if problem:
         context.add_note("E-0901", problem)
     return DiagnoseReport(steps, report_path, log_path, summary, tuple(context.calls))
+
+
+def run_machine_sapera_diagnose(store: CcdMachineSettingsStore | None = None, **kwargs) -> DiagnoseReport:
+    """The CLI and packaged-EXE entry: diagnose the location saved in the machine settings file.
+
+    The CCD screen already diagnoses its own saved location; before this, the console entries passed
+    an empty location, so S6 could never connect on a correctly configured machine. Product-level
+    settings stay at their defaults because no Recipe is loaded here.
+    """
+
+    store = store if store is not None else CcdMachineSettingsStore()
+    try:
+        machine = store.load()
+        problem = store.last_error
+    except Exception as exc:  # noqa: BLE001 - a broken settings file must not stop the diagnosis
+        machine = CcdMachineSettings()
+        problem = f"CCD 機台設定檔無法讀取：{exc}"
+    path = Path(store.path)
+    resolved = path if path.is_absolute() else Path.cwd() / path
+    if problem:
+        source = f"機台設定檔：{resolved}（{problem}）"
+    elif path.is_file():
+        source = f"機台設定檔：{resolved}"
+    else:
+        source = f"機台設定檔：{resolved}（不存在，使用預設值）"
+    return run_sapera_diagnose(connection=machine.connection, settings_source=source, **kwargs)
 
 
 def _run_guarded(context: _Context, code: str, action) -> tuple[str, str]:

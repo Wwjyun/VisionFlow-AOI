@@ -415,9 +415,9 @@ def run_packaged_sapera_diagnose(runner=None, *, show_dialog: bool = True) -> in
     shows them in a dialog instead. `show_dialog=False` is the test hook.
     """
 
-    from devices.sapera_diagnose import run_sapera_diagnose
+    from devices.sapera_diagnose import run_machine_sapera_diagnose
 
-    report = (runner or run_sapera_diagnose)()
+    report = (runner or run_machine_sapera_diagnose)()
     if show_dialog:
         from PySide6.QtWidgets import QApplication
 

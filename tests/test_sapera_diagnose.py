@@ -14,7 +14,14 @@ from unittest.mock import patch
 
 import numpy as np
 
-from devices.ccd_models import AcquisitionSettings, CameraConnectionSettings, TriggerSettings
+from devices.ccd_models import (
+    AcquisitionSettings,
+    CameraConnectionSettings,
+    CcdMachineSettings,
+    DeviceError,
+    TriggerSettings,
+)
+from devices.ccd_settings_store import CcdMachineSettingsStore
 from devices.sapera_api import (
     ACQ_CAPABILITIES,
     ACQ_PARAMETERS,
@@ -34,6 +41,7 @@ from devices.sapera_diagnose import (
     _file_version_text,
     _short,
     numeric_code,
+    run_machine_sapera_diagnose,
     run_sapera_diagnose,
 )
 
@@ -569,6 +577,108 @@ class CleanupFailureAtS5Tests(DiagnoseHarness):
         self.assertIn("E-0801", report.steps[4].short)
         self.assertTrue(all(step.status == "SKIP" for step in report.steps[5:]))
         self.assertEqual([step.code for step in report.steps], list(STEP_CODES))
+
+
+class FieldNumericCodeRegressionTests(DiagnoseHarness):
+    """The camera machine reported `069998`: S6 failed, but its short line had lost the error code."""
+
+    def run_with(self, connection, **kwargs):
+        return run_sapera_diagnose(
+            runtime_loader=lambda: self.runtime,
+            environ=self.environ(),
+            connection=connection,
+            acquisition=AcquisitionSettings(length_lines=4, internal_line_rate_hz=5000),
+            trigger=TriggerSettings(),
+            log_dir=self.log_dir,
+            clock=FrozenDatetime(),
+            **kwargs,
+        )
+
+    def test_s6_connect_exception_keeps_its_code_in_both_lines(self):
+        camera = SaperaLineScanCamera(interop=self.interop, clock=FakeMonotonic())
+        error = SaperaError("E-0502", f"{SERVER}#0；SapAcquisition.Create() 回傳 false")
+        with patch.object(camera, "connect", side_effect=error):
+            report = self.run_diagnose(camera=camera)
+
+        self.assertEqual(report.steps[5].status, "FAIL")
+        self.assertTrue(report.steps[5].short.startswith("S6 FAIL E-0502"), report.steps[5].short)
+        self.assertEqual(report.numeric_lines()[5], "060502")
+        self.assertLessEqual(len(report.steps[5].short), 60)
+
+    def test_s6_error_without_a_code_is_reported_as_e_0901_not_9998(self):
+        camera = SaperaLineScanCamera(interop=self.interop, clock=FakeMonotonic())
+        with patch.object(camera, "connect", side_effect=DeviceError("沒有錯誤碼的例外")):
+            report = self.run_diagnose(camera=camera)
+
+        self.assertEqual(report.numeric_lines()[5], "060901")
+        self.assertNotIn("9998", report.numeric_line())
+
+    def test_s4_and_s7_exception_paths_also_carry_their_code(self):
+        self.interop.raise_on[("server_count",)] = FakeDotNetException("System.Exception")
+        report = self.run_diagnose()
+
+        self.assertEqual(report.steps[3].status, "FAIL")
+        self.assertEqual(report.numeric_lines()[3][:2], "04")
+        self.assertNotEqual(report.numeric_lines()[3][2:], "9998")
+
+    def test_empty_server_fails_s5_with_e_0404_before_creating_any_object(self):
+        report = self.run_with(self.connection(server_name=""))
+
+        self.assertEqual(self.statuses(report)[:5], ["PASS", "PASS", "PASS", "PASS", "FAIL"])
+        self.assertEqual(report.numeric_lines()[4], "050404")
+        self.assertEqual(report.numeric_lines()[5], "069999")
+        self.assertEqual(self.interop.objects, [])
+        self.assertIn("server=（未設定）", Path(report.report_path).read_text(encoding="utf-8"))
+
+    def test_s5_fails_when_an_object_the_camera_needs_cannot_be_created(self):
+        self.interop.fail_create = {"SapAcquisition"}
+        report = self.run_diagnose()
+
+        self.assertEqual(report.steps[4].status, "FAIL")
+        self.assertEqual(report.numeric_lines()[4], "050502")
+        self.assertEqual(report.steps[5].status, "SKIP")
+        self.assertTrue(all(obj.disposed for obj in self.interop.objects if obj.initialized))
+
+    def test_s5_still_passes_when_only_the_acq_device_is_missing(self):
+        # The camera treats SapAcqDevice as feature writes that S6 reports, not a connect blocker.
+        self.interop.fail_create = {"SapAcqDevice"}
+        report = self.run_diagnose()
+
+        self.assertEqual(report.steps[4].status, "PASS")
+        self.assertIn("E-0501", Path(report.report_path).read_text(encoding="utf-8"))
+
+    def test_machine_entry_diagnoses_the_location_saved_in_the_settings_file(self):
+        store = CcdMachineSettingsStore(self.root / "config" / "ccd_machine.json")
+        store.save(CcdMachineSettings(connection=self.connection()))
+
+        report = run_machine_sapera_diagnose(
+            store,
+            runtime_loader=lambda: self.runtime,
+            environ=self.environ(),
+            acquisition=AcquisitionSettings(length_lines=4, internal_line_rate_hz=5000),
+            trigger=TriggerSettings(),
+            log_dir=self.log_dir,
+            clock=FrozenDatetime(),
+        )
+
+        self.assertTrue(report.passed, report.numeric_line())
+        text = Path(report.report_path).read_text(encoding="utf-8")
+        self.assertIn(f"機台設定檔：{store.path}", text)
+        self.assertIn(f"server={SERVER}#0", text)
+
+    def test_machine_entry_without_a_settings_file_says_so_and_stops_at_s5(self):
+        store = CcdMachineSettingsStore(self.root / "missing" / "ccd_machine.json")
+
+        report = run_machine_sapera_diagnose(
+            store,
+            runtime_loader=lambda: self.runtime,
+            environ=self.environ(),
+            log_dir=self.log_dir,
+            clock=FrozenDatetime(),
+        )
+
+        self.assertEqual(report.numeric_lines()[4], "050404")
+        self.assertIn("不存在，使用預設值", Path(report.report_path).read_text(encoding="utf-8"))
 
 
 class NumericShortCodeTests(unittest.TestCase):

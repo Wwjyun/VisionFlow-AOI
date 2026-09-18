@@ -5,8 +5,11 @@
 
 - 打包後的 EXE：`VisionFlow AOI.exe --sapera-diagnose`
 - 開發機／原始碼：`.\env\Scripts\python.exe main.py --sapera-diagnose`
-- GUI 管理模式之後會呼叫**同一個**流程（`devices/sapera_diagnose.py` 的
-  `run_sapera_diagnose()`），兩者結果一致。
+- GUI 管理模式（CCD 頁「執行相機診斷」）呼叫**同一個**流程（`devices/sapera_diagnose.py` 的
+  `run_sapera_diagnose()`），兩者結果一致。三個入口都使用機台設定檔（`config\ccd_machine.json`）
+  儲存的 server／CCF；報告開頭會寫出實際讀取的設定檔路徑與位置。
+- **GUI 診斷前請先斷線**：CCD 頁的相機已連線時，診斷會搶用同一張擷取卡，所以按鈕會
+  以提示拒絕執行，請先按「斷線」。米輪不受影響，可以保持連線。
 
 執行後 stdout 會印出總結加八行短碼，並以離開碼表示結果：`0` 代表八步全部 PASS，
 `1` 代表有 FAIL 或 SKIP。
@@ -33,7 +36,8 @@ S8 PASS 已斷線並清理完整報告：outputs\logs\camera\sapera-diagnose-202
 - `<步驟>`：`S1`～`S8`，固定順序。
 - `<狀態>`：`PASS`、`FAIL`、`SKIP`（英文，方便抄寫）。
 - 說明：錯誤碼（`E-xxxx`）加一句繁中原因；通過時是簡短結果。
-- 每行保持在 60 個字元以內，錯誤碼永遠不會被截斷。
+- 每行保持在 60 個字元以內，錯誤碼永遠不會被截斷；每個 FAIL 都帶錯誤碼（連例外路徑也是），
+  所以數字短碼不會再出現 `9998`，除非是上表以外的狀況。
 - 前一步失敗時，後續步驟一律記為 `SKIP 前一步失敗`，不會被略過不印，
   也不會再去碰硬體。
 
@@ -89,8 +93,8 @@ S8 PASS 已斷線並清理完整報告：outputs\logs\camera\sapera-diagnose-202
 | S2 | 載入 SapClassBasic.dll | pythonnet／.NET Framework 可用，且機台自己的 managed DLL 載得進來（版本未與 runtime 不符） | `S2 PASS managed …／runtime …`，或 `E-0101`～`E-0203` |
 | S3 | Sapera API 自檢 | 相機程式用到的每個 .NET 成員都在這台機器的 DLL 裡（反射檢查，尚未碰硬體） | `S3 PASS`，或 `E-0301` 加上缺少的成員名稱 |
 | S4 | 列舉 server／resource／CCF | 擷取卡 server、Acq／AcqDevice 數量與名稱、`CamFiles\User` 內的 CCF 檔數量 | `S4 PASS n 個 server、CCF m 個（檔名）`，或 `E-0401`／`E-0402`／`E-0403` |
-| S5 | 建立並釋放 Sapera 物件 | `SapAcqDevice`、`SapAcquisition`、`SapBufferWithTrash`、`SapAcqToBuf` 依相機順序建立後再完整釋放 | `S5 PASS 建立並釋放 n 個物件`，或 `E-0501`～`E-0504`、`E-0801` |
-| S6 | 連線並寫入參數後讀回 | 真正用 `SaperaLineScanCamera` 連線、寫入 Exposure／Gain／Length／Line Rate／觸發並讀回 | `S6 PASS 參數寫入並讀回 n 項`，或 `E-0403`／`E-0505`／`E-0601`～`E-0607` |
+| S5 | 建立並釋放 Sapera 物件 | `SapAcqDevice`、`SapAcquisition`、`SapBufferWithTrash`、`SapAcqToBuf` 依相機順序建立後再完整釋放 | `S5 PASS 建立並釋放 n 個物件`，或 `E-0404`、`E-0502`～`E-0504`、`E-0801` |
+| S6 | 連線並寫入參數後讀回 | 真正用 `SaperaLineScanCamera` 連線、寫入 Exposure／Gain／Length／Line Rate／觸發並讀回 | `S6 PASS 參數寫入並讀回 n 項`，或 `E-0402`～`E-0404`／`E-0502`～`E-0505`／`E-0601`～`E-0607`／`E-0704` |
 | S7 | Snap 一張並檢查影像 | Snap 一張，檢查影像尺寸與灰階統計（min／max／mean） | `S7 PASS 寬×高 min.. max.. mean..`，或 `E-0701`～`E-0705` |
 | S8 | 斷線與清理 | 斷線並釋放所有 Sapera 物件，失敗會單獨回報 | `S8 PASS 已斷線並清理`，或 `E-0801` |
 
@@ -100,7 +104,7 @@ S8 PASS 已斷線並清理完整報告：outputs\logs\camera\sapera-diagnose-202
   仍然能先確認「有沒有裝、裝哪一版」。
 - **S4 只列舉，不建立硬體物件**：server 數為 0 會回報 `E-0402` 提示，但真正的
   硬體存取從 S5 才開始。
-- **S5 建立後立即釋放**：目的是單獨驗證物件能不能建立，不影響後面的 S6。
+- **S5 建立後立即釋放**：目的是單獨驗證物件能不能建立，不影響後面的 S6。沒有選 server 時直接`E-0404`，不碰硬體；`SapAcquisition`／buffer／`SapAcqToBuf` 任一建立失敗時 S5 就是 FAIL（`SapAcqDevice` 失敗只記在報告，相機 feature 寫入由 S6 回報）。
 - **S7 有等待上限**：最多等 5 秒，逾時即 `E-0702`，不會卡住畫面。
 - **S8 只要 S6 連上就會執行**：即使 S6 是「連上但參數寫入失敗」，S8 仍會斷線並
   回報清理結果。
@@ -122,6 +126,7 @@ S8 PASS 已斷線並清理完整報告：outputs\logs\camera\sapera-diagnose-202
 | E-0401 | 列舉 Sapera server 失敗 | 驅動異常、Sapera 服務未啟動 | 重開機；確認 Sapera LT 驅動與擷取卡驅動都已安裝 |
 | E-0402 | 找不到擷取卡（Acq resource） | 卡未插好、驅動未載入、卡被其他程式佔用 | 檢查 Xtium 卡與驅動；關閉 CamExpert 等其他取像程式 |
 | E-0403 | CCF 檔不存在 | 路徑設定錯誤、CCF 被刪除 | 確認 `CamFiles\User` 內有 CCF；必要時用 CamExpert 重新產生 |
+| E-0404 | 尚未選擇 Sapera 擷取卡（server） | 機台設定檔沒有 server、設定檔不在工作目錄的 `config\ccd_machine.json` | 在 CCD 頁「Sapera 位置」選擇擷取卡後再診斷；報告開頭會寫出實際讀取的設定檔路徑 |
 | E-0501 | `SapAcqDevice` 建立失敗 | 相機未上電、Camera Link 線未接、AcqDevice 位置錯 | 檢查相機電源與 Camera Link 線；確認相機 feature 的 server#index |
 | E-0502 | `SapAcquisition` 建立失敗 | CCF 與卡不符、資源被佔用 | 確認 CCF 對應這張卡；關閉其他取像程式後重試 |
 | E-0503 | `SapBuffer 建立失敗` | 記憶體不足、Scatter-Gather 記憶體不可用 | 關閉其他吃記憶體的程式後重試；確認 Sapera 記憶體驅動正常 |
@@ -142,7 +147,7 @@ S8 PASS 已斷線並清理完整報告：outputs\logs\camera\sapera-diagnose-202
 | E-0801 | Sapera 物件清理失敗 | Destroy／Dispose 卡住、驅動已異常 | 重新連線；若持續出現請重開機並記錄當時的 S6 結果 |
 | E-0901 | Sapera 呼叫發生未預期錯誤 | 上述分類以外的例外 | 把整行短碼抄回，並記下當時操作步驟 |
 
-> 交叉檢查結果：`ERROR_MESSAGES` 目前有 **30** 個錯誤碼，本表逐一列出 30 個，沒有缺漏、
+> 交叉檢查結果：`ERROR_MESSAGES` 目前有 **31** 個錯誤碼，本表逐一列出 31 個，沒有缺漏、
 > 也沒有文件裡多出來的字號。每個字號都能寫出上表那一欄「機台上怎麼處理」的具體動作；
 > 其中 `E-0203` 是提醒而非中斷（版本不符仍會繼續嘗試），`E-0401`／`E-0402` 的現場
 > 動作相近（都是驅動與硬體檢查），回報時請一併抄回 S4 那一行以便區分。

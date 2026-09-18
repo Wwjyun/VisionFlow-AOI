@@ -29,9 +29,9 @@ def parse_args() -> argparse.Namespace:
 def _run_sapera_diagnose() -> int:
     """Print one manually-copyable line per step; the full report stays on this machine."""
 
-    from devices.sapera_diagnose import run_sapera_diagnose
+    from devices.sapera_diagnose import run_machine_sapera_diagnose
 
-    report = run_sapera_diagnose()
+    report = run_machine_sapera_diagnose()
     print(report.summary())
     print(f"數字短碼（優先抄這組）：{report.numeric_line()}")
     for step in report.steps:

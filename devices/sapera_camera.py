@@ -215,7 +215,7 @@ class SaperaLineScanCamera(LineScanCamera):
         acquisition = acquisition.normalized()
         trigger = trigger.normalized()
         if not connection.server_name:
-            raise DeviceError("尚未選擇 Sapera 擷取卡（server），請先在「Sapera 位置」選擇。")
+            raise SaperaError("E-0404", "請先在「Sapera 位置」選擇擷取卡並儲存到機台設定檔。")
         if not connection.config_file_path or not Path(connection.config_file_path).is_file():
             raise SaperaError("E-0403", connection.config_file_path or "未設定 CCF 檔")
         self._require_capture_resource(interop, connection)

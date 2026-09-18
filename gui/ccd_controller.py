@@ -1038,8 +1038,16 @@ class CcdController(QObject, LogMixin):
         return self._diagnose_running
 
     def start_camera_diagnose(self) -> bool:
-        """Run S1-S8 on a worker thread; a second concurrent start is refused."""
+        """Run S1-S8 on a worker thread; a second concurrent start is refused.
 
+        The diagnosis opens its own Sapera objects on the saved server, so it is refused while this
+        screen's camera holds the capture card: S5/S6 would otherwise fail on the occupied resource
+        and read like a hardware fault.
+        """
+
+        if self.camera_status().connected:
+            self.notice.emit("相機目前已連線，診斷會搶用同一張擷取卡；請先按「斷線」再執行相機診斷。", "warning")
+            return False
         with self._diagnose_lock:
             if self._diagnose_running:
                 self.notice.emit("相機診斷正在執行中，請等待完成。", "warning")

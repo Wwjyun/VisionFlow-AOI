@@ -549,6 +549,29 @@ class SaperaGuiTests(unittest.TestCase):
         blocker.set()
         self.assertTrue(_wait_until(self.app, lambda: not controller.diagnose_running))
 
+    def test_diagnose_is_refused_while_the_screen_camera_holds_the_capture_card(self):
+        """Field `069998`: the diagnosis opened a second SapAcquisition on the card the screen held."""
+
+        camera = FakeSaperaCamera(versions=SaperaVersions(assembly_file_version="8.60.0.0"))
+        screen, controller = self._screen(camera)
+        screen.set_mode("admin")
+        calls: list[dict] = []
+        controller.diagnose_runner = lambda **kwargs: calls.append(kwargs) or _report(self._diagnose_steps())
+        notices: list[tuple[str, str]] = []
+        controller.notice.connect(lambda message, kind: notices.append((message, kind)))
+        camera.connect(CameraConnectionSettings(), AcquisitionSettings(), TriggerSettings())
+
+        self.assertFalse(controller.start_camera_diagnose())
+        self.assertEqual(calls, [], "the diagnosis must not touch the card the screen holds")
+        self.assertTrue(any("斷線" in message and kind == "warning" for message, kind in notices))
+        self.assertFalse(controller.diagnose_running)
+        self.assertTrue(screen.diagnose_button.isEnabled())
+
+        camera.disconnect()
+        self.assertTrue(controller.start_camera_diagnose())
+        self.assertTrue(_wait_until(self.app, lambda: not controller.diagnose_running))
+        self.assertEqual(len(calls), 1)
+
     def test_failing_report_keeps_the_failing_short_code_visible(self):
         camera = FakeSaperaCamera(versions=SaperaVersions(assembly_file_version="8.60.0.0"))
         screen, controller = self._screen(camera)

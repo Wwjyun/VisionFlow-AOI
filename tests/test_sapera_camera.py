@@ -395,8 +395,11 @@ class ConnectSequenceTests(SaperaCameraTestBase):
         with self.assertRaises(SaperaError) as caught:
             self.camera.connect(self.connection(config_file_path=str(self.ccf) + ".missing"), AcquisitionSettings(), TriggerSettings())
         self.assertEqual(caught.exception.code, "E-0403")
-        with self.assertRaises(DeviceError):
+        with self.assertRaises(DeviceError) as caught:
             self.camera.connect(self.connection(server_name=""), AcquisitionSettings(), TriggerSettings())
+        # A coded SaperaError (still a DeviceError for callers) so the field numeric line reads 0404.
+        self.assertIsInstance(caught.exception, SaperaError)
+        self.assertEqual(caught.exception.code, "E-0404")
         self.assertEqual(self.interop.calls, [])
 
     def test_a_server_without_an_acq_resource_is_refused_with_e0402(self):

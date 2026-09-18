@@ -72,6 +72,7 @@ ERROR_MESSAGES = {
     "E-0401": "列舉 Sapera server 失敗",
     "E-0402": "找不到擷取卡（Acq resource）",
     "E-0403": "CCF 檔不存在",
+    "E-0404": "尚未選擇 Sapera 擷取卡（server）",
     "E-0501": "SapAcqDevice 建立失敗",
     "E-0502": "SapAcquisition 建立失敗",
     "E-0503": "SapBuffer 建立失敗",
