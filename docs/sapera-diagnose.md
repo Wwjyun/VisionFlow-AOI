@@ -135,7 +135,7 @@ S8 PASS 已斷線並清理完整報告：outputs\logs\camera\sapera-diagnose-202
 | E-0504 | `SapAcqToBuf` 建立失敗 | 前一個物件（buffer／acquisition）未正確建立 | 先看 S5 短碼中較早的錯誤碼，通常是被前面失敗連帶影響 |
 | E-0505 | 未偵測到相機訊號 | 相機未上電、線材鬆脫、線材損壞 | 檢查相機電源與 Camera Link 線；確認相機燈號 |
 | E-0506 | 找不到可用的 SapBuffer 建構子 | 這台機器的 Sapera 版本提供的 `SapBufferWithTrash`／`SapBuffer` 建構子形狀與程式預期不同（S3 就會回報，不碰硬體） | 回報 `030506`；報告檔會列出機台實際提供的建構子（例如 `SapBufferWithTrash(Int32, SapXferNode, SapBuffer+MemoryType)`），需要改程式 |
-| E-0601 | 相機 Line Rate（`AcquisitionLineRate`）寫入失敗 | 相機仍在 TriggerMode=On（外部觸發）時 CamExpert 顯示 n/a、要求值低於相機最低線速率、feature 唯讀 | 連續模式會先把 TriggerMode 切回 Off 再寫線速率；若同時有 `E-0609`，先處理 TriggerMode。否則在 CamExpert 確認 `AcquisitionLineRate` 的可寫範圍 |
+| E-0601 | 相機 Line Rate（`AcquisitionLineRate`）寫入失敗 | 相機仍在 TriggerMode=On（外部觸發）時 CamExpert 顯示 n/a、feature 唯讀、要求值超出範圍且相機沒有回報範圍 | 連續模式會先把 TriggerMode 切回 Off 再寫線速率；相機有回報範圍時會自動夾到範圍內（本產線 Linea 16K 最低 300 Hz），報告會註明。若同時有 `E-0609`，先處理 TriggerMode。否則把 Recipe 線速率設在 CamExpert 顯示的範圍內 |
 | E-0602 | Exposure 寫入失敗 | 相機沒有可寫的曝光 feature、值超出範圍 | 用 CamExpert 確認曝光 feature 名稱與可寫範圍 |
 | E-0603 | Gain 寫入失敗 | 相機沒有 Gain feature、值超出範圍 | 用 CamExpert 確認 Gain 可寫範圍 |
 | E-0604 | Length（`CROP_HEIGHT`）寫入失敗 | 板卡不支援此參數、值超出範圍 | 確認 Length 在板卡允許範圍；對照 CamExpert 的 CROP_HEIGHT |
@@ -189,7 +189,7 @@ S8 PASS 已斷線並清理完整報告：outputs\logs\camera\sapera-diagnose-202
 | 擷取卡 | Teledyne DALSA Xtium-CL MX4（`OR-Y4C0-XMX00`），Sapera `Acq` resource |
 | 相機 | Teledyne DALSA Linea Mono 16K（`LA-HM-16K05A-00-R`），Camera Link，Sapera `AcqDevice` resource |
 | 影像 | 16384 × `CROP_HEIGHT`、8-bit 單色（CCF 需設為 Mono8） |
-| 線速率 | 最高 48000 Hz（實際上下限由板卡 `INT_LINE_TRIGGER_FREQ_MIN/MAX` 與相機 `AcquisitionLineRate` 讀回決定） |
+| 線速率 | 300–48000 Hz（現場 CamExpert 確認相機最低 300 Hz；程式會讀相機回報的範圍並夾住，板卡另依 `INT_LINE_TRIGGER_FREQ_MIN/MAX` 限制） |
 | 外部觸發 | 米輪編碼器脈衝進 CC1，`LINE_INTEGRATE_METHOD_3`、`EXT_LINE_TRIGGER_ENABLE=1` |
 
 診斷跑完時，短碼應該長得像（數值依現場設定）：

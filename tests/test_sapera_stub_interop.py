@@ -194,6 +194,26 @@ class SaperaStubInteropTests(unittest.TestCase):
         self.assertIn("SetParameter INT_LINE_TRIGGER_ENABLE=1", calls)
         self.assertIn("SetParameter INT_LINE_TRIGGER_FREQ=100", calls)
 
+    def test_line_rate_below_the_camera_minimum_is_raised_to_it(self):
+        """Field: Linea 16K reports AcquisitionLineRate minimum 300 Hz; the Recipe asked for 30."""
+
+        self.stub.MissingParameters = CAM_LINE_RATE_BOUNDS
+        self.stub.LineRateMin = 300
+        interop = self.runtime.interop()
+        device = interop.new_acq_device(interop.location(SERVER, 0))
+        self.assertTrue(interop.create(device))
+        try:
+            self.assertEqual(interop.feature_int_range(device, "AcquisitionLineRate"), (300, 48000))
+            self.assertEqual(interop.feature_int_range(device, "Gain"), (None, None))
+        finally:
+            interop.destroy(device)
+            interop.dispose(device)
+
+        self.connect()
+        calls = self.calls()
+        self.assertIn("SetFeatureValue(Int64) AcquisitionLineRate=300", calls)
+        self.assertNotIn("SetFeatureValue(Int64) AcquisitionLineRate=30", calls)
+
     def test_continuous_connect_notes_record_the_readback_values(self):
         self.stub.MissingParameters = CAM_LINE_RATE_BOUNDS
         self.connect()

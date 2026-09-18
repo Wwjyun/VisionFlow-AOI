@@ -692,6 +692,7 @@ class PythonnetSaperaInterop:
         clr_type = clr.GetClrType
         int32_out = clr_type(System.Int32).MakeByRefType()
         string_out = clr_type(System.String).MakeByRefType()
+        self._int64_out = clr_type(System.Int64).MakeByRefType()
         self._prm = sap.SapAcquisition.Prm
         self._val = sap.SapAcquisition.Val
         self._cap = sap.SapAcquisition.Cap
@@ -814,6 +815,44 @@ class PythonnetSaperaInterop:
                     feature.Destroy()
             finally:
                 feature.Dispose()
+
+    def feature_int_range(self, device, name: str) -> tuple[int | None, int | None]:
+        """Optional probe: `(min, max)` of an integer feature, `None` where this build cannot say.
+
+        Not part of the manifest (like the buffer constructor, a missing member must not fail S3):
+        `SapFeature.GetValueMin/Max(out Int64)` is looked up at call time and any failure reads as
+        unknown. Field report: Linea 16K rejects AcquisitionLineRate below 300 Hz.
+        """
+
+        try:
+            feature = self._sap.SapFeature(device.Location)
+        except Exception:  # noqa: BLE001 - an unknown range is a valid answer
+            return None, None
+        try:
+            feature.Create()
+            if not device.GetFeatureInfo(str(name), feature):
+                return None, None
+            return self._feature_bound(feature, "GetValueMin"), self._feature_bound(feature, "GetValueMax")
+        except Exception:  # noqa: BLE001
+            LOGGER.debug("feature range unavailable: %s", name, exc_info=True)
+            return None, None
+        finally:
+            try:
+                if feature.Initialized:
+                    feature.Destroy()
+                feature.Dispose()
+            except Exception:  # noqa: BLE001 - probe cleanup is best effort
+                LOGGER.debug("SapFeature cleanup failed", exc_info=True)
+
+    def _feature_bound(self, feature, method_name: str) -> int | None:
+        method = getattr(feature, method_name, None)
+        if method is None:
+            return None
+        try:
+            ok, value = method.Overloads[self._int64_out](0)
+        except Exception:  # noqa: BLE001 - overload absent on this build
+            return None
+        return int(value) if ok else None
 
     def set_feature_string(self, device, name: str, value: str) -> bool:
         return bool(device.SetFeatureValue.Overloads[self._sig_set_string](str(name), str(value)))

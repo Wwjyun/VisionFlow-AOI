@@ -465,7 +465,12 @@ class SaperaLineScanCamera(LineScanCamera):
             )
             return False
         before = self._quiet(lambda: interop.get_feature_string(device, LINE_RATE_FEATURE), None)
-        rate = int(line_rate_hz)
+        requested = int(line_rate_hz)
+        rate, bounds = self._clamp_to_feature_range(interop, device, LINE_RATE_FEATURE, requested)
+        if rate != requested:
+            # Like the board's INT_LINE_TRIGGER clamp (xx_ccd ClampInternalLineRate): the camera
+            # rejects out-of-range values outright (field: Linea 16K minimum 300 Hz, Recipe 30 Hz).
+            log.ok("Internal Line Rate 範圍", f"要求 {requested} Hz 超出相機範圍 {bounds}，改寫 {rate} Hz")
         # xx_ccd TrySetNotebookInternalLineRateFeatures: Int64, then the decimal text, then the integer
         # text. GenICam declares AcquisitionLineRate as a Float, which may reject the Int64 overload
         # (field report `060601` came from a port that only tried Int64).
@@ -487,6 +492,20 @@ class SaperaLineScanCamera(LineScanCamera):
             "（要求值可能低於相機最低線速率）",
         )
         return False
+
+    def _clamp_to_feature_range(self, interop, device, feature: str, value: int) -> tuple[int, str]:
+        """`(value clamped to the feature's reported range, "min–max" text)`; unchanged when unknown."""
+
+        probe = getattr(interop, "feature_int_range", None)
+        if probe is None:
+            return value, "未知"
+        low, high = self._quiet(lambda: probe(device, feature), (None, None)) or (None, None)
+        clamped = value
+        if low is not None and clamped < low:
+            clamped = int(low)
+        if high is not None and clamped > high:
+            clamped = int(high)
+        return clamped, f"{_fmt(low)}–{_fmt(high)}"
 
     def _write_exposure(self, interop, device, exposure_time: float, log: _ApplyLog) -> bool:
         text = str(int(exposure_time))

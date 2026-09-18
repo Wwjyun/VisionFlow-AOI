@@ -30,6 +30,9 @@ namespace DALSA.SaperaLT.SapClassBasic
         public static string[] ReadOnlyFeatures = new string[0];
         public static string[] MissingFeatures = new string[0];
         public static string[] MissingParameters = new string[0];
+        // Linea 16K reports AcquisitionLineRate 300..48000 Hz (field report); defaults keep 30 Hz legal.
+        public static long LineRateMin = 1;
+        public static long LineRateMax = 48000;
         public static SapAcquisition LastAcquisition;
         public static int CallbackThreadId;
 
@@ -52,6 +55,8 @@ namespace DALSA.SaperaLT.SapClassBasic
                 ReadOnlyFeatures = new string[0];
                 MissingFeatures = new string[0];
                 MissingParameters = new string[0];
+                LineRateMin = 1;
+                LineRateMax = 48000;
                 LastAcquisition = null;
                 CallbackThreadId = 0;
                 SapAcqDevice.Features.Clear();
@@ -178,6 +183,32 @@ namespace DALSA.SaperaLT.SapClassBasic
 
         public bool Initialized { get; private set; }
         public AccessMode DataAccessMode { get; internal set; }
+        internal string Name;
+
+        // Both widths exist so the binding has to pick the Int64 overload explicitly.
+        public bool GetValueMin(out int value)
+        {
+            value = (int)StubHardware.LineRateMin;
+            return Name == "AcquisitionLineRate";
+        }
+
+        public bool GetValueMin(out long value)
+        {
+            value = StubHardware.LineRateMin;
+            return Name == "AcquisitionLineRate";
+        }
+
+        public bool GetValueMax(out int value)
+        {
+            value = (int)StubHardware.LineRateMax;
+            return Name == "AcquisitionLineRate";
+        }
+
+        public bool GetValueMax(out long value)
+        {
+            value = StubHardware.LineRateMax;
+            return Name == "AcquisitionLineRate";
+        }
 
         public bool Create()
         {
@@ -241,6 +272,7 @@ namespace DALSA.SaperaLT.SapClassBasic
                 return false;
             }
 
+            feature.Name = featureName;
             feature.DataAccessMode = StubHardware.Contains(StubHardware.ReadOnlyFeatures, featureName)
                 ? SapFeature.AccessMode.ReadOnly
                 : SapFeature.AccessMode.ReadWrite;

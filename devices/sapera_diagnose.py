@@ -76,6 +76,7 @@ _MANAGED_METHODS = (
     "new_acq_device",
     "feature_available",
     "feature_access_mode",
+    "feature_int_range",
     "set_feature_string",
     "set_feature_int64",
     "get_feature_string",

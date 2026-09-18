@@ -453,6 +453,30 @@ class ConnectSequenceTests(SaperaCameraTestBase):
         self.assertEqual([note.code for note in self.camera.apply_notes() if note.code], [])
         self.assertEqual(io.features["AcquisitionLineRate"], "5000")
 
+    def test_line_rate_is_clamped_to_the_range_the_camera_reports(self):
+        """Field: Linea 16K minimum 300 Hz; a 30 Hz request was rejected outright."""
+
+        self.interop.feature_int_range = lambda device, name: (300, 48000) if name == "AcquisitionLineRate" else (None, None)
+        self.connect(internal_line_rate_hz=30)
+
+        self.assertIn(("set_feature_int64", "AcquisitionLineRate", 300), self.interop.calls)
+        self.assertEqual([note.code for note in self.camera.apply_notes() if note.code], [])
+        clamp = next(note for note in self.camera.apply_notes() if note.item == "Internal Line Rate 範圍")
+        self.assertIn("要求 30 Hz", clamp.detail)
+        self.assertIn("300–48000", clamp.detail)
+
+        self.camera.disconnect()
+        self.interop.calls.clear()
+        self.connect(internal_line_rate_hz=60000)
+        self.assertIn(("set_feature_int64", "AcquisitionLineRate", 48000), self.interop.calls)
+
+    def test_unknown_line_rate_range_writes_the_request_unchanged(self):
+        self.interop.feature_int_range = lambda device, name: (None, None)
+        self.connect(internal_line_rate_hz=30)
+
+        self.assertIn(("set_feature_int64", "AcquisitionLineRate", 30), self.interop.calls)
+        self.assertNotIn("Internal Line Rate 範圍", [note.item for note in self.camera.apply_notes()])
+
     def test_external_trigger_mode_does_not_report_e0609(self):
         self.interop.read_only_features.add("TriggerMode")
         self.connect(mode=TriggerMode.EXTERNAL)
