@@ -23,7 +23,7 @@ from gui.image_viewer import ImageViewer
 from gui.theme import COLORS
 from gui.widgets.common import Badge, EmptyState, ProgressBar, Segmented, make_param_widget, result_badge
 from gui.widgets.panel import Panel
-from gui.table_models import RowTableModel, StatusFilterProxyModel, TableColumn
+from gui.table_models import RowTableModel, StatusFilterProxyModel, TableColumn, fit_columns_to_sample
 
 # ============================================================
 # AOI Console — 檢測執行 screen
@@ -506,7 +506,7 @@ class BatchDataPanel(Panel):
         self.output_label.setText(f"{output_dir}\n總耗時：{batch_duration}" if output_dir else "")
 
         self.table_model.set_rows(items)
-        self.table.resizeColumnsToContents()
+        fit_columns_to_sample(self.table)
         self.table.horizontalHeader().setStretchLastSection(True)
 
 

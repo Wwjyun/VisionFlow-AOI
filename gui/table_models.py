@@ -4,6 +4,20 @@ from dataclasses import dataclass
 from typing import Callable, Iterable
 
 from PySide6.QtCore import QAbstractTableModel, QModelIndex, QSortFilterProxyModel, Qt
+from PySide6.QtWidgets import QTableView
+
+# Rows measured when fitting column widths. Qt defaults to 1000, which made a
+# 1000-image batch table query every cell on the GUI thread.
+COLUMN_FIT_SAMPLE_ROWS = 64
+
+
+def fit_columns_to_sample(table: QTableView, sample_rows: int = COLUMN_FIT_SAMPLE_ROWS) -> None:
+    """Fit column widths to the header and a bounded sample of rows.
+
+    Only widths change; table content, filtering and ordering are untouched.
+    """
+    table.horizontalHeader().setResizeContentsPrecision(max(1, int(sample_rows)))
+    table.resizeColumnsToContents()
 
 
 @dataclass(frozen=True)

@@ -11,7 +11,7 @@ import yaml
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PySide6.QtCore import QSettings
+from PySide6.QtCore import QSettings, Qt
 from PySide6.QtGui import QImage, QPalette
 from PySide6.QtWidgets import QApplication, QComboBox, QLabel
 
@@ -1063,6 +1063,68 @@ class GuiWorkflowTests(unittest.TestCase):
         self.assertEqual(len(sampled), 1_000)
         self.assertEqual((sampled[0], sampled[-1]), (0, 9_999))
         self.assertEqual(sampled, deterministic_sample(range(10_000), 1_000))
+
+    def test_batch_tables_fit_columns_from_bounded_row_sample(self):
+        from gui.screens.batch_dashboard_screen import BatchDashboardScreen
+        from gui.screens.run_screen import BatchDataPanel
+        from gui.table_models import COLUMN_FIT_SAMPLE_ROWS
+
+        statuses = ("PASS", "NG", "ERROR")
+        items = [
+            {
+                "image_name": f"IMG_{index:04d}.bmp",
+                "image_path": f"C:/batch/IMG_{index:04d}.bmp",
+                "final_result": statuses[index % 3],
+                "tile_count": 6,
+                "pass_tile_count": 5,
+                "ng_count": 1 if index % 3 == 1 else 0,
+                "tile_pass_rate": 83.3,
+                "defect_count": index % 11,
+                "duration_sec": 0.3,
+                "error": "decode failed" if index % 3 == 2 else "",
+                "outputs": {},
+                "detail": {"tiles": [], "final_result": statuses[index % 3]},
+            }
+            for index in range(1000)
+        ]
+        result = {
+            "summary": {"total": 1000, "pass": 334, "ng": 333, "error": 333},
+            "items": items,
+            "output_dir": "C:/out",
+            "duration_sec": 300.0,
+        }
+        measured_rows: set[int] = set()
+        original_data = RowTableModel.data
+
+        def recording_data(model, index, role=Qt.ItemDataRole.DisplayRole):
+            if role == Qt.ItemDataRole.DisplayRole and index.isValid():
+                measured_rows.add(index.row())
+            return original_data(model, index, role)
+
+        dashboard = BatchDashboardScreen()
+        panel = BatchDataPanel()
+        with patch.object(RowTableModel, "data", recording_data):
+            for fill in (panel.set_batch_result, dashboard.set_batch_result):
+                measured_rows.clear()
+                fill(result)
+                self.assertLessEqual(len(measured_rows), COLUMN_FIT_SAMPLE_ROWS)
+
+        for table, model, proxy in (
+            (panel.table, panel.table_model, panel.table_proxy),
+            (dashboard.table, dashboard.table_model, dashboard.table_proxy),
+        ):
+            self.assertEqual(table.horizontalHeader().resizeContentsPrecision(), COLUMN_FIT_SAMPLE_ROWS)
+            self.assertEqual([row["image_name"] for row in model.rows], [item["image_name"] for item in items])
+            header = table.horizontalHeader()
+            for column in range(model.columnCount()):
+                self.assertGreaterEqual(header.sectionSize(column), header.sectionSizeFromContents(column).width())
+            proxy.set_status("ng")
+            self.assertEqual(proxy.rowCount(), 333)
+            self.assertEqual(proxy.row_dict(0)["image_name"], "IMG_0001.bmp")
+            proxy.set_status("all")
+            self.assertEqual(proxy.rowCount(), 1000)
+        dashboard.deleteLater()
+        panel.deleteLater()
 
 
 if __name__ == "__main__":
