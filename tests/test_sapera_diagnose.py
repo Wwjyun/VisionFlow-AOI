@@ -40,6 +40,7 @@ from devices.sapera_diagnose import (
     DiagnoseStep,
     _file_version_text,
     _short,
+    frame_wait_timeout,
     numeric_code,
     run_machine_sapera_diagnose,
     run_sapera_diagnose,
@@ -811,6 +812,21 @@ class FrameTests(DiagnoseHarness):
         self.assertIn("E-0801", report.steps[7].short)
         self.assertFalse(report.passed)
         self.assertEqual([step.code for step in report.steps], list(STEP_CODES))
+
+
+class FrameWaitTimeoutTests(unittest.TestCase):
+    """Field `070702`: 720 lines at 30 Hz take 24 s, far beyond a fixed 5 s wait."""
+
+    def test_wait_covers_one_frame_with_margin_within_the_bounds(self):
+        cases = (
+            ((720, 30), 38.0),        # 24 s frame -> 1.5 x 24 + 2
+            ((4, 5000), 5.0),         # tiny frame keeps the base wait
+            ((50_000, 30), 60.0),     # never longer than the ceiling
+        )
+        for (length, rate), expected in cases:
+            with self.subTest(length=length, rate=rate):
+                acquisition = AcquisitionSettings(length_lines=length, internal_line_rate_hz=rate)
+                self.assertEqual(frame_wait_timeout(acquisition), expected)
 
 
 class ShortCodeTests(unittest.TestCase):

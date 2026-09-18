@@ -87,6 +87,7 @@ ERROR_MESSAGES = {
     "E-0606": "One Frame（EXT_FRAME_TRIGGER_ENABLE）寫入失敗",
     "E-0607": "外部觸發未 arm",
     "E-0608": "板卡內部線觸發（INT_LINE_TRIGGER）寫入失敗",
+    "E-0609": "相機 TriggerMode 無法切回 Off（連續模式）",
     "E-0701": "Snap 啟動失敗",
     "E-0702": "等待影像逾時",
     "E-0703": "影像複製失敗",

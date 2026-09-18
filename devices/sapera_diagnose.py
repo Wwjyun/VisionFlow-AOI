@@ -58,6 +58,9 @@ LOGGER = logging.getLogger(__name__)
 DIAGNOSE_LOG_SUBDIR = Path("outputs") / "logs" / "camera"
 DIAGNOSE_SCHEMA = "visionflow-sapera-diagnose/v1"
 FRAME_WAIT_TIMEOUT_SEC = 5.0
+# S7 waits for one whole frame: `length / line rate` plus margin, never shorter than the base wait
+# (field `070702`: 720 lines at 30 Hz take 24 s) and never so long that the operator gives up.
+FRAME_WAIT_MAX_SEC = 60.0
 FRAME_WAIT_POLL_SEC = 0.05
 _SHORT_LINE_MAX = 60
 
@@ -760,13 +763,15 @@ def _readback(acquisition: AcquisitionSettings) -> str:
     )
 
 
-def _step_s7(context: _Context, camera: SaperaLineScanCamera, wait: Callable[[], None]) -> tuple[str, str]:
+def _step_s7(
+    context: _Context, camera: SaperaLineScanCamera, wait: Callable[[], None], timeout: float = FRAME_WAIT_TIMEOUT_SEC
+) -> tuple[str, str]:
     """S7: one frame through Snap, then its size and grey statistics, within a bounded wait."""
 
     try:
         start_status = camera.status()
         camera.capture_frame()
-        context.add(f"Snap 已啟動；state={start_status.state.value}")
+        context.add(f"Snap 已啟動；state={start_status.state.value}；等待上限 {timeout:g} 秒")
     except (SaperaError, DeviceError) as exc:
         code = getattr(exc, "code", "") or "E-0701"
         context.add_note(code, str(exc))
@@ -776,7 +781,7 @@ def _step_s7(context: _Context, camera: SaperaLineScanCamera, wait: Callable[[],
     frame = camera.latest_frame()
     if frame is None:
         detail = camera.status().message or "尚未收到影像"
-        context.add_note("E-0702", f"{detail}（等待上限 {FRAME_WAIT_TIMEOUT_SEC:g} 秒）")
+        context.add_note("E-0702", f"{detail}（等待上限 {timeout:g} 秒）")
         return "FAIL", _badge("E-0702")
     if frame.size == 0:
         context.add_note("E-0703", "收到空影像")
@@ -922,10 +927,18 @@ def _resolve_loader(runtime_loader, environ):
     return runtime_loader
 
 
-def _wait_for_frame(camera: SaperaLineScanCamera, clock) -> None:
-    """Bounded wait: uses the injected clock when it can be, and always gives up after a few seconds."""
+def frame_wait_timeout(acquisition: AcquisitionSettings) -> float:
+    """Seconds S7 waits: 1.5 frame times plus 2 s, clamped to the base wait and the 60 s ceiling."""
 
-    deadline = time.monotonic() + FRAME_WAIT_TIMEOUT_SEC
+    rate = max(1, int(acquisition.internal_line_rate_hz))
+    frame_time = int(acquisition.length_lines) / rate
+    return round(min(FRAME_WAIT_MAX_SEC, max(FRAME_WAIT_TIMEOUT_SEC, frame_time * 1.5 + 2.0)), 1)
+
+
+def _wait_for_frame(camera: SaperaLineScanCamera, clock, timeout: float = FRAME_WAIT_TIMEOUT_SEC) -> None:
+    """Bounded wait: uses the injected clock when it can be, and always gives up after `timeout`."""
+
+    deadline = time.monotonic() + timeout
     while camera.latest_frame() is None:
         if time.monotonic() >= deadline:
             return
@@ -985,6 +998,7 @@ def run_sapera_diagnose(
     devices_logger = logging.getLogger("devices")
     devices_logger.addHandler(handler)
     connected = False
+    wait_limit = frame_wait_timeout(acquisition)
     if settings_source:
         context.add(settings_source)
     context.add(
@@ -1004,7 +1018,9 @@ def run_sapera_diagnose(
             ("S4", lambda: _step_s4(context, settings, state)),
             ("S5", lambda: _step_s5(context, settings, state, objects)),
             ("S6", lambda: _step_s6(context, camera, settings, acquisition, trigger, state)),
-            ("S7", lambda: _step_s7(context, camera, lambda: _wait_for_frame(camera, session_clock))),
+            ("S7", lambda: _step_s7(
+                context, camera, lambda: _wait_for_frame(camera, session_clock, wait_limit), wait_limit
+            )),
         ):
             note_from = len(context.notes)
             # A connected camera whose parameter writes partly failed still gets one Snap: the

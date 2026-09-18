@@ -414,12 +414,19 @@ class SaperaLineScanCamera(LineScanCamera):
             log.ok("相機 feature 位置", source)
             applied = False
             if trigger.mode == TriggerMode.CONTINUOUS:
+                # Field `060601`: a camera left in TriggerMode=On (external line trigger) shows
+                # AcquisitionLineRate as n/a, so free-run is restored and committed first. The line
+                # rate still precedes Exposure, the order PROJECT_HANDOFF.md confirmed.
+                if self._write_trigger_features(interop, device, trigger.mode, log):
+                    applied = True
+                    self._quiet(lambda: interop.update_features(device))
                 applied |= self._write_line_rate(interop, device, acquisition.internal_line_rate_hz, log)
             else:
                 log.ok("Internal Line Rate", f"{trigger.mode.value} 模式不寫入")
             applied |= self._write_exposure(interop, device, acquisition.exposure_time, log)
             applied |= self._write_gain(interop, device, acquisition.gain, log)
-            applied |= self._write_trigger_features(interop, device, trigger.mode, log)
+            if trigger.mode != TriggerMode.CONTINUOUS:
+                applied |= self._write_trigger_features(interop, device, trigger.mode, log)
             if applied and not self._quiet(lambda: interop.update_features(device)):
                 log.fail("E-0501", "相機 feature", "UpdateFeaturesToDevice() 失敗")
         except Exception as exc:  # noqa: BLE001 - xx_ccd keeps connecting when feature writes fail
@@ -451,7 +458,11 @@ class SaperaLineScanCamera(LineScanCamera):
 
     def _write_line_rate(self, interop, device, line_rate_hz: int, log: _ApplyLog) -> bool:
         if not self._quiet(lambda: interop.feature_available(device, LINE_RATE_FEATURE)):
-            log.fail("E-0601", "Internal Line Rate", f"{LINE_RATE_FEATURE} 不存在")
+            log.fail(
+                "E-0601",
+                "Internal Line Rate",
+                f"{LINE_RATE_FEATURE} 不可用（CamExpert 顯示 n/a；相機 TriggerMode 仍為 On 時會這樣）",
+            )
             return False
         before = self._quiet(lambda: interop.get_feature_string(device, LINE_RATE_FEATURE), None)
         rate = int(line_rate_hz)
@@ -513,8 +524,16 @@ class SaperaLineScanCamera(LineScanCamera):
                 interop, device, EXTERNAL_LINE_SELECTORS, True, EXTERNAL_LINE_SOURCES
             )
             applied, details = disabled or enabled, first + second
-        # Camera-side trigger selectors are advisory in xx_ccd too; the board parameters decide arming.
-        log.ok("相機 TriggerMode", f"{mode.value}：{'；'.join(details)}")
+        readback = self._quiet(lambda: interop.get_feature_string(device, DEVICE_TRIGGER_MODE_FEATURE), None)
+        detail = f"{mode.value}：{'；'.join(details)}；TriggerMode 讀回 {_fmt(readback)}"
+        if mode == TriggerMode.CONTINUOUS and not applied:
+            # Free-run needs the camera's TriggerMode Off: while it stays On the camera waits for CC1
+            # pulses (field `070702`) and hides AcquisitionLineRate (field `060601`).
+            log.fail("E-0609", "相機 TriggerMode", detail)
+            return applied
+        # Camera-side trigger selectors are advisory in external modes, as in xx_ccd; the board
+        # parameters decide arming there.
+        log.ok("相機 TriggerMode", detail)
         return applied
 
     def _write_selectors(self, interop, device, selectors, enabled: bool, sources) -> tuple[bool, list[str]]:

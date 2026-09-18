@@ -297,11 +297,18 @@ class ConnectSequenceTests(SaperaCameraTestBase):
         line_rate = io.index(("set_feature_int64", "AcquisitionLineRate", 5000))
         exposure = io.index(("set_feature_string", "ExposureTime", "1234"))
         gain = io.index(("set_feature_string", "Gain", "2"))
-        update = io.index(("update_features",))
+        updates = [index for index, call in enumerate(io.calls) if call == ("update_features",)]
+        trigger_off = io.index(("set_feature_string", "TriggerMode", "Off"))
         device_disposed = io.index(("dispose", "SapAcqDevice"))
         new_acq = io.index(("new_acquisition", ("loc", SERVER, 0), "line_scan.ccf"))
+        # Field `060601`: free-run (TriggerMode Off) is committed before the line rate, which a camera
+        # still in TriggerMode=On reports as n/a; the line rate still precedes Exposure and Gain.
+        self.assertEqual(len(updates), 2)
+        self.assertLess(trigger_off, updates[0])
+        self.assertLess(updates[0], line_rate)
         self.assertLess(line_rate, exposure)
         self.assertLess(exposure, gain)
+        update = updates[-1]
         self.assertLess(gain, update)
         self.assertLess(update, device_disposed)
         self.assertLess(device_disposed, new_acq)
@@ -408,6 +415,49 @@ class ConnectSequenceTests(SaperaCameraTestBase):
         self.assertIn("ReadOnly", failed[0].detail)
         attempts = [call[0] for call in self.interop.calls if call[0].startswith("set_feature") and call[1] == "AcquisitionLineRate"]
         self.assertEqual(attempts, ["set_feature_int64", "set_feature_string", "set_feature_string"])
+
+    def test_continuous_mode_that_cannot_leave_trigger_mode_on_is_e0609(self):
+        """Field `060601 070702`: a camera stuck in TriggerMode=On waits for CC1 and hides the line rate."""
+
+        self.interop.read_only_features.add("TriggerMode")
+        self.interop.features["TriggerMode"] = "On"
+        status = self.connect()
+
+        self.assertEqual(status.state, CameraState.IDLE)
+        failed = {note.code: note for note in self.camera.apply_notes() if note.code}
+        self.assertIn("E-0609", failed)
+        self.assertIn("TriggerMode 讀回 On", failed["E-0609"].detail)
+
+    def test_line_rate_hidden_by_trigger_mode_on_is_written_after_free_run_is_committed(self):
+        """Models the field camera: AcquisitionLineRate is n/a until TriggerMode=Off reaches the device."""
+
+        io = self.interop
+        io.features["TriggerMode"] = "On"
+        committed = {"TriggerMode": "On"}
+        base_available = io.feature_available
+        base_update = io.update_features
+
+        def feature_available(device, name):
+            if name == "AcquisitionLineRate" and committed["TriggerMode"] != "Off":
+                return False
+            return base_available(device, name)
+
+        def update_features(device):
+            committed["TriggerMode"] = io.features["TriggerMode"]
+            return base_update(device)
+
+        io.feature_available = feature_available
+        io.update_features = update_features
+        self.connect(internal_line_rate_hz=5000)
+
+        self.assertEqual([note.code for note in self.camera.apply_notes() if note.code], [])
+        self.assertEqual(io.features["AcquisitionLineRate"], "5000")
+
+    def test_external_trigger_mode_does_not_report_e0609(self):
+        self.interop.read_only_features.add("TriggerMode")
+        self.connect(mode=TriggerMode.EXTERNAL)
+
+        self.assertNotIn("E-0609", [note.code for note in self.camera.apply_notes()])
 
     def test_board_internal_line_trigger_failure_has_its_own_code(self):
         original = self.interop.acq_set_int
