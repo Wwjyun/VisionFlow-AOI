@@ -708,11 +708,23 @@ vs 原本 `[255,255,20,20]`）。因此「標籤編號順序」對 202 的最終
 ### 已確認決策（2026-09-17 使用者同意規劃建議）
 
 - [x] **Sapera 綁定方式採 `pythonnet`**：載入 `DALSA.SaperaLT.SapClassBasic.dll`，類別與參數名稱和 C# 參考逐行對照，移植風險最低；ctypes 呼叫 Sapera C API 只在 spike 證明 pythonnet 不可行時才改用。
-- [ ] 【實物】**pythonnet spike**（目前 `env` 未安裝，需在裝有 Sapera 的相機機台執行）：x64 與 .NET Framework runtime 載入、`SapAcquisition`／`SapAcqDevice`／`SapBuffer`／`SapAcqToBuf` 建立與釋放、`EndOfFrame` callback 從非 UI thread 進入 Python、`SapBuffer` 直接複製成 numpy（不經 `Bitmap`）、PyInstaller 打包可行性；結果記錄於本節後才開始正式移植。
+- [ ] 【實物】**pythonnet spike**（2026-09-18 依下方「離線相機機台」條件改寫）：相機機台沒有 Python 環境與 IDE，不在現場跑獨立 spike，也不等 spike 結果才開始移植。本機先完成 pythonnet 以 .NET Framework runtime 載入與 PyInstaller 打包；需要真實 Sapera 的檢查（x64 載入、`SapAcquisition`／`SapAcqDevice`／`SapBuffer`／`SapAcqToBuf` 建立與釋放、`EndOfFrame` callback 從非 UI thread 進入 Python、`SapBuffer` 直接複製成 numpy 而不經 `Bitmap`）併入打包 EXE 的 `--sapera-diagnose` 步驟，於相機機台執行通過後勾選。
 - [x] **設定歸屬分兩層，取代 `settings.ini`**：機台層（server／resource index、CCF 路徑、AcqDevice 位置、米輪 card ID、倍頻、反向、CMP Out Width、CMP0–7）存機台設定檔，不進 Recipe；產品層（Exposure、Gain、Length、Internal Line Rate、Trigger Mode、自動存圖）放 Recipe 選用 `camera` 區段，參與 dirty tracking 與 `RecipeManager` 驗證，舊 Recipe 沒有 `camera` 區段時不得改動相機設定。另提供一次性從 `xx_ccd` `settings.ini` 匯入。
 - [x] **權限分級**：OP 看不到 CCD 頁（Monitor 只顯示唯讀相機／米輪連線與取像狀態）；工程模式可連線／斷線、預覽、停止、擷取、存圖、查看米輪讀值；管理模式才可改相機參數、Sapera 位置／CCF、Trigger、米輪與 CMP0–7、匯出診斷。新增控制項比照 Detector 參數 fail-closed，未分類一律只給管理模式。
 - [x] **存圖格式與 AOI 交接**：`xx_ccd` 因大型 BMP 在一般看圖軟體開啟慢而移除 BMP，但 VisionFlow 產線格式是 BMP，且 `BmpReader`／BMP file-order resident upload 是目前最快的讀圖路徑。因此第一階段 CCD→檢測的檔案交接使用 BMP；第二階段評估記憶體直接交接；PNG／TIF／TIF 不壓縮只作保存用途。
 - [x] **`TriggerMode.SingleFrame` 暫不移植**：C# enum 有，但 handoff 未描述行為也未實機確認；需要時再另列。
+
+### 離線相機機台的開發與現場測試方式（2026-09-18 使用者說明）
+
+現場條件：產線相機機台安裝 Sapera LT 8.60（CamExpert 8.60），不能聯網、沒有 AI 與 IDE；檔案只能帶進去、不能複製出來（包含 8.60 的 `DALSA.SaperaLT.SapClassBasic.dll`），也不能用手機拍螢幕或掃 QR code。`xx_ccd` 不會帶進產線，相機綁定必須完整位於 `devices/`。因此 Sapera 相機綁定在本機寫到近乎無誤，打包成 EXE 帶進相機機台測試；現場結果只能靠人工抄寫畫面上的短碼帶回，本機依短碼修正後重新打包再測。
+
+- [ ] **本機實作 Sapera 相機綁定**：新增 `devices/sapera_camera.py`（`SaperaLineScanCamera` 實作既有 `LineScanCamera` 介面），`devices/factory.py` 偵測到 Sapera LT 時改用它，未安裝、載入失敗或版本不符時維持「不可用」並顯示原因；GUI、監控與檢測只依賴介面，不需修改。只使用 Sapera 核心類別（`SapManager`、`SapLocation`、`SapAcquisition`、`SapAcqDevice`、`SapBuffer`、`SapAcqToBuf` 與通知事件參數），只移植下方「只移植已實機確認的寫入路徑」與 Trigger 規則，不移植 `SapClassGui`、`xx_ccd` 的探測寫法與額外診斷。
+- [ ] **以 8.60 為目標 API**：本機沒有 8.60 DLL，依 Sapera LT 8.60 User's Manual 與 .NET Basic Class／Basic Modules reference 核對每個用到的類別、方法、屬性、事件、enum 與參數常數，全部集中列在綁定模組的單一 API manifest，不在程式其他地方直接散用 Sapera 成員；如取得 8.65 等相近版本 SDK，可在本機以其 DLL metadata 先比對一輪（DLL 不提交）。
+- [ ] **執行期載入機台自己的 Sapera**：`SapClassBasic.dll` 一律從相機機台已安裝的 Sapera LT 載入（依 Sapera 安裝目錄，機台設定檔可覆寫路徑），不打包、不引用開發機版本，避免重演 `xx_ccd` 編譯時綁定 9.12 managed DLL、在 8.6 runtime 出現 `FileLoadException` 的問題。pythonnet 以 .NET Framework（netfx）runtime 載入並在 `requirements` 固定版本，打包進 EXE；相機機台需 .NET Framework 4.7.2 以上。
+- [ ] **fake Sapera 層自動測試**（本機、無硬體）：以可注入的假 .NET 物件驗證連線與參數寫入順序（line rate 在 `SapAcquisition.Create()` 前、Exposure 在 line rate 後）、四種觸發模式的參數組合、`Snap`／`Grab`／`Freeze`、擷取中 Stop 不呼叫 `Freeze()`、`EndOfFrame` 從非 UI thread 交接 frame、`SapBuffer` 複製成 `uint8` numpy、外部觸發事件、每個物件個別 guarded 清理與清理失敗不外傳、API manifest 缺成員時拒絕連線。
+- [ ] **現場 API 自檢**：載入 `SapClassBasic.dll` 後先以 .NET 反射逐一檢查 API manifest，全部存在才開始存取硬體；缺少時在畫面列出缺少的成員與簽名，並顯示 managed DLL 版本與 Sapera runtime 版本。
+- [ ] **現場診斷模式**：打包 EXE 提供 `--sapera-diagnose`，GUI 管理模式也可執行同一流程；依序執行 S1 找到 Sapera 安裝與版本、S2 載入 `SapClassBasic.dll`、S3 API 自檢、S4 列舉 server／resource 與 CCF、S5 建立並釋放各 Sapera 物件、S6 連線並寫入參數後讀回、S7 `Snap` 一張並檢查 frame 尺寸與灰階統計、S8 斷線與清理。每步在畫面上顯示一行短結果（例如 `S6 FAIL E-0602 Exposure 寫入失敗`），前一步失敗時後續步驟標示略過；短碼設計成可人工抄寫，錯誤碼表記錄在 repository 文件中，本機可依抄回的短碼判斷問題。完整報告與逐次 Sapera 呼叫 log 仍寫到機台 `outputs/logs/camera/`，供現場對照，不預期能帶出。
+- [ ] 【實物】**現場測試循環**：將打包 EXE 帶進相機機台，先跑 `--sapera-diagnose`，S1–S8 全部通過後才以 GUI 連線、預覽、取像與相機直連監控；抄回失敗短碼與畫面訊息，本機修正、補 fake 測試後重新打包再測，並把每輪結果記錄在完成紀錄。
 
 ### 架構與模組邊界
 
@@ -721,11 +733,11 @@ vs 原本 `[255,255,20,20]`）。因此「標籤編號順序」對 202 的最終
 - [x] LSI-8181 以 ctypes 包裝 `LSI8181_64.dll`（`devices/lsi8181.py`，2026-09-17）：23 個使用中的 export 與型別對照 `Native/Lsi8181Native.cs`（byte／ushort／short／int／uint 與指標輸出），不包裝 `LSI8181_CO_read`；非 0 回傳碼與 Windows 例外轉成含動作與狀態碼的 `Lsi8181Error`；呼叫前檢查 card／int32／int16／uint16 範圍；反向計數讀寫 CIO polarity，只切 A 相 bit 0；連線順序與 `Lsi8181MeterWheelService.Open` 相同，但任一步失敗會停止計數並關閉卡片（原 C# 會留在已初始化狀態）；所有 native 呼叫以鎖序列化。DLL 與驅動不提交；`devices/factory.py` 預設選用此綁定，DLL 載入失敗只讓米輪不可用。驗證：ctypes callback 假卡 16 項測試，並在本機以 MSVC 編出同名 stub DLL 經 `WinDLL` 實際載入確認 export、int32 極值、uint16 40000、極性位元與 CMP0–7 往返（stub 未提交）。**實際卡片驗證仍待相機機台。**
 - [ ] 【實物】Lifecycle 明確：`close()`／context manager；每個 Sapera 物件個別 guarded destroy／dispose 並記 log，清理失敗不得傳到 UI thread；關閉主程式一定斷線。不使用持有相機、影像或設定的 mutable module global。（GUI 層已完成：`CcdController.close()` 停止輪詢、預覽 thread 與存圖佇列並關閉 devices，存圖未完成時阻止關窗；Sapera 物件清理待綁定實作。）
 - [x] 相機與米輪 session 由 `MainWindow` composition root 擁有的 `CcdController` 管理，不由頁面擁有；切換頁面不斷線，只有斷線按鈕或關閉主程式才釋放。（2026-09-17）
-- [ ] 【實物】偵測 Sapera runtime 與 managed DLL 版本不符（開發機 9.12、現場 8.6 曾出現 `FileLoadException`），以繁中 inline notice 顯示「Sapera runtime 版本不符」與兩個版本號，不得當成「沒有擷取卡」。
+- [ ] 【實物】偵測 Sapera runtime 與 managed DLL 版本不符（`xx_ccd` 以開發機 9.12 編譯、在現場 8.6 曾出現 `FileLoadException`；現場確認為 Sapera LT 8.60），以繁中 inline notice 顯示「Sapera runtime 版本不符」與兩個版本號，不得當成「沒有擷取卡」。VisionFlow 從機台自己的 Sapera 載入 managed DLL，正常情況兩者一致；此檢查仍保留，用於機台 Sapera 安裝不完整或路徑被覆寫指向其他版本時。
 
 ### 相機連線與參數（Sapera）
 
-- [ ] 【實物】以 Qt 對話框取代 `AcqConfigDlg`：列舉 server／resource、選 CCF；只找到一個 AcqDevice 時自動選取並提示。
+- [ ] 【實物】以 Qt 對話框取代 `AcqConfigDlg`：列舉 server／resource、選 CCF；只找到一個 AcqDevice 時自動選取並提示。`xx_ccd` 沒有固定的 server／resource／CCF 值（`CameraSettings` 預設為空，由 `AcqConfigDlg` 在機台上選取並存在該機台），因此不需事先抄回，現場以此對話框選取後存入機台設定檔。
 - [x] 保留「離線修改 → 套用 → 重新連線才寫入硬體」流程（Sapera 建立 acquisition／buffer／transfer 後部分參數會鎖定）：設定只在 `connect()` 寫入；已連線時套用會顯示「待重新連線寫入」與提示文字。（2026-09-17）
 - [x] **產品層相機參數接 Recipe `camera` 區段**（2026-09-17）：Exposure／Gain／Length／Line Rate／觸發模式與選項／自動存圖保存在 Recipe 選用 `camera` 區段（`devices/ccd_recipe.py`），`RecipeManager` 嚴格驗證（必填、型別、範圍、未知欄位、觸發選項與模式衝突）；自動存圖旗標已從機台設定檔移出。Recipe 設計新增「相機 CCD」區塊參與 dirty tracking，僅管理模式可編輯，工程模式儲存原值保留，未修改的數值不因顯示精度被改寫；舊 Recipe 無此區段時不改動相機設定。CCD 控制按「套用相機設定」後同步為 Recipe 設計的未儲存變更，Recipe 設計仍是唯一寫入者；載入含此區段的 Recipe 會套用到相機 session，已連線時提示需重連。
 - [ ] 一次性從 `xx_ccd` `settings.ini` 匯入機台層與產品層設定（產品層匯入到 Recipe 設計成為未儲存變更）。
@@ -741,7 +753,7 @@ vs 原本 `[255,255,20,20]`）。因此「標籤編號順序」對 202 的最終
   - External Trigger One Frame：`EXT_FRAME_TRIGGER_ENABLE`，獨立於 Trigger Mode。
   - Software Trigger：`EXT_FRAME_TRIGGER_ENABLE=0`、`EXT_LINE_TRIGGER_ENABLE=1`，由程式呼叫 `Snap()` 開始一張，米輪脈衝逐線完成；One Frame 顯示但停用且強制取消，line integration 設定與 External Trigger 一致。
   - External Trigger arm 檢查同時看 EXT_LINE 與 EXT_FRAME。
-- [ ] 【實物】診斷：`last_requested_settings`／`last_apply_params`、Live Features、Acq Params 報告寫到 `outputs/logs/camera/`，GUI 提供管理模式「匯出診斷」。
+- [ ] 【實物】診斷：`last_requested_settings`／`last_apply_params`、Live Features、Acq Params 報告寫到 `outputs/logs/camera/`，GUI 提供管理模式「匯出診斷」。相機機台的檔案帶不出來，因此參數寫入失敗與讀回不符時，CCD 頁也要以可抄寫的短碼與實際讀回值直接顯示在畫面上，不只寫進報告檔。
 
 ### 取像、預覽與存圖
 
@@ -777,7 +789,7 @@ vs 原本 `[255,255,20,20]`）。因此「標籤編號順序」對 202 的最終
 ### 測試、打包與實機驗收
 
 - [ ] 自動測試（fake backend，無硬體）：設定 round trip 與預設值、載入不觸發寫入、Trigger 互斥矩陣、Software Trigger 狀態機、忙碌／Stop 語意、自動存圖不重複、`.tmp` 存檔、缺 Sapera／缺 DLL 時主程式可啟動且 CCD 頁顯示不可用、OP／工程／管理可見性、GUI offscreen smoke。（`tests/test_ccd_devices.py`、`tests/test_ccd_gui.py` 已涵蓋設定 round trip／損毀檔、載入不寫入、Trigger 16 種組合、忙碌／Stop、`.tmp` 與四格式無損、存圖佇列上限、米輪保存與寫入、不可用後端、權限可見性、鍵盤、監控來源與關窗；`tests/test_ccd_trigger_automation.py` 涵蓋 Software Trigger 狀態機、外部觸發規則矩陣、自動存圖不重複、監控前置條件與停止。）
-- [ ] 打包：Sapera runtime、`LSI8181_64.dll` 與驅動由現場安裝、不打包；若採 pythonnet 則打包其 runtime。packaged `--smoke-test` 增加「無相機環境 CPU 檢測正常、CCD 顯示不可用」；README 補 Sapera 版本對齊的部署說明。
+- [ ] 打包：Sapera runtime、`SapClassBasic.dll`、`LSI8181_64.dll` 與驅動由現場安裝、不打包；pythonnet 與其 runtime 打包進 EXE，相機機台不需安裝 Python、IDE 或連網即可執行。packaged `--smoke-test` 增加「無相機環境 CPU 檢測正常、CCD 顯示不可用」，並確認 `--sapera-diagnose` 在無 Sapera 的電腦上停在 S1 且顯示原因、不崩潰；README 補離線機台部署步驟（Sapera LT 8.60、.NET Framework 4.7.2 以上）與 `--sapera-diagnose` 錯誤碼對照。
 - [ ] 相機機台有 `LSI8181_64.dll` 時，建立預設 `MainWindow` 的 unit tests 可能在事件迴圈中觸發米輪自動連線並寫入已存設定；評估測試環境預設以 `VISIONFLOW_LSI8181_DLL` 指向不存在路徑隔離硬體。
 - [ ] 【實物】實機驗收（在相機機台執行，未實測不得勾選）：連線／斷線重複；Exposure、Gain、Length、Internal Line Rate 讀回與畫面效果；Continuous 沒有 Sapera 警告視窗；External Trigger 一個脈衝一條線、湊滿 Length 才顯示；One Frame；Software Trigger 監控與擷取中 Stop；米輪自動連線、重開後設定保留、Encoder 正反向計數與倍頻、Compare 自動遞增、錯誤卡片 ID 的狀態碼訊息、示波器確認 CMP_OUT 脈寬與 CMP0–7；16384×50000 各格式存圖時間；連續取像＋存圖＋檢測長時間穩定、記憶體平台與 GUI 回應。
 
@@ -929,6 +941,7 @@ vs 原本 `[255,255,20,20]`）。因此「標籤編號順序」對 202 的最終
 
 ## 完成紀錄
 
+- [x] 2026-09-18：依使用者說明產線相機機台條件（Sapera LT 8.60／CamExpert 8.60、不能聯網、沒有 AI 與 IDE、檔案只能帶進不能帶出、不能用手機拍照或掃碼、`xx_ccd` 不帶進產線），在 P11 新增「離線相機機台的開發與現場測試方式」：Sapera 綁定在本機實作於 `devices/sapera_camera.py` 並以 fake Sapera 層測試、以 8.60 為目標 API 並集中為單一 API manifest、執行期從機台自己的 Sapera 載入 `SapClassBasic.dll` 而不打包、現場先以 .NET 反射做 API 自檢，以及打包 EXE 的 `--sapera-diagnose` S1–S8 分步診斷與可人工抄寫的短碼。同步改寫 pythonnet spike（不在現場跑獨立 spike、改併入診斷模式，不再等 spike 結果才移植）、版本不符偵測、`AcqConfigDlg` 取代項目（`xx_ccd` 沒有固定的 server／resource／CCF 值，由現場選取）、診斷畫面顯示與打包部署項目。未改變任何既有 checkbox 狀態；僅文件變更。
 - [x] 2026-09-18：正式發布 VisionFlow AOI `v1.6.3` CUDA-enabled Windows x64（依使用者指定以 `gh release create`）；annotated tag 指向 `3022652` 且位於 `origin/main`，release 為 Latest、非 draft／prerelease。資產 `VisionFlow-AOI-v1.6.3-windows-x64.zip` 119,695,238 bytes、SHA-256 `aeb21e5508155f6b2652c561b44387385a316a40fc008417c27faca28093bd5a`（GitHub digest 相同），348 entries、7 個 bundled Recipes、1 個 `gpu/visionflow_cuda.dll`（SHA-256 `38433800568FAB7BBD8E7007A970ADE20B11B2960FEDD319829C78B8167B2345`，發行前於 RTX 3090 重跑 native smoke 與 validator 通過）。發行前 629 tests、compileall、CUDA preflight、GUI offscreen smoke、CLI smoke、`build_exe.ps1` 打包、dist 與獨立解壓後 `--smoke-test` 皆 exit 0；發布後以 `gh release download` 重新下載，大小、SHA-256、DLL 與 Recipe 數量一致。其他 GPU、無 GPU 電腦、相機機台與真實產線影像驗收仍待目標環境。
 - [x] 2026-09-18：**packaged `--smoke-test` 改用隔離的 GUI 設定。** v1.6.3 打包 smoke 在本機卡住：`run_packaged_smoke_test` 以預設 `QSettings("VisionFlow", "AOI")` 建立 `MainWindow`，還原了操作者上次開啟的 16384×13000 影像，背景預覽／自動預熱仍在執行時 `close()` 進入背景工作關窗保護，offscreen 下無法回應而一直等待；同時 smoke 也會把自身狀態寫回操作者設定。改為在暫存資料夾建立 INI `QSettings` 注入 `MainWindow`，不讀也不寫操作者設定；新增 `tests/test_gui_threading_packaging.py` 測試確認 smoke 使用隔離設定。本次也移除開發中 MainWindow 手動 smoke 寫入本機設定的 `paths/image`。
 - [x] 2026-09-18：準備 VisionFlow AOI v1.6.3 CUDA-enabled Windows x64 發行原始碼；GUI Pipeline 版本同步為 1.6.3，更新根目錄、`docs/README.md` 與 GPU README 並新增 `docs/release-notes/visionflow-aoi-v1.6.3.md`。範圍為 v1.6.2 之後的 CCD 控制與相機直連監控（含邊檢測邊存原圖）、session 重用 pinned host 緩衝與同檔解碼重用、GUI／批量／監控共用 GPU session 與自動預熱、CUDA context 逐類顯存統計、效能分析面板、CPU／GPU 對照、大圖 LOD 預覽、批量填表加速與 matrix CSV 缺陷類型。發行 DLL（SHA-256 `38433800568FAB7BBD8E7007A970ADE20B11B2960FEDD319829C78B8167B2345`）於最後一次 CUDA source 修改（`96ab85f`）後以 CUDA 13.3／`sm_86` 建置，之後未再修改 CUDA source/header；發行前在 RTX 3090（Driver 610.62）重跑 `test_cuda_api.exe` native smoke 與 `validate_cuda_dll.py --benchmark 5` 全部通過，並確認含最新 optional export `vf_context_memory_stats_v1`。Sapera LT 相機 binding 與相機機台實測仍未完成。
