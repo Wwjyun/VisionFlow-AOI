@@ -807,6 +807,66 @@ vs 原本 `[255,255,20,20]`）。因此「標籤編號順序」對 202 的最終
 - 滾動式拍照（2026-09-17 使用者決定不移植）：原功能把最近最多 100 張 frame 上下拼成一張長圖供回看與存圖，只是顯示／保存用途；VisionFlow 每張 frame 各自檢測，不需要。若日後產品長度超過單張 frame、缺陷可能跨 frame 邊界，應另列為檢測流程的 frame 拼接與跨邊界切圖需求，不以移植此顯示功能處理。原規格：張數上限 100、上到下／下到上方向、存圖前 snapshot 目前 frames。
 - 灰階波形（2026-09-17 使用者決定不移植）：原功能在影像上拖線畫灰階曲線，用於調光源均勻度、曝光飽和與對焦，不影響檢測結果，裝機調整可用 Sapera CamExpert。若工程人員需要在 VisionFlow 內調相機，建議改做簡化版：CCD 預覽顯示游標位置的原始灰階值，以及整張 frame 的飽和（255）像素比例。原規格：Shift 角度吸附、取全解析度 frame、依 tile 批次取樣、Y 軸 0–255、每 16 灰階輔助線、縮放／框選／重設。
 
+## P12：PLC 通訊（接收 PLC 命令與回送檢測結果）
+
+2026-09-18 使用者需求：VisionFlow 需要與產線 PLC 通訊，方向有二。**方向一（接收）**：PLC 發訊號過來，要求啟動監控模式中的相機串流。**方向二（發送）**：每張照片檢測完成後，把 matrix CSV 的內容送給 PLC。細節尚未確定。
+
+**原「逐排（橫排）EIP 訊號」方案已由使用者於 2026-09-18 駁回**，因此 `docs/reports/Phase2_改動一_PLC逐排訊號評估.md`、`docs/reports/Phase2_簡報逐頁講解與問答準備.md` 與 `簡報/phase2/Phase2_改動一_PLC逐排訊號.pptx` 中關於 PLC 的規劃與 24–41 週工期**均已失效**，不得再作為依據。本節描述的是取代它的方案；因為兩個方向都是「整張圖做完才動作」，逐排方案最大的代價（整圖產物原子性被破壞、逐排事件的不可逆風險、部分完成結果的追溯）都不存在。
+
+**工作草案**：`docs/reports/PLC通訊_收發規格候選.md`（未追蹤草稿），內含 payload 三種候選與 word 佈局、讀取一致性規則、命令握手設計與待確認清單。
+
+**本節目前只規劃，尚未實作任何程式；所有實作項目均未勾選。**
+
+### 已確認決策（2026-09-18；僅決策，尚未實作）
+
+- [x] **設定歸屬採機台層**：PLC 的 IP／port／協定／timeout／register map／命令與結果的 word 位址存機台設定檔（`config/plc_machine.json`，schema `visionflow-plc-machine/v1`），**不進 Recipe**。理由比照相機：IP 是機器接線而非產品屬性，Recipe 必須能跨機台使用。
+- [x] **連線模式採按需**：使用者進入 PLC 頁才建立連線，不在啟動時常駐連線。
+- [x] **OP 完全看不到 PLC 頁**：比照 CCD 控制。工程模式可連線、測試與檢視；管理模式才能改參數。新增控制項比照 Detector 參數 fail-closed，未分類一律只給管理模式。
+- [x] **診斷連線與生產連線分離**：PLC 頁擁有的是按需的診斷 session；方向一與方向二的生產收發必須由檢測生命週期擁有。兩者失敗語意相反——診斷連不上只報錯，生產連不上**必須繼續檢測**。
+- [x] **PLC 斷線狀態必須顯示在 OP 看得到的地方**：PLC 頁對 OP 不可見，因此連線狀態與「結果未送出」要以 inline notice 與狀態列事件呈現，不能只藏在 PLC 頁（狀態不得只靠顏色）。
+- [x] **PLC 是選配能力，比照 CUDA DLL 與相機**：沒有 PLC 時 GUI、CLI、batch、monitor 照常啟動，PLC 頁顯示不可用原因；方向一與方向二在未連線時為 no-op。
+
+### 待產線／PLC 端確認（未確認前不決定實作細節）
+
+- [ ] PLC 廠牌與型號？是否為 Keyence KV-8000＋KV-XLE02（`eiptest/` 參考實作實測的機型）？決定傳輸實作與 register map。
+- [ ] 方向二採用哪一種 payload？（極簡 3 words／彙總／逐格 bitmap）
+- [ ] PLC 收到結果後**觸發什麼實體動作**？決定風險等級（是否不可逆）。
+- [ ] 列編號方向：PLC 端預期第 1 列對應影像的哪一側？（matrix CSV 的 `id` 為 `max_row - row + 1`，第一列帶最大編號，須明確對齊，否則整份上下顛倒）
+- [ ] 是否需要缺陷類型對照表（type → code）？由誰維護？可接受的類型數上限？
+- [ ] 方向二可提供幾個連續 word？（逐格 bitmap 在 16384×13000、tile 512／overlap 64 下需 73 words，**已超過 `eiptest/` 展示配置的 64-word 寫入區**）
+- [ ] 方向一用哪個 word 的哪個 bit 下命令？**誰負責清 bit**（我方回寫 ack 或 PLC 自行清除）？
+- [ ] 輪詢週期 50–200 ms 是否可接受？（上位鏈結為 request/response，PLC 無法主動 push，命令只能以輪詢實現）
+- [ ] 可否提供一個**控制區以外的安全測試位址**供寫入回讀診斷使用？
+- [ ] PLC 掃描週期？（用於驗證多 word 讀取一致性規則）
+- [ ] 產線停機窗口。
+
+### 實作項目（規劃，尚未開工）
+
+- [ ] **傳輸層 `devices/plc/`**：KV 上位鏈結 request/response（`?K` 型號查詢、`RDS`／`WRS` 批次讀寫）、連線生命週期、讀寫耗時統計；CIP 路徑要嘛實作要嘛移除，不得留下選了卻沒作用的協定選項（`eiptest/electron/plc_service.js` 目前存了 `protocol` 卻一律送 ASCII 指令）。無 Qt import，比照 `devices/` 契約。
+- [ ] **機台層設定 store `devices/plc_settings_store.py`**：`config/plc_machine.json`、schema `visionflow-plc-machine/v1`、`.tmp` 原子寫入、損毀或型別錯誤回預設並保留原檔與提示，比照 `devices/ccd_settings_store.py`。
+- [ ] **模擬器與注入**：`VISIONFLOW_PLC_SIMULATOR=1` 提供假 PLC（比照 `devices/factory.py` 的 `VISIONFLOW_CCD_SIMULATOR`），`MainWindow` 可注入 client 與設定 store，無硬體與 CI 可測。
+- [ ] **register map 必須是設定值，不得寫死**：不沿用 `eiptest/` 的 `W000~W03F` 讀／`W040~W07F` 寫；所有位址相對於機台層設定的 base address，並在頁面上可讀回。
+- [ ] **診斷 `devices/plc_diagnose.py` 與 `main.py --plc-diagnose`**：分步（設定有效性 → TCP 可達 → `?K` 型號 → 讀取測試 → 寫入回讀 → 延遲基準），永不拋出、前一步失敗後續 SKIP、UTF-8 txt＋JSON 寫到 `outputs/logs/`，比照 `devices/sapera_diagnose.py` 的短碼與錯誤碼表做法。**打包 EXE 是視窗版、沒有主控台**，因此必須同時提供 GUI 入口與 CLI 參數。
+- [ ] **診斷的寫入測試不得指向控制區**：`eiptest/` 會把測試樣式寫進 `W040~W07F`（GUI 批次寫入更會寫滿整個控制區），此行為**不得移植為預設**；改為讀機台層設定的安全測試位址，未設定就 SKIP。
+- [ ] **GUI：`gui/screens/plc_screen.py` 與 `gui/plc_controller.py`**，controller 由 `MainWindow` 擁有；內容含設定、型號、連線狀態、register map 與診斷面板。另需四處既有檔案註冊：`gui/widgets/rail.py` 的 `NAV_ITEMS`、`gui/widgets/topbar.py` 的標題對照表、`gui/main_window.py` 的 `SCREEN_INDEX`／`stack.addWidget` 順序／`_visible_screens_for_mode()`／`_apply_mode_permissions()`。（`NAV_ITEMS` 顯示順序與 `SCREEN_INDEX` 堆疊順序是兩份不同順序，不可假設一致。）
+- [ ] **方向二：結果回送**。payload 依待確認項目定案；**不得依賴 matrix CSV 檔案**（`save_matrix_csv` 是可關的輸出開關，且寫檔是額外 I/O），直接由記憶體中的 `result["tiles"]` 以 `MatrixCsvExporter.ng_cell_text` 的同一套邏輯計算。`status` 需含第三態 ERROR（pipeline 有 tile error），否則 PLC 會把「未跑完」誤判為 PASS。
+- [ ] **方向二：多 word 讀取一致性**：寫入順序為先寫資料、**最後才寫序號 `seq`**，PLC 以 `seq` 變更判斷新資料，避免讀到更新到一半的混合狀態。
+- [ ] **方向二：送出時機與模式**：確認涵蓋單張、相機直連監控、資料夾監控與批量；批量預設關閉（1000 張會寫 PLC 1000 次，且批量屬離線作業）。送出失敗不阻擋檢測、不重送過期結果，並累計失敗次數與最後錯誤原因。
+- [ ] **方向一：命令接收**：輪詢約定的命令 word ＋**上升緣偵測**（持續為 1 不重複啟動）＋握手回寫（`stream_active`／`command_rejected`／心跳）。**不得因 PLC 要求而繞過既存前置條件**（相機未連線、非觸發模式連線、`CcdController.camera_monitor_blocker()`、OP 模式限制）：無法執行時回報拒絕原因，且該原因要顯示在 OP 看得到的地方。
+- [ ] **自動測試（無硬體）**：以假 PLC／模擬器覆蓋連線與斷線、批次讀寫、payload 編碼與 word 佈局、`seq` 一致性、上升緣只觸發一次、拒絕語意、PLC 不可達時檢測仍完成且結果不誤報、設定檔損毀回預設、OP 模式不可見。
+- [ ] 【實物】實機驗收（需 PLC 在場，未實測不得勾選）：型號查詢、讀寫延遲、payload 來回正確（含列方向與類型對照表）、PLC 斷線與恢復、命令啟動相機串流、連續生產下的穩定性。
+
+### 風險與注意事項
+
+- **不可逆風險取決於 PLC 收到後做什麼**（放行／剔除／停線皆不可逆）。在產線端回答「觸發什麼實體動作」之前，不得把方向二接到會造成物理動作的 register；可先只寫入 PLC 的顯示／記錄區。
+- **傳輸層的物理限制**：KV 上位鏈結無法主動 push，方向一必然帶有輪詢延遲；若產線要求更即時，才評估 EtherNet/IP Implicit I/O，但 `eiptest/` 未驗證過該路徑，且它是另一套程式模型。
+- **`eiptest/` 的角色**：它是 Keyence PLC 通訊的參考實作（另一個 repository 的複本，未追蹤，見 `ARTIFACTS.md`）。可移植 `RDS`／`WRS` 批次語意、`?K` 型號查詢、讀寫耗時統計、診斷套件結構與 Value Inspector 的呈現概念；**不移植** Electron 介面（本專案是 PySide6）、寫死的 64-word 對照表、把測試樣式寫入控制區、`src/plc/cip_client.py` 以 `& 0x3F` 遮罩位址的寫法。產線 PLC 若與 `eiptest/` 實測的機型不同，其 Assembly 240/241 對照表不可照抄。
+
+### 暫不納入
+
+- 逐排（橫排）訊號與 `RowEventSink` 架構（2026-09-18 使用者駁回）。
+- 缺陷類型對照表的維護工具（等確認需要後另列）。
+
 ## RTX 3090 編譯與實機驗收
 
 ### 環境與編譯
@@ -948,6 +1008,7 @@ vs 原本 `[255,255,20,20]`）。因此「標籤編號順序」對 202 的最終
 
 ## 完成紀錄
 
+- [x] 2026-09-18：**在 `Todo.md` 建立 P12「PLC 通訊」規劃（僅規劃，未實作程式）。** 使用者確認原「逐排（橫排）EIP 訊號」方案已駁回，改為兩個方向：方向一（接收）PLC 要求啟動監控模式中的相機串流；方向二（發送）每張影像檢測完成後把 matrix CSV 的內容送給 PLC。新增 P12 節，含六項已確認決策（機台層 JSON 設定不進 Recipe、按需連線、OP 完全不可見、診斷與生產連線分離且失敗語意相反、斷線狀態須顯示在 OP 看得到的地方、比照 CUDA／相機的選配能力 fail-closed）、11 項待產線／PLC 端確認、13 項實作規劃（傳輸層、機台層設定 store、模擬器與注入、register map 不得寫死、診斷與 `--plc-diagnose`、診斷寫入不得指向控制區、GUI 頁與四處既有檔案註冊、結果回送不依賴 CSV 檔且 `status` 需含 ERROR 第三態、`seq` 讀取一致性、送出時機與模式、命令輪詢與上升緣握手、無硬體自動測試、【實物】實機驗收）、風險與注意事項、以及暫不納入項目；並明確標示 `docs/reports/Phase2_改動一_PLC逐排訊號評估.md`、`Phase2_簡報逐頁講解與問答準備.md` 與對應 pptx 的 PLC 規劃及 24–41 週工期均已失效。同步新增未追蹤工作草案 `docs/reports/PLC通訊_收發規格候選.md`（payload 三種候選與 word 佈局、實際 word 數推算、讀取一致性規則、命令握手設計、待確認清單）。未修改任何程式，所有實作項目維持未勾選。驗證：完整 817 tests OK、compileall exit 0、CUDA preflight exit 0、`git diff --check` 通過。
 - [x] 2026-09-18：正式發布 VisionFlow AOI `v1.7.0` CUDA-enabled Windows x64（依使用者指定以 `gh release create`）；annotated tag `v1.7.0` 指向 `57e3869`（`Prepare VisionFlow AOI v1.7.0 release`）且該 commit 位於 `origin/main`，release 為 Latest、非 draft／prerelease，target `main`，網址 <https://github.com/wjcudalearning/VisionFlow/releases/tag/v1.7.0>。資產 `VisionFlow-AOI-v1.7.0-windows-x64.zip`：120,338,794 bytes、SHA-256 `053525AE4032A8261498506862F66B990EF3CF59EA63266718512E3EDCB37940`（GitHub asset digest 相同），460 entries／387 files、7 個 bundled Recipes、1 個 `gpu/visionflow_cuda.dll`（SHA-256 `38433800568FAB7BBD8E7007A970ADE20B11B2960FEDD319829C78B8167B2345`）、1 個 `VisionFlow AOI.exe`。發布後以 `gh release download` 重新下載，位元組數、SHA-256、entry 數、Recipe 數與 DLL 數全部一致。發行內容為 P11 Sapera LT 相機綁定（`devices/sapera_api.py`＋`devices/sapera_camera.py`，pythonnet 載入機台自己的 `SapClassBasic.dll`、API manifest 反射自檢、只移植已實機確認的寫入路徑與觸發規則）、`--sapera-diagnose` S1–S8 現場診斷與 `docs/sapera-diagnose.md` 錯誤碼表、CCD 頁 Sapera 診斷面板與位置對話框、`xx_ccd` `settings.ini` 匯入解析、測試環境硬體隔離；版本字串同步為 1.7.0（GUI Pipeline 版本、README 最新發行版、`docs/README.md`、`gpu/README.md`）並新增 `docs/release-notes/visionflow-aoi-v1.7.0.md`。發行前驗證：817 tests OK、compileall exit 0、CUDA preflight exit 0、`git diff --check` 通過、CLI 合成圖 smoke PASS、GUI offscreen smoke OK；`build_exe.ps1` 建置成功且 dist 內 `build_provenance.json` 為 `commit=57e3869`、`dirty=false`，`dist` 與**獨立解壓 ZIP 後**的 `--smoke-test` 皆 exit 0（含無相機環境 CCD 不可用、`--sapera-diagnose` 停 S1 並寫出報告、凍結版 pythonnet／netfx 載入）。**CUDA DLL 未重新編譯**：自 v1.6.3 建置點 `96ab85f` 之後 `gpu/` 只有 README 變更，沿用同一個已於 RTX 3090 驗證的二進位，GPU 行為、ABI v1 與 optional exports 與 v1.6.3 相同。與 v1.6.3 ZIP 的檔案差異已逐項核對：新增 99 個 `pythonnet/runtime` .NET 組件、`clr_loader` 的兩個 `ClrLoader.dll`、`_cffi_backend`／`_elementtree`（`clr_loader` 的 cffi 後端）與 1 個 setuptools 資料檔；減少的是 `libcrypto-3-x64.dll`／`libssl-3-x64.dll` 這組**不屬於本機 Python 安裝**的重複 OpenSSL 建置（v1.6.3 遺留），本版仍含實際連結的 `libcrypto-3.dll`／`libssl-3.dll`，且 packaged smoke 的模型 checksum 路徑（`hashlib`→OpenSSL）通過。ZIP 以逐 entry 方式建立（PowerShell 5.1 `Compress-Archive` 會寫入反斜線，前版為正斜線＋單一根目錄），entry 名稱與 v1.6.3 一致為 `VisionFlow AOI/...` 正斜線。其他 GPU／無 GPU 電腦、相機機台與真實產線影像驗收仍待目標環境。
 
 - [x] 2026-09-18：**把 `eiptest/` 登錄進 `ARTIFACTS.md`，避免巢狀 repository 被誤 commit。** `eiptest/` 是 Keyence PLC 通訊工具（KV-8000／KV-XLE02）的另一個 repository 複本，自帶 `.git`（remote `keyence-plc-hud`），在母 repo 只顯示成一行 `?? eiptest/`，而未追蹤產物地圖先前沒有它，一旦用 `git add -A` 就會被收成 gitlink。`ARTIFACTS.md` 新增 `eiptest/` 目錄條目（標明 remote、內含 `src/`／`electron/`／`frontend/` 與 `env/`、`node_modules/` 本機依賴，用途為 PLC 通訊層與逐排訊號的參考實作，對應 `docs/reports/Phase2_改動一_PLC逐排訊號評估.md`），並新增不變規則 7：`xx_ccd/` 與 `eiptest/` 同為巢狀 repository，一律不可 stage，只能明列檔案路徑，且其內部未提交變更須進該目錄自行 `git status` 才看得到。驗證：完整 817 tests OK、compileall exit 0、CUDA preflight exit 0、`git diff --check` 通過。僅文件變更，未修改任何程式，未動 PLC 功能實作。
