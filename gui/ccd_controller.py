@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 import datetime
+import os
 import threading
 import time
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from pathlib import Path
 
@@ -36,6 +37,14 @@ from devices.ccd_models import (
 from devices.ccd_settings_store import CcdMachineSettingsStore
 from devices.factory import CcdDevices
 from devices.frame_writer import SaveQueueStats, SnapshotSaveQueue, write_frame_atomic
+from devices.sapera_api import (
+    DEFAULT_CCF_SUBDIR,
+    DEFAULT_SAPERA_DIR,
+    SAPERADIR_ENV,
+    SaperaError,
+    SaperaVersions,
+    translate_exception,
+)
 from devices.trigger_automation import (
     SOFTWARE_TRIGGER_POLL_SEC,
     AutoSaveRequests,
@@ -44,10 +53,65 @@ from devices.trigger_automation import (
     external_trigger_actions,
     software_frame_requests_auto_save,
 )
+from gui.sapera_diagnostics import (
+    SaperaDiagnoseWorker,
+    SaperaDiagnosticsReport,
+    apply_note_lines,
+    write_diagnostics_report,
+)
+from gui.sapera_location_dialog import SaperaLocationCatalog
+from gui.workflow_controllers import SaperaDiagnoseWorkflowController
 
 PREVIEW_MAX_DIMENSION = 2048
 METER_WHEEL_POLL_MS = 200
 DEFAULT_SNAPSHOT_DIR = Path("outputs") / "ccd_snapshots"
+# S7 waits at most 5 s for a frame, so 15 s covers a full run from a run-to-completion join.
+DIAGNOSE_SHUTDOWN_TIMEOUT_MS = 15_000
+
+
+@dataclass(frozen=True)
+class CcdSaperaVersionsView:
+    """What `getattr(camera, "runtime", None)` reports; empty for the simulator and the placeholder."""
+
+    managed_version: str = ""
+    native_version: str = ""
+    summary: str = ""
+    mismatch: bool = False
+    assembly_path: str = ""
+    available: bool = True
+    missing_api_members: tuple[str, ...] = ()
+    reason: str = ""
+
+    @property
+    def known(self) -> bool:
+        """True only when a real version was read; `summary()` alone is not evidence."""
+
+        return bool(self.managed_version or self.native_version or self.assembly_path)
+
+
+def _sapera_ccf_dir(assembly_path: str, environ: Mapping[str, str] | None = None) -> Path | None:
+    """`<Sapera>\\CamFiles\\User`, found without importing the diagnose runner.
+
+    The offline property is that only the runner's folder matters: this stays best-effort and may
+    legitimately return ``None`` (the dialog then just offers the browse button).
+    """
+
+    env = os.environ if environ is None else environ
+    roots = [str(env.get(SAPERADIR_ENV) or ""), DEFAULT_SAPERA_DIR]
+    if assembly_path:
+        # …\Components\NET\Bin\SapClassBasic.dll → the install root is a few levels up.
+        roots.append(str(Path(assembly_path).parents[3]) if len(Path(assembly_path).parents) > 3 else "")
+    for root in roots:
+        if not root:
+            continue
+        try:
+            candidate = Path(root).joinpath(*DEFAULT_CCF_SUBDIR)
+            if candidate.is_dir():
+                return candidate
+        except OSError:  # pragma: no cover - defensive
+            continue
+    return None
+
 
 
 def preview_qimage(frame: np.ndarray, max_dimension: int = PREVIEW_MAX_DIMENSION) -> QImage:
@@ -137,6 +201,12 @@ class CcdController(QObject, LogMixin):
     preview_image_ready = Signal(QImage, int, int)
     save_stats_changed = Signal(object)
     software_trigger_monitor_changed = Signal(bool)
+    sapera_versions_changed = Signal(object)
+    #: True while a diagnose run is in flight. Emitted when the controller's own running flag
+    #: changes, so the screen's disable/enable state never depends on signal delivery order.
+    sapera_diagnose_running_changed = Signal(bool)
+    diagnose_finished = Signal(bool)
+    diagnose_report_ready = Signal(object)
     status_message = Signal(str)
     notice = Signal(str, str)
     _frame_arrived = Signal()
@@ -146,6 +216,13 @@ class CcdController(QObject, LogMixin):
     _auto_save_rejected = Signal()
 
     software_trigger_poll_sec = SOFTWARE_TRIGGER_POLL_SEC
+    #: Bound to the controller so tests can replace how the location dialog probes the machine.
+    sapera_location_prober = None
+    #: `outputs/logs/camera` by default; injectable so tests never write into the repository.
+    diagnostics_log_dir: str | Path | None = None
+    #: S1-S8 runner; injectable so the GUI test never touches Sapera. Defaults to the fixed
+    #: `devices.sapera_diagnose.run_sapera_diagnose` interface.
+    diagnose_runner: Callable | None = None
 
     def __init__(self, devices: CcdDevices, store: CcdMachineSettingsStore, parent=None):
         super().__init__(parent)
@@ -166,6 +243,14 @@ class CcdController(QObject, LogMixin):
         self._inspection_queue: CameraFrameQueue | None = None
         self._inspection_saves_raw = True
         self._inspection_sequence = 0
+        # One diagnose run at a time; the workflow controller owns the QThread lifetime.
+        self._diagnose_controller = SaperaDiagnoseWorkflowController(self)
+        self._diagnose_lock = threading.Lock()
+        self._diagnose_running = False
+        self._diagnose_worker: SaperaDiagnoseWorker | None = None
+        self._last_diagnose_report = None
+        self._version_notice_shown = False
+        self._clock = datetime.datetime.now
 
         self._converter = PreviewFrameConverter(self.preview_image_ready.emit)
         self._save_queue = self._create_save_queue()
@@ -215,6 +300,9 @@ class CcdController(QObject, LogMixin):
         screen.reverse_direction_changed.connect(self.set_reverse_direction)
         screen.cmp_out_width_requested.connect(self.set_cmp_out_width)
         screen.extension_channels_applied.connect(self.apply_extension_channels)
+        screen.sapera_location_requested.connect(self.request_sapera_location)
+        screen.sapera_diagnose_requested.connect(self.start_camera_diagnose)
+        screen.sapera_diagnostics_export_requested.connect(self.export_camera_diagnostics)
 
         self.camera_status_changed.connect(screen.set_camera_status)
         self.camera_settings_changed.connect(screen.set_camera_settings)
@@ -223,6 +311,9 @@ class CcdController(QObject, LogMixin):
         self.meter_wheel_changed.connect(screen.set_meter_wheel_snapshot)
         self.meter_wheel_settings_changed.connect(screen.set_meter_wheel_settings)
         self.software_trigger_monitor_changed.connect(screen.set_software_trigger_monitor_running)
+        self.sapera_versions_changed.connect(screen.set_sapera_versions)
+        self.sapera_diagnose_running_changed.connect(screen.set_sapera_diagnose_running)
+        self.diagnose_report_ready.connect(screen.set_sapera_diagnose_report)
 
         screen.set_availability(self.devices.camera.availability(), self.devices.meter_wheel.availability())
         screen.set_camera_settings(self.camera_settings_view())
@@ -230,6 +321,7 @@ class CcdController(QObject, LogMixin):
         screen.set_camera_status(self.camera_status())
         screen.set_meter_wheel_snapshot(self._last_meter_snapshot)
         screen.set_save_stats(self._save_queue.stats())
+        self._publish_sapera_versions()
 
     def availability(self) -> tuple[DeviceAvailability, DeviceAvailability]:
         return self.devices.camera.availability(), self.devices.meter_wheel.availability()
@@ -688,6 +780,312 @@ class CcdController(QObject, LogMixin):
             self.meter_wheel_changed.emit(snapshot)
 
     # ------------------------------------------------------------------
+    # Sapera runtime information, location dialog, diagnosis (Todo P11)
+    # ------------------------------------------------------------------
+    def sapera_versions_view(self) -> CcdSaperaVersionsView:
+        """Read Sapera information through `getattr(camera, "runtime", None)`.
+
+        The `LineScanCamera` interface stays backend-neutral: the simulator and the unavailable
+        placeholder simply have no `runtime` attribute, so they report an empty view and behave
+        exactly as before. Nothing here adds a Sapera-only method to `devices/interfaces.py`.
+        """
+
+        camera = self.devices.camera
+        availability = camera.availability()
+        runtime = getattr(camera, "runtime", None)
+        versions = getattr(runtime, "versions", None) or SaperaVersions()
+        missing: tuple[str, ...] = ()
+        check_api = getattr(runtime, "check_api", None)
+        if callable(check_api):
+            try:
+                missing = tuple(str(member) for member in check_api())
+            except Exception:  # noqa: BLE001 - reflection failures belong to the availability reason
+                missing = ()
+        return CcdSaperaVersionsView(
+            managed_version=versions.assembly_file_version or versions.assembly_version,
+            native_version=versions.native_file_version,
+            summary=versions.summary(),
+            mismatch=bool(versions.mismatch),
+            assembly_path=versions.assembly_path,
+            available=bool(availability.available),
+            missing_api_members=missing,
+            reason=availability.reason,
+        )
+
+    def _publish_sapera_versions(self) -> CcdSaperaVersionsView:
+        view = self.sapera_versions_view()
+        self.sapera_versions_changed.emit(view)
+        self._notice_version_mismatch_once(view)
+        return view
+
+    def refresh_sapera_versions(self) -> CcdSaperaVersionsView:
+        """Re-read the (cached) Sapera versions and republish them to the CCD screen.
+
+        Used on every camera status refresh; the mismatch notice stays one-per-session.
+        """
+
+        return self._publish_sapera_versions()
+
+    def _notice_version_mismatch_once(self, view: CcdSaperaVersionsView) -> None:
+        """One Traditional-Chinese notice per session; a mismatch is never "沒有擷取卡"."""
+
+        if self._version_notice_shown or not view.mismatch:
+            return
+        self._version_notice_shown = True
+        self.notice.emit(
+            f"Sapera runtime 版本不符：{view.summary}。相機仍可使用；"
+            "請在相機機台改用同一版本的 Sapera LT 安裝。",
+            "warning",
+        )
+
+    def _default_sapera_location_prober(self):
+        """The production prober: the machine's own Sapera through the camera's `SaperaRuntime`."""
+
+        try:
+            from devices.sapera_camera import SaperaLineScanCamera  # noqa: PLC0415 - optional backend
+        except ImportError:  # pragma: no cover - pythonnet is optional
+            SaperaLineScanCamera = None  # type: ignore[assignment]
+        camera = self.devices.camera
+        if SaperaLineScanCamera is None or not isinstance(camera, SaperaLineScanCamera):
+            reason = camera.availability().reason or "沒有 Sapera runtime"
+            return lambda: SaperaLocationCatalog(unavailable_reason=f"E-0101 相機後端不是 Sapera：{reason}")
+        return lambda: self.probe_sapera_locations(camera)
+
+    def sapera_location_catalog(self) -> SaperaLocationCatalog:
+        """Enumerate through the injected prober when one is set, otherwise through the backend."""
+
+        prober = self.sapera_location_prober
+        if prober is None:
+            prober = self._default_sapera_location_prober()
+        try:
+            return prober()
+        except SaperaError as exc:
+            return SaperaLocationCatalog(unavailable_reason=str(exc))
+        except Exception as exc:  # noqa: BLE001 - a probe failure must never reach the GUI thread
+            return SaperaLocationCatalog(
+                unavailable_reason=str(translate_exception(exc, "E-0401"))
+            )
+
+    def probe_sapera_locations(self, camera) -> SaperaLocationCatalog:
+        """Server／resource／CCF enumeration through `SaperaRuntime.interop()`.
+
+        Everything goes through the machine's own Sapera. When the runtime, the managed DLL or the
+        API manifest is missing the catalog carries the reason (with its short code) instead of
+        raising, so the dialog can stay open and Cancel still works.
+        """
+
+        availability = camera.availability()
+        runtime = getattr(camera, "runtime", None)
+        if runtime is None:
+            return SaperaLocationCatalog(
+                unavailable_reason=f"相機後端沒有 Sapera runtime：{availability.reason}"
+            )
+        try:
+            missing = tuple(str(member) for member in runtime.check_api())
+        except Exception as exc:  # noqa: BLE001 - reflection failure is still an API failure
+            return SaperaLocationCatalog(unavailable_reason=str(translate_exception(exc, "E-0301")))
+        if missing:
+            return SaperaLocationCatalog(
+                unavailable_reason=f"E-0301 Sapera API 缺少必要成員：{'、'.join(missing)}"
+            )
+        try:
+            interop = runtime.interop()
+            server_count = int(interop.server_count())
+            servers = tuple(str(interop.server_name(index)) for index in range(server_count))
+            acq_resources: dict[str, tuple[str, ...]] = {}
+            acq_devices: dict[str, tuple[str, ...]] = {}
+            for server in servers:
+                acq_resources[server] = self._resource_names(interop, server, "Acq")
+                acq_devices[server] = self._resource_names(interop, server, "AcqDevice")
+        except SaperaError as exc:
+            return SaperaLocationCatalog(unavailable_reason=str(exc))
+        except Exception as exc:  # noqa: BLE001
+            return SaperaLocationCatalog(
+                unavailable_reason=str(translate_exception(exc, "E-0401"))
+            )
+
+        ccf_dir = _sapera_ccf_dir(getattr(runtime.versions, "assembly_path", ""))
+        ccf_files: tuple[str, ...] = ()
+        ccf_problem = ""
+        if ccf_dir is None:
+            ccf_problem = "找不到 Sapera CamFiles\\User 目錄，請以「瀏覽」指定 CCF 檔。"
+        else:
+            try:
+                ccf_files = tuple(str(path) for path in sorted(ccf_dir.glob("*.ccf")) if path.is_file())
+            except OSError as exc:  # pragma: no cover - defensive
+                ccf_problem = f"無法讀取 CCF 目錄 {ccf_dir}：{exc}"
+            if not ccf_files:
+                ccf_problem = f"{ccf_dir} 下找不到 CCF 檔，請以「瀏覽」指定。"
+        return SaperaLocationCatalog(
+            servers=servers,
+            acq_resources=acq_resources,
+            acq_devices=acq_devices,
+            ccf_files=ccf_files,
+            ccf_dir=str(ccf_dir or ""),
+            ccf_problem=ccf_problem,
+        )
+
+    @staticmethod
+    def _resource_names(interop, server: str, kind: str) -> tuple[str, ...]:
+        """One server's resource names; a server that cannot be read keeps its slot but is empty."""
+
+        try:
+            count = int(interop.resource_count(server, kind))
+        except Exception:  # noqa: BLE001 - one unreadable server must not hide the others
+            return ()
+        names: list[str] = []
+        for index in range(count):
+            try:
+                names.append(str(interop.resource_name(server, kind, index)))
+            except Exception:  # noqa: BLE001
+                names.append("")
+        return tuple(names)
+
+    def request_sapera_location(self, current: CameraConnectionSettings | None = None) -> None:
+        """Open the admin-only Sapera location dialog; nothing is saved until it is accepted."""
+
+        from gui.sapera_location_dialog import SaperaLocationDialog  # noqa: PLC0415 - avoids a cycle
+
+        connection = (current or self._machine.connection).normalized()
+        dialog = SaperaLocationDialog(self.sapera_location_catalog, current=connection, parent=self.parent())
+        if dialog.exec() != SaperaLocationDialog.DialogCode.Accepted:
+            self.status_message.emit("已取消 Sapera 位置選擇，設定未變更。")
+            return
+        selected = dialog.result_location().connection(connection)
+        if not self._save_machine(replace(self._machine, connection=selected)):
+            return
+        self.camera_settings_changed.emit(self.camera_settings_view())
+        self.status_message.emit(
+            f"已選擇 Sapera 位置：{selected.server_name}#{selected.resource_index}；"
+            "按「套用相機設定」存入機台設定。"
+        )
+
+    @property
+    def diagnose_running(self) -> bool:
+        return self._diagnose_running
+
+    def start_camera_diagnose(self) -> bool:
+        """Run S1-S8 on a worker thread; a second concurrent start is refused."""
+
+        with self._diagnose_lock:
+            if self._diagnose_running:
+                self.notice.emit("相機診斷正在執行中，請等待完成。", "warning")
+                return False
+            self._diagnose_running = True
+        connection, acquisition, trigger = self._hardware_settings()
+        worker = SaperaDiagnoseWorker(
+            runner=self._resolve_diagnose_runner(),
+            connection=connection,
+            acquisition=acquisition,
+            trigger=trigger,
+            log_dir=self.diagnostics_log_dir,
+        )
+        self._diagnose_worker = worker
+        self.sapera_diagnose_running_changed.emit(True)
+        self.notice.emit("相機診斷已開始（S1–S8），完成後會直接列出短碼；請勿關閉視窗。", "info")
+        try:
+            self._diagnose_controller.start(
+                worker,
+                signal_handlers=((worker.finished, self._on_diagnose_finished),),
+                terminal_signals=(worker.finished,),
+                on_thread_finished=self._on_diagnose_thread_finished,
+            )
+        except RuntimeError as exc:
+            # A finished run is still winding down; keep the control usable for the next attempt.
+            with self._diagnose_lock:
+                self._diagnose_running = False
+            self._diagnose_worker = None
+            self.sapera_diagnose_running_changed.emit(False)
+            self.diagnose_finished.emit(False)
+            self.notice.emit(f"相機診斷無法啟動：{exc}", "error")
+            return False
+        return True
+
+    def _resolve_diagnose_runner(self):
+        """Injectable runner (tests) or the fixed `run_sapera_diagnose` interface (production)."""
+
+        runner = self.diagnose_runner
+        if runner is not None:
+            return runner
+        from devices.sapera_diagnose import run_sapera_diagnose  # noqa: PLC0415 - deferred import
+
+        return run_sapera_diagnose
+
+    def _on_diagnose_finished(self, report) -> None:
+        self._last_diagnose_report = report
+        passed = bool(getattr(report, "passed", False))
+        summary = str(getattr(report, "summary", lambda: "")())
+        self.diagnose_report_ready.emit(report)
+        self.diagnose_finished.emit(passed)
+        self.notice.emit(f"相機診斷完成：{summary}", "success" if passed else "error")
+        self.status_message.emit(f"相機診斷：{summary}")
+
+    def _on_diagnose_thread_finished(self) -> None:
+        with self._diagnose_lock:
+            self._diagnose_running = False
+        self._diagnose_worker = None
+        self._diagnose_controller.clear()
+        self.sapera_diagnose_running_changed.emit(False)
+
+    def camera_diagnostics_report(self) -> SaperaDiagnosticsReport | None:
+        """The export payload, or ``None`` when this backend has no Sapera information at all."""
+
+        if getattr(self.devices.camera, "runtime", None) is None:
+            return None
+        view = self.sapera_versions_view()
+        connection, _acquisition, _trigger = self._hardware_settings()
+        report = self._last_diagnose_report
+        return SaperaDiagnosticsReport(
+            connection=connection,
+            product=self._product.normalized(),
+            apply_notes=self._last_apply_notes(),
+            versions=self._sapera_versions_object(),
+            versions_summary=view.summary,
+            versions_mismatch=view.mismatch,
+            availability_reason=view.reason,
+            missing_api_members=view.missing_api_members,
+            diagnose_lines=tuple(str(line) for line in getattr(report, "lines", lambda: ())()),
+            diagnose_summary=str(getattr(report, "summary", lambda: "")()),
+            diagnose_report_path=str(getattr(report, "report_path", "") or ""),
+            diagnose_log_path=str(getattr(report, "log_path", "") or ""),
+            exported_at=self._clock().strftime("%Y%m%d-%H%M%S"),
+        )
+
+    def _sapera_versions_object(self) -> SaperaVersions:
+        runtime = getattr(self.devices.camera, "runtime", None)
+        return getattr(runtime, "versions", None) or SaperaVersions()
+
+    def _last_apply_notes(self) -> tuple[str, ...]:
+        notes = getattr(self.devices.camera, "apply_notes", None)
+        if not callable(notes):
+            return ()
+        try:
+            return apply_note_lines(notes())
+        except Exception:  # noqa: BLE001 - a diagnostic export must never fail on a read
+            return ()
+
+    def export_camera_diagnostics(self) -> Path | None:
+        """Write one UTF-8 report into `outputs/logs/camera/` and report the path on screen."""
+
+        report = self.camera_diagnostics_report()
+        if report is None:
+            self.notice.emit(
+                "匯出診斷需要 Sapera 相機後端；目前相機後端沒有 Sapera runtime，沒有可匯出的資料。",
+                "warning",
+            )
+            return None
+        try:
+            path = write_diagnostics_report(
+                report, log_dir=self.diagnostics_log_dir, clock=self._clock
+            )
+        except OSError as exc:
+            self.notice.emit(f"診斷匯出失敗：{exc}", "error")
+            return None
+        self.notice.emit(f"診斷已匯出：{path}（未收集：Live Features／Acq Params 列舉）", "success")
+        self.status_message.emit(f"診斷已匯出：{path}")
+        return path
+
+    # ------------------------------------------------------------------
     # persistence and lifecycle
     # ------------------------------------------------------------------
     def _save_machine(self, settings: CcdMachineSettings) -> bool:
@@ -715,6 +1113,7 @@ class CcdController(QObject, LogMixin):
         self._closed = True
         self.detach_inspection_queue()
         self.stop_software_trigger_monitor()
+        self._stop_diagnose()
         self._meter_wheel_timer.stop()
         self.devices.camera.set_frame_listener(None)
         self.devices.camera.set_external_trigger_listener(None)
@@ -724,3 +1123,26 @@ class CcdController(QObject, LogMixin):
             self.devices.close()
         except DeviceError as exc:
             self.logger.warning("CCD device cleanup failed: %s", exc)
+
+    def _stop_diagnose(self) -> None:
+        """Never orphan the diagnose thread: ask it to stop, then wait a bounded time.
+
+        `run_sapera_diagnose` may still be inside S7's frame wait, so this is a bounded wait rather
+        than a kill; the thread is a daemon-free `QThread` owned by this controller, which is being
+        destroyed here, so leaking it would abort the process at exit.
+        """
+
+        thread = self._diagnose_controller.thread
+        if thread is None:
+            return
+        worker = self._diagnose_worker
+        if worker is not None:
+            worker.stop()
+        if thread.isRunning():
+            thread.quit()
+            if not thread.wait(DIAGNOSE_SHUTDOWN_TIMEOUT_MS):
+                self.logger.warning("Sapera diagnose thread did not stop within the shutdown timeout")
+        with self._diagnose_lock:
+            self._diagnose_running = False
+        self._diagnose_worker = None
+        self._diagnose_controller.clear()

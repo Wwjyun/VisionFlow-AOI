@@ -74,3 +74,7 @@ class GpuWarmupWorkflowController(WorkerWorkflowController):
 
 class BackendComparisonWorkflowController(WorkerWorkflowController):
     pass
+
+
+class SaperaDiagnoseWorkflowController(WorkerWorkflowController):
+    """Own the CCD Sapera diagnosis thread; the window/controller owns presentation callbacks."""

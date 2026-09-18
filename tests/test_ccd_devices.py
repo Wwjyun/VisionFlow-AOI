@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import tempfile
 import threading
 import unittest
@@ -35,6 +36,8 @@ from devices.factory import (
 )
 from devices.lsi8181 import DLL_PATH_ENV, Lsi8181MeterWheel
 from devices.frame_writer import SnapshotSaveQueue, write_frame_atomic
+from devices.sapera_api import DLL_PATH_ENV as SAPERA_DLL_PATH_ENV
+from devices.sapera_camera import SaperaLineScanCamera
 from devices.simulated import SimulatedLineScanCamera, SimulatedMeterWheel
 
 
@@ -269,19 +272,57 @@ class SimulatedDeviceTests(unittest.TestCase):
 class FactoryTests(unittest.TestCase):
     def test_default_devices_are_unavailable_with_operator_reasons(self):
         with tempfile.TemporaryDirectory() as directory:
-            devices = create_ccd_devices({DLL_PATH_ENV: str(Path(directory) / "LSI8181_64.dll")})
+            devices = create_ccd_devices(
+                {
+                    DLL_PATH_ENV: str(Path(directory) / "LSI8181_64.dll"),
+                    # Isolate the Sapera probe from the host: an explicit missing assembly path keeps
+                    # this test identical on a development machine and on the camera machine.
+                    SAPERA_DLL_PATH_ENV: str(Path(directory) / "SapClassBasic.dll"),
+                }
+            )
         self.assertIsInstance(devices.camera, UnavailableLineScanCamera)
         self.assertIsInstance(devices.meter_wheel, Lsi8181MeterWheel)
         self.assertFalse(devices.meter_wheel.availability().available)
         self.assertIn(SIMULATOR_ENV, devices.meter_wheel.availability().reason)
+        camera_reason = devices.camera.availability().reason
         self.assertFalse(devices.camera.availability().available)
-        self.assertIn(SIMULATOR_ENV, devices.camera.availability().reason)
+        self.assertIn("E-0201", camera_reason)
+        self.assertIn("Sapera", camera_reason)
+        self.assertIn(SIMULATOR_ENV, camera_reason)
         with self.assertRaises(DeviceError):
             devices.camera.connect(CameraConnectionSettings(), AcquisitionSettings(), TriggerSettings())
         with self.assertRaises(DeviceError):
             devices.meter_wheel.connect(MeterWheelSettings())
         self.assertIsNone(devices.camera.latest_frame())
         devices.close()
+
+    def test_sapera_camera_is_used_when_the_machine_assembly_exists(self):
+        with tempfile.TemporaryDirectory() as directory:
+            assembly = Path(directory) / "SapClassBasic.dll"
+            assembly.write_bytes(b"")
+            devices = create_ccd_devices({SAPERA_DLL_PATH_ENV: str(assembly)})
+        # The factory only locates the assembly; pythonnet and the .NET runtime stay untouched
+        # until availability()/connect(), so no test here loads them.
+        self.assertIsInstance(devices.camera, SaperaLineScanCamera)
+        self.assertIsNone(devices.camera.runtime)
+        self.assertEqual(devices.camera.status().state, CameraState.OFFLINE)
+        devices.close()
+
+    def test_test_suite_isolates_real_acquisition_hardware_by_default(self):
+        # Importing any test module points both vendor lookups at an absent path, so a default
+        # MainWindow on the camera machine cannot connect a real card or write hardware settings.
+        from devices.lsi8181 import DLL_PATH_ENV as LSI_DLL_PATH_ENV
+
+        for variable in (LSI_DLL_PATH_ENV, SAPERA_DLL_PATH_ENV):
+            with self.subTest(variable=variable):
+                self.assertTrue(os.environ[variable])
+                self.assertFalse(Path(os.environ[variable]).exists())
+        devices = create_ccd_devices()
+        try:
+            self.assertFalse(devices.camera.availability().available)
+            self.assertFalse(devices.meter_wheel.availability().available)
+        finally:
+            devices.close()
 
     def test_simulator_environment_switch(self):
         devices = create_ccd_devices({SIMULATOR_ENV: "1"})

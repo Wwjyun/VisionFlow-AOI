@@ -1,0 +1,142 @@
+# Sapera 現場診斷模式（`--sapera-diagnose`）
+
+相機機台離線時無法把檔案帶出來，因此現場診斷只回傳「短碼」：每一步一行，由現場人員
+人工抄寫後帶回。完整報告與逐次 Sapera 呼叫 log 仍會寫在機台上，供現場自行對照。
+
+- 打包後的 EXE：`VisionFlow AOI.exe --sapera-diagnose`
+- 開發機／原始碼：`.\env\Scripts\python.exe main.py --sapera-diagnose`
+- GUI 管理模式之後會呼叫**同一個**流程（`devices/sapera_diagnose.py` 的
+  `run_sapera_diagnose()`），兩者結果一致。
+
+執行後 stdout 會印出總結加八行短碼，並以離開碼表示結果：`0` 代表八步全部 PASS，
+`1` 代表有 FAIL 或 SKIP。
+
+```
+S1-S8：6 PASS、1 FAIL、1 SKIP
+S1 PASS Sapera 8.60
+S2 PASS managed 8.60.0.00／runtime 8.60.0.00
+S3 PASS API 成員齊全
+S4 PASS 2 個 server、CCF 1 個（line_scan.ccf）
+S5 PASS 建立並釋放 4 個物件
+S6 FAIL E-0602 Exposure 寫入失敗
+S7 SKIP 前一步失敗
+S8 PASS 已斷線並清理完整報告：outputs\logs\camera\sapera-diagnose-20260918-143817.txt
+機器可讀報告：outputs\logs\camera\sapera-diagnose-20260918-143817.json
+```
+
+## 短碼格式
+
+```
+<步驟> <狀態> <錯誤碼或說明>
+```
+
+- `<步驟>`：`S1`～`S8`，固定順序。
+- `<狀態>`：`PASS`、`FAIL`、`SKIP`（英文，方便抄寫）。
+- 說明：錯誤碼（`E-xxxx`）加一句繁中原因；通過時是簡短結果。
+- 每行保持在 60 個字元以內，錯誤碼永遠不會被截斷。
+- 前一步失敗時，後續步驟一律記為 `SKIP 前一步失敗`，不會被略過不印，
+  也不會再去碰硬體。
+
+**只能抄短碼，不要把整份報告帶走**：報告檔留在機台 `outputs\logs\camera\`，
+複製不出去；請把畫面上的八行抄回來即可。
+
+## 步驟表
+
+| 步驟 | 標題 | 這一步證明什麼 | 現場要抄回的內容 |
+| --- | --- | --- | --- |
+| S1 | Sapera 安裝與版本 | 機台找得到 Sapera 安裝目錄，且 `SapClassBasic.dll` 的檔案版本是 8.60 | `S1 PASS Sapera 8.60`，或 `E-0104`／`E-0201` |
+| S2 | 載入 SapClassBasic.dll | pythonnet／.NET Framework 可用，且機台自己的 managed DLL 載得進來（版本未與 runtime 不符） | `S2 PASS managed …／runtime …`，或 `E-0101`～`E-0203` |
+| S3 | Sapera API 自檢 | 相機程式用到的每個 .NET 成員都在這台機器的 DLL 裡（反射檢查，尚未碰硬體） | `S3 PASS`，或 `E-0301` 加上缺少的成員名稱 |
+| S4 | 列舉 server／resource／CCF | 擷取卡 server、Acq／AcqDevice 數量與名稱、`CamFiles\User` 內的 CCF 檔數量 | `S4 PASS n 個 server、CCF m 個（檔名）`，或 `E-0401`／`E-0402`／`E-0403` |
+| S5 | 建立並釋放 Sapera 物件 | `SapAcqDevice`、`SapAcquisition`、`SapBufferWithTrash`、`SapAcqToBuf` 依相機順序建立後再完整釋放 | `S5 PASS 建立並釋放 n 個物件`，或 `E-0501`～`E-0504`、`E-0801` |
+| S6 | 連線並寫入參數後讀回 | 真正用 `SaperaLineScanCamera` 連線、寫入 Exposure／Gain／Length／Line Rate／觸發並讀回 | `S6 PASS 參數寫入並讀回 n 項`，或 `E-0403`／`E-0505`／`E-0601`～`E-0607` |
+| S7 | Snap 一張並檢查影像 | Snap 一張，檢查影像尺寸與灰階統計（min／max／mean） | `S7 PASS 寬×高 min.. max.. mean..`，或 `E-0701`～`E-0705` |
+| S8 | 斷線與清理 | 斷線並釋放所有 Sapera 物件，失敗會單獨回報 | `S8 PASS 已斷線並清理`，或 `E-0801` |
+
+補充說明：
+
+- **S1 不需要 .NET**：版本是直接讀 PE 檔的固定版本欄位，所以 pythonnet 壞掉時
+  仍然能先確認「有沒有裝、裝哪一版」。
+- **S4 只列舉，不建立硬體物件**：server 數為 0 會回報 `E-0402` 提示，但真正的
+  硬體存取從 S5 才開始。
+- **S5 建立後立即釋放**：目的是單獨驗證物件能不能建立，不影響後面的 S6。
+- **S7 有等待上限**：最多等 5 秒，逾時即 `E-0702`，不會卡住畫面。
+- **S8 只要 S6 連上就會執行**：即使 S6 是「連上但參數寫入失敗」，S8 仍會斷線並
+  回報清理結果。
+
+## 錯誤碼表
+
+以下完整對應 `devices/sapera_api.py` 的 `ERROR_MESSAGES`（診斷模組不新增錯誤碼）。
+
+| 錯誤碼 | 意義 | 可能原因 | 機台上怎麼處理 |
+| --- | --- | --- | --- |
+| E-0101 | pythonnet 未安裝或無法匯入 | 打包缺檔、或不在 `env` 環境執行 | 確認 EXE 是完整打包版本；原始碼執行請用 `.\env\Scripts\python.exe` |
+| E-0102 | .NET Framework runtime 載入失敗 | 未安裝 .NET Framework、版本過舊 | 安裝 .NET Framework 4.7.2 或更新版本後重開機 |
+| E-0103 | 需要 64 位元程式 | 誤用 32 位元 Python 或 32 位元 EXE | 改用 64 位元 EXE／Python；Sapera LT 只有 x64 |
+| E-0104 | 找不到 Sapera LT 安裝目錄 | 未安裝 Sapera LT、安裝在非預設路徑 | 安裝 Sapera LT 8.60；非預設路徑請設定 `SAPERADIR` |
+| E-0201 | 找不到 `DALSA.SaperaLT.SapClassBasic.dll` | Sapera 安裝不完整、`VISIONFLOW_SAPERA_DLL` 指到不存在的檔 | 重新安裝 Sapera LT；或把 `VISIONFLOW_SAPERA_DLL` 指向正確的 DLL |
+| E-0202 | `SapClassBasic.dll` 載入失敗 | DLL 損毀、相依檔案缺失 | 重裝 Sapera LT，確認 `corapi.dll` 存在 |
+| E-0203 | managed 與 runtime 版本不符 | 換過 Sapera 版本、目錄內混到舊 DLL | 讓 managed 與 native 都來自同一套 Sapera LT 8.60 |
+| E-0301 | Sapera API 缺少必要成員 | 安裝的 Sapera 版本比 8.60 舊、DLL 被替換 | 升級／重裝 Sapera LT 8.60，回報短碼上列出的成員名稱 |
+| E-0401 | 列舉 Sapera server 失敗 | 驅動異常、Sapera 服務未啟動 | 重開機；確認 Sapera LT 驅動與擷取卡驅動都已安裝 |
+| E-0402 | 找不到擷取卡（Acq resource） | 卡未插好、驅動未載入、卡被其他程式佔用 | 檢查 Xtium 卡與驅動；關閉 CamExpert 等其他取像程式 |
+| E-0403 | CCF 檔不存在 | 路徑設定錯誤、CCF 被刪除 | 確認 `CamFiles\User` 內有 CCF；必要時用 CamExpert 重新產生 |
+| E-0501 | `SapAcqDevice` 建立失敗 | 相機未上電、Camera Link 線未接、AcqDevice 位置錯 | 檢查相機電源與 Camera Link 線；確認相機 feature 的 server#index |
+| E-0502 | `SapAcquisition` 建立失敗 | CCF 與卡不符、資源被佔用 | 確認 CCF 對應這張卡；關閉其他取像程式後重試 |
+| E-0503 | `SapBuffer 建立失敗` | 記憶體不足、Scatter-Gather 記憶體不可用 | 關閉其他吃記憶體的程式後重試；確認 Sapera 記憶體驅動正常 |
+| E-0504 | `SapAcqToBuf` 建立失敗 | 前一個物件（buffer／acquisition）未正確建立 | 先看 S5 短碼中較早的錯誤碼，通常是被前面失敗連帶影響 |
+| E-0505 | 未偵測到相機訊號 | 相機未上電、線材鬆脫、線材損壞 | 檢查相機電源與 Camera Link 線；確認相機燈號 |
+| E-0601 | Internal Line Rate 寫入失敗 | 相機不支援 `AcquisitionLineRate`、板卡內部線觸發不可用 | 確認線速在允許範圍；必要時降低線速後重試 |
+| E-0602 | Exposure 寫入失敗 | 相機沒有可寫的曝光 feature、值超出範圍 | 用 CamExpert 確認曝光 feature 名稱與可寫範圍 |
+| E-0603 | Gain 寫入失敗 | 相機沒有 Gain feature、值超出範圍 | 用 CamExpert 確認 Gain 可寫範圍 |
+| E-0604 | Length（`CROP_HEIGHT`）寫入失敗 | 板卡不支援此參數、值超出範圍 | 確認 Length 在板卡允許範圍；對照 CamExpert 的 CROP_HEIGHT |
+| E-0605 | 外部觸發參數寫入失敗 | `EXT_LINE_TRIGGER_ENABLE` 寫不進去、CC1 對應錯誤 | 確認米輪編碼器接線與 CC1；用 CamExpert 檢查外部線觸發設定 |
+| E-0606 | One Frame（`EXT_FRAME_TRIGGER_ENABLE`）寫入失敗 | 板卡不支援單張模式 | 確認觸發模式；必要時改用連續模式測試 |
+| E-0607 | 外部觸發未 arm | 外部線觸發沒有真的開啟 | 確認米輪有在轉、編碼器脈衝有進來後重新連線 |
+| E-0701 | Snap 啟動失敗 | `SapAcqToBuf.Snap()` 被拒、前一次取像尚未結束 | 停止預覽後再試；必要時重新連線 |
+| E-0702 | 等待影像逾時 | 沒有觸發（外部觸發未 arm）、相機沒送圖 | 連續模式先確認能取像；外部模式確認米輪脈衝 |
+| E-0703 | 影像複製失敗 | `ReadRect` 失敗、buffer 尚未建立 | 重新連線後再試；持續失敗通常是驅動或記憶體問題 |
+| E-0704 | 不支援的像素格式 | 相機輸出非 8-bit 單色 | 在 CamExpert 把像素格式改成 8-bit 單色 |
+| E-0705 | Grab 啟動失敗 | 預覽啟動被拒、前一次取像尚未結束 | 先停止再重新開始預覽；必要時重新連線 |
+| E-0801 | Sapera 物件清理失敗 | Destroy／Dispose 卡住、驅動已異常 | 重新連線；若持續出現請重開機並記錄當時的 S6 結果 |
+| E-0901 | Sapera 呼叫發生未預期錯誤 | 上述分類以外的例外 | 把整行短碼抄回，並記下當時操作步驟 |
+
+> 交叉檢查結果：`ERROR_MESSAGES` 目前有 **30** 個錯誤碼，本表逐一列出 30 個，沒有缺漏、
+> 也沒有文件裡多出來的字號。每個字號都能寫出上表那一欄「機台上怎麼處理」的具體動作；
+> 其中 `E-0203` 是提醒而非中斷（版本不符仍會繼續嘗試），`E-0401`／`E-0402` 的現場
+> 動作相近（都是驅動與硬體檢查），回報時請一併抄回 S4 那一行以便區分。
+> 若之後新增錯誤碼，必須同時在 `devices/sapera_api.py` 的 `ERROR_MESSAGES` 與本表補上，
+> 診斷模組本身不自行發明錯誤碼。
+
+## 完整報告位置（留在機台，帶不出去）
+
+| 檔案 | 內容 |
+| --- | --- |
+| `outputs\logs\camera\sapera-diagnose-<YYYYmmdd-HHMMSS>.txt` | 人可讀報告：短碼、每步細節、版本、診斷過程 log、逐次 Sapera 呼叫 log |
+| `outputs\logs\camera\sapera-diagnose-<YYYYmmdd-HHMMSS>.json` | 機器可讀：`schema`、`summary`、`passed`、`versions`、`steps`、`sapera_calls`、`log` |
+
+兩個檔案使用同一個時間戳。`--output` 只影響一般 AOI 輸出；診斷報告固定寫在
+`outputs\logs\camera\`（相對於執行時的工作目錄）。目錄不存在時會自動建立。
+
+## 部署前置條件
+
+- Sapera LT **8.60**（`TARGET_SAPERA_VERSION = 8.60.0.00.2120`）；其他版本會被
+  標成 `E-0203` 提醒，但仍會繼續嘗試。
+- .NET Framework **4.7.2 或更新版本**（Sapera .NET 是 netfx，診斷會載入 netfx runtime）。
+- pythonnet（`pythonnet==3.1.0`）隨程式打包；64 位元執行環境。
+- `DALSA.SaperaLT.SapClassBasic.dll` **一律從機台自己的 Sapera 安裝載入，不隨程式打包**。
+- 環境變數覆寫（兩者都支援，設定後優先使用）：
+  - `VISIONFLOW_SAPERA_DLL`：直接指定 `SapClassBasic.dll` 完整路徑。
+  - `SAPERADIR`：指定 Sapera 安裝根目錄，DLL 會在其中搜尋。
+- 缺少 Sapera LT／pythonnet／相機時，診斷本身仍會跑完並以短碼回報原因；
+  GUI、CLI、批次與監看模式的啟動不受影響。
+
+## 已知限制
+
+- 診斷只涵蓋 xx_ccd 已確認的參數寫入路徑，不做 Live Features 或 Acq Params 全列舉；
+  GUI 的診斷匯出報告會逐條列出「未收集」項目。
+- `S6` 的「參數寫入並讀回」是**要求值與讀回值**的對照；實際的曝光／增益刻度仍以
+  CamExpert 與產品的 Recipe 設定為準。
+- 診斷報告與一般 AOI 輸出共用同一個工作目錄：CLI 以 `--output` 決定 `logs`，
+  診斷報告則固定是工作目錄下的 `outputs\logs\camera\`（本機驗證時請在
+  `outputs_validation\` 內執行，避免寫進正式 `outputs\`）。

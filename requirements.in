@@ -7,3 +7,6 @@ PyYAML>=6.0.1
 PySide6>=6.7.0
 PyInstaller>=6.14.0
 hypothesis>=6.0.0
+# Sapera LT camera binding: pythonnet loads the machine's own SapClassBasic.dll on the .NET
+# Framework (netfx) runtime. The vendor DLL itself is never bundled or redistributed.
+pythonnet>=3.1.0

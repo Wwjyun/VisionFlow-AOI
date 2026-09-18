@@ -19,14 +19,36 @@ from devices.ccd_models import (
 )
 from devices.interfaces import FrameListener, LineScanCamera, MeterWheel, TriggerListener
 from devices.lsi8181 import Lsi8181Library, Lsi8181MeterWheel
+from devices.sapera_api import (
+    ASSEMBLY_FILE_NAME,
+    DEFAULT_SAPERA_DIR,
+    DLL_PATH_ENV,
+    SAPERADIR_ENV,
+    load_runtime,
+    locate_assembly,
+)
+from devices.sapera_camera import SaperaLineScanCamera
 from devices.simulated import SimulatedLineScanCamera, SimulatedMeterWheel
 
 SIMULATOR_ENV = "VISIONFLOW_CCD_SIMULATOR"
 
-CAMERA_BINDING_PENDING_REASON = (
-    "Sapera LT 相機綁定尚未實作（P11 pythonnet spike 待相機機台執行）；"
-    f"可設定環境變數 {SIMULATOR_ENV}=1 使用模擬相機。"
-)
+
+def camera_unavailable_reason(environ: Mapping[str, str]) -> str:
+    """Operator-facing reason naming the copyable error code and the overrides to set."""
+
+    explicit = str(environ.get(DLL_PATH_ENV) or "")
+    search = locate_assembly(environ=environ)
+    if explicit:
+        detail = f"E-0201 {DLL_PATH_ENV}={explicit} 不存在"
+    elif search.sapera_dir is None:
+        detail = f"E-0104 未設定 {SAPERADIR_ENV}，且 {DEFAULT_SAPERA_DIR} 不存在"
+    else:
+        detail = f"E-0201 已在 {search.sapera_dir} 找不到 {ASSEMBLY_FILE_NAME}"
+    return (
+        f"找不到 Sapera LT 相機（{detail}）；請在相機機台安裝 Sapera LT 8.60，"
+        f"或設定 {DLL_PATH_ENV}／{SAPERADIR_ENV} 指向安裝位置。"
+        f"可設定 {SIMULATOR_ENV}=1 使用模擬相機。"
+    )
 
 
 class UnavailableLineScanCamera(LineScanCamera):
@@ -137,12 +159,25 @@ class CcdDevices:
             self.meter_wheel.close()
 
 
+def create_line_scan_camera(environ: Mapping[str, str] | None = None) -> LineScanCamera:
+    """Sapera camera when the machine has its own Sapera LT, otherwise a placeholder with the reason.
+
+    Only the assembly location is probed here: pythonnet and the .NET runtime load lazily on the
+    first `availability()`/`connect()`, so a machine without Sapera LT never pays for them.
+    """
+
+    env = os.environ if environ is None else environ
+    if locate_assembly(environ=env).chosen is None:
+        return UnavailableLineScanCamera(camera_unavailable_reason(env))
+    return SaperaLineScanCamera(lambda: load_runtime(environ=env))
+
+
 def create_ccd_devices(environ: Mapping[str, str] | None = None) -> CcdDevices:
     env = os.environ if environ is None else environ
     if str(env.get(SIMULATOR_ENV, "")).strip().lower() in {"1", "true", "yes", "on"}:
         return CcdDevices(SimulatedLineScanCamera(), SimulatedMeterWheel(auto_advance_per_read=25))
     # The LSI-8181 DLL is loaded lazily; a missing driver only makes the meter wheel unavailable.
     return CcdDevices(
-        UnavailableLineScanCamera(CAMERA_BINDING_PENDING_REASON),
+        create_line_scan_camera(env),
         Lsi8181MeterWheel(loader=lambda: Lsi8181Library.load(environ=env)),
     )

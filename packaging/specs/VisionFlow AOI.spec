@@ -19,7 +19,10 @@ a = Analysis(
         (str(ROOT / 'models' / 'yolox'), 'models/yolox'),
         (str(ROOT / 'build_provenance.json'), '.'),
     ],
-    hiddenimports=[],
+    # pythonnet loads the camera machine's own Sapera LT SapClassBasic.dll at runtime on the .NET
+    # Framework runtime. The managed hooks collect clr.pyd/Python.Runtime.dll; the vendor DLL and
+    # the LSI-8181 driver stay on the machine and must never be bundled.
+    hiddenimports=['pythonnet', 'clr_loader'],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],

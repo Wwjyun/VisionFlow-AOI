@@ -40,10 +40,115 @@ def run_packaged_smoke_test() -> int:
         settings.sync()
     if not valid:
         return 3
+    ccd_status = run_packaged_ccd_smoke_test()
+    if ccd_status:
+        return ccd_status
+    diagnose_status = run_packaged_sapera_diagnose_smoke_test()
+    if diagnose_status:
+        return diagnose_status
+    pythonnet_status = run_packaged_pythonnet_smoke_test()
+    if pythonnet_status:
+        return pythonnet_status
     fallback_status = run_packaged_gpu_fallback_smoke_test()
     if fallback_status:
         return fallback_status
     return run_packaged_yolox_smoke_test()
+
+
+def run_packaged_pythonnet_smoke_test() -> int:
+    """The camera binding needs pythonnet bundled; a machine without .NET Framework is a prerequisite gap.
+
+    Returns 20 when `pythonnet` is missing from the bundle or the interpreter is not 64-bit (packaging
+    defects), and 0 when the .NET bootstrap either succeeds or fails only because this machine has no
+    .NET Framework 4.x — installing it is a documented camera-machine prerequisite, not a package bug.
+    """
+
+    try:
+        import pythonnet  # noqa: F401, PLC0415
+    except ImportError:
+        return 20
+    from devices.sapera_api import SaperaError, ensure_dotnet_runtime
+
+    try:
+        ensure_dotnet_runtime()
+    except SaperaError as exc:
+        return 20 if exc.code in ("E-0101", "E-0103") else 0
+    return 0
+
+
+def run_packaged_sapera_diagnose_smoke_test() -> int:
+    """The packaged diagnosis must stop at the first missing step, say why, and never crash.
+
+    The environment is isolated with an explicit missing assembly path, so this is the same check on
+    a development machine and on the camera machine.
+    """
+
+    from devices.sapera_api import DLL_PATH_ENV as SAPERA_DLL_PATH_ENV
+    from devices.sapera_diagnose import run_sapera_diagnose
+
+    with tempfile.TemporaryDirectory(prefix="visionflow_packaged_sapera_") as temporary:
+        root = Path(temporary)
+        report = run_sapera_diagnose(
+            environ={SAPERA_DLL_PATH_ENV: str(root / "SapClassBasic.dll")},
+            log_dir=root / "logs",
+        )
+        reports_written = Path(report.report_path).is_file() and Path(report.log_path).is_file()
+    if report.passed:
+        return 16
+    if not report.steps or report.steps[0].status != "FAIL" or "E-" not in report.steps[0].short:
+        return 17
+    if any(step.status == "PASS" for step in report.steps):
+        return 18
+    if not reports_written:
+        return 19
+    return 0
+
+
+def run_packaged_ccd_smoke_test() -> int:
+    """Verify a package without Sapera LT or LSI-8181 still starts and reports CCD as unavailable.
+
+    The environment is isolated with explicit missing assembly paths so the result is identical on a
+    development machine and on the camera machine: only the assembly location is probed here, so no
+    pythonnet/.NET runtime and no driver is loaded by this check.
+    """
+
+    from devices.factory import create_ccd_devices
+    from devices.lsi8181 import DLL_PATH_ENV as LSI_DLL_PATH_ENV
+    from devices.sapera_api import DLL_PATH_ENV as SAPERA_DLL_PATH_ENV
+
+    with tempfile.TemporaryDirectory(prefix="visionflow_packaged_ccd_") as temporary:
+        devices = create_ccd_devices(
+            {
+                SAPERA_DLL_PATH_ENV: str(Path(temporary) / "SapClassBasic.dll"),
+                LSI_DLL_PATH_ENV: str(Path(temporary) / "LSI8181_64.dll"),
+            }
+        )
+        try:
+            camera = devices.camera.availability()
+            meter_wheel = devices.meter_wheel.availability()
+        finally:
+            devices.close()
+    if camera.available or meter_wheel.available:
+        return 13
+    if "E-0201" not in camera.reason or not meter_wheel.reason:
+        return 14
+
+    from PySide6.QtWidgets import QApplication
+
+    from gui.screens.ccd_screen import CcdScreen
+
+    app = QApplication.instance() or QApplication([])
+    screen = CcdScreen()
+    screen.set_availability(camera, meter_wheel)
+    app.processEvents()
+    shown = (
+        not screen.camera_availability_label.isHidden()
+        and camera.reason in screen.camera_availability_label.text()
+        and not screen.meter_wheel_availability_label.isHidden()
+    )
+    screen.deleteLater()
+    app.processEvents()
+    return 0 if shown else 15
 
 
 def _packaged_smoke_recipe() -> dict:
@@ -215,7 +320,58 @@ def run_packaged_yolox_smoke_test() -> int:
     return 0
 
 
+def sapera_diagnose_text(report) -> str:
+    """The manually-copyable diagnosis text: step summary, one short line per step, report paths."""
+
+    lines = [report.summary(), ""]
+    lines.extend(report.lines())
+    lines.extend(["", f"完整報告：{report.report_path}", f"機器可讀報告：{report.log_path}"])
+    return "\n".join(lines)
+
+
+def build_sapera_diagnose_dialog(report):
+    """Read-only dialog used because a windowed package has no console to print the short codes to."""
+
+    from PySide6.QtWidgets import QDialog, QDialogButtonBox, QPlainTextEdit, QVBoxLayout
+
+    dialog = QDialog()
+    dialog.setWindowTitle("Sapera 相機診斷")
+    view = QPlainTextEdit()
+    view.setObjectName("sapera_diagnose_text")
+    view.setReadOnly(True)
+    view.setPlainText(sapera_diagnose_text(report))
+    layout = QVBoxLayout(dialog)
+    layout.addWidget(view)
+    buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
+    buttons.rejected.connect(dialog.reject)
+    buttons.accepted.connect(dialog.accept)
+    layout.addWidget(buttons)
+    dialog.resize(760, 420)
+    return dialog
+
+
+def run_packaged_sapera_diagnose(runner=None, *, show_dialog: bool = True) -> int:
+    """Field diagnosis entry for the packaged (windowed, console-less) executable.
+
+    `main.py --sapera-diagnose` prints the same short codes when a console exists; the packaged EXE
+    shows them in a dialog instead. `show_dialog=False` is the test hook.
+    """
+
+    from devices.sapera_diagnose import run_sapera_diagnose
+
+    report = (runner or run_sapera_diagnose)()
+    if show_dialog:
+        from PySide6.QtWidgets import QApplication
+
+        app = QApplication.instance() or QApplication([])
+        dialog = build_sapera_diagnose_dialog(report)
+        dialog.exec()
+    return 0 if report.passed else 1
+
+
 if __name__ == "__main__":
     if "--smoke-test" in sys.argv[1:]:
         raise SystemExit(run_packaged_smoke_test())
+    if "--sapera-diagnose" in sys.argv[1:]:
+        raise SystemExit(run_packaged_sapera_diagnose())
     raise SystemExit(run_app())

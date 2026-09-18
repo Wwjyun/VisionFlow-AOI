@@ -845,6 +845,9 @@ class MainWindow(QMainWindow, LogMixin):
 
     def _on_ccd_camera_status_changed(self, status: CameraStatus) -> None:
         camera_availability = self.ccd_controller.devices.camera.availability()
+        # Sapera version／API facts come from the same cached availability probe; the mismatch
+        # notice is emitted at most once per session (see CcdController._notice_version_mismatch_once).
+        self.ccd_controller.refresh_sapera_versions()
         if not camera_availability.available:
             text = "相機：不可用（請至 CCD 控制查看原因）"
         else:

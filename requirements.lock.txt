@@ -1,5 +1,6 @@
 # Windows x64 / CPython 3.13 lock used by CI, RTX validation, and packaging.
 altgraph==0.17.5
+clr-loader==0.3.1
 flatbuffers==25.12.19
 hypothesis==6.156.6
 narwhals==2.25.0
@@ -16,6 +17,7 @@ pyinstaller-hooks-contrib==2026.6
 PySide6==6.11.1
 PySide6_Addons==6.11.1
 PySide6_Essentials==6.11.1
+pythonnet==3.1.0
 pywin32-ctypes==0.2.3
 PyYAML==6.0.3
 setuptools==82.0.1

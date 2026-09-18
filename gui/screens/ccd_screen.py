@@ -217,6 +217,9 @@ class CcdScreen(QWidget):
     reverse_direction_changed = Signal(bool)
     cmp_out_width_requested = Signal(int)
     extension_channels_applied = Signal(object)
+    sapera_location_requested = Signal(object)
+    sapera_diagnose_requested = Signal()
+    sapera_diagnostics_export_requested = Signal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -229,6 +232,8 @@ class CcdScreen(QWidget):
         self._trigger_mode = TriggerMode.CONTINUOUS
         self._pending_hardware_write = False
         self._software_trigger_monitor_running = False
+        self._sapera_diagnose_running = False
+        self.sapera_diagnose_lines: tuple[str, ...] = ()
         self._save_settings = SaveSettings()
         # Steppers display rounded values; unedited fields keep the loaded values exactly.
         self._loaded_acquisition = AcquisitionSettings()
@@ -253,6 +258,7 @@ class CcdScreen(QWidget):
         controls_layout.setSpacing(12)
         controls_layout.addWidget(self._build_camera_panel())
         controls_layout.addWidget(self._build_settings_panel())
+        controls_layout.addWidget(self._build_sapera_diagnostics_panel())
         controls_layout.addWidget(self._build_save_panel())
         controls_layout.addWidget(self._build_meter_wheel_panel())
         self.extension_panel = self._build_extension_panel()
@@ -279,6 +285,7 @@ class CcdScreen(QWidget):
         self.set_mode("op")
         self._refresh_camera_controls()
         self._refresh_meter_wheel_controls()
+        self._refresh_sapera_diagnostics_controls()
 
     # ------------------------------------------------------------------
     # construction
@@ -341,7 +348,18 @@ class CcdScreen(QWidget):
         form.addRow("相機功能伺服器", self.feature_server_edit)
         self.feature_resource_input = self.gate.register(NumStepper(-1, -1, 255))
         form.addRow("相機功能 Resource", self.feature_resource_input)
+        self.choose_location_button = self.gate.register(_button("選擇 Sapera 位置…", icon_name="gear"))
+        self.choose_location_button.clicked.connect(
+            lambda: self.sapera_location_requested.emit(self.connection_settings())
+        )
         panel.add_layout(form)
+        panel.add_widget(_row(self.choose_location_button))
+        panel.add_widget(
+            _hint(
+                "「選擇 Sapera 位置」會透過機台自己的 Sapera 列舉 server／resource／CCF；"
+                "選取結果只填回上方欄位，仍需「套用相機設定」才會存入機台設定檔。"
+            )
+        )
 
         panel.add_widget(_section("取像參數"))
         form = _form()
@@ -419,6 +437,65 @@ class CcdScreen(QWidget):
         self.apply_save_button = self.gate.register(_button("套用存圖設定", icon_name="check"), ACCESS_ENGINEER)
         self.apply_save_button.clicked.connect(self._emit_save_settings)
         panel.add_widget(_row(self.apply_save_button))
+        return panel
+
+    def _build_sapera_diagnostics_panel(self) -> Panel:
+        """Sapera runtime information, the on-screen diagnose short codes and the export control.
+
+        The version／API lines are pure status text. The two controls are admin-only, and the whole
+        panel is hidden in OP mode: it is a hardware／install diagnostic, not an operator view.
+        """
+
+        panel = Panel(title="Sapera 診斷")
+        panel.add_widget(
+            _hint(
+                "S1–S8 自檢與版本資訊；短碼可直接抄回。管理模式的「匯出診斷」會把目前收集到的資料"
+                "寫到 outputs/logs/camera/，但未收集 Live Features／Acq Params 列舉。"
+            )
+        )
+        self.sapera_managed_label = _mono_value("—", 12)
+        self.sapera_native_label = _mono_value("—", 12)
+        self.sapera_assembly_label = _hint()
+        self.sapera_assembly_label.setProperty("mono", "true")
+        version_grid = QWidget()
+        version_layout = QGridLayout(version_grid)
+        version_layout.setContentsMargins(0, 0, 0, 0)
+        version_layout.setHorizontalSpacing(14)
+        version_layout.setVerticalSpacing(4)
+        version_layout.addWidget(_hint("managed DLL 版本"), 0, 0)
+        version_layout.addWidget(_hint("Sapera runtime 版本"), 0, 1)
+        version_layout.addWidget(self.sapera_managed_label, 1, 0)
+        version_layout.addWidget(self.sapera_native_label, 1, 1)
+        panel.add_widget(version_grid)
+        panel.add_widget(self.sapera_assembly_label)
+
+        self.sapera_version_notice = _hint(color=COLORS["warn"])
+        self.sapera_version_notice.setWordWrap(True)
+        self.sapera_version_notice.setVisible(False)
+        panel.add_widget(self.sapera_version_notice)
+
+        self.sapera_api_label = _hint(color=COLORS["ng"])
+        self.sapera_api_label.setWordWrap(True)
+        self.sapera_api_label.setVisible(False)
+        panel.add_widget(self.sapera_api_label)
+
+        self.diagnose_button = self.gate.register(_button("執行相機診斷", "primary", "check"))
+        self.export_diagnostics_button = self.gate.register(_button("匯出診斷", icon_name="save"))
+        self.diagnose_button.clicked.connect(self.sapera_diagnose_requested.emit)
+        self.export_diagnostics_button.clicked.connect(self.sapera_diagnostics_export_requested.emit)
+        panel.add_widget(_row(self.diagnose_button, self.export_diagnostics_button))
+
+        self.sapera_diagnose_result_label = _hint()
+        self.sapera_diagnose_result_label.setProperty("mono", "true")
+        self.sapera_diagnose_result_label.setWordWrap(True)
+        self.sapera_diagnose_result_label.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse
+        )
+        self.sapera_diagnose_result_label.setVisible(False)
+        panel.add_widget(self.sapera_diagnose_result_label)
+
+        self.diagnostics_panel = panel
+        self._refresh_sapera_diagnostics_controls()
         return panel
 
     def _build_meter_wheel_panel(self) -> Panel:
@@ -574,6 +651,7 @@ class CcdScreen(QWidget):
     def set_mode(self, mode: str) -> None:
         self.gate.set_mode(mode)
         self.extension_panel.setVisible(mode == "admin")
+        self.diagnostics_panel.setVisible(mode == "admin")
 
     def set_availability(self, camera: DeviceAvailability, meter_wheel: DeviceAvailability) -> None:
         self._camera_available = camera
@@ -643,6 +721,78 @@ class CcdScreen(QWidget):
             f"原始 {source_width} × {source_height} px · 預覽 {image.width()} × {image.height()} px"
         )
         self._refresh_camera_controls()
+
+    def set_sapera_versions(self, view) -> None:
+        """Sapera managed/runtime versions, the mismatch warning and the API self-check result.
+
+        A version mismatch keeps the camera available: it is shown as a warning, never as
+        「沒有擷取卡」. When the backend has no Sapera runtime (simulator, placeholder) the view is
+        empty and every label falls back to its neutral value.
+        """
+
+        managed = str(getattr(view, "managed_version", "") or "")
+        native = str(getattr(view, "native_version", "") or "")
+        summary = str(getattr(view, "summary", "") or "")
+        available = bool(getattr(view, "available", True))
+        missing = tuple(str(member) for member in getattr(view, "missing_api_members", ()) or ())
+        self.sapera_managed_label.setText(managed or "—")
+        self.sapera_native_label.setText(native or "—")
+        assembly = str(getattr(view, "assembly_path", "") or "")
+        self.sapera_assembly_label.setText(f"managed 路徑：{assembly}" if assembly else "")
+        self.sapera_assembly_label.setVisible(bool(assembly))
+        if getattr(view, "mismatch", False):
+            self.sapera_version_notice.setText(
+                f"Sapera runtime 版本不符：{summary}。相機仍可使用，請改用一致版本的 Sapera LT。"
+            )
+            self.sapera_version_notice.setVisible(True)
+        else:
+            self.sapera_version_notice.setText("")
+            self.sapera_version_notice.setVisible(False)
+        if available and not missing:
+            self.sapera_api_label.setText("")
+            self.sapera_api_label.setVisible(False)
+            return
+        lines: list[str] = []
+        reason = str(getattr(view, "reason", "") or "")
+        if reason:
+            lines.append(f"相機不可用：{reason}")
+        if missing:
+            # The full signatures from the E-0301 reason text must be readable on screen, not
+            # only in a log: the operator copies them back by hand.
+            lines.append(f"E-0301 API 自檢缺少 {len(missing)} 個成員：")
+            lines.extend(f"　{member}" for member in missing)
+        self.sapera_api_label.setText("\n".join(lines))
+        self.sapera_api_label.setVisible(bool(lines))
+
+    def set_sapera_diagnose_running(self, running: bool) -> None:
+        self._sapera_diagnose_running = bool(running)
+        self._refresh_sapera_diagnostics_controls()
+
+    def set_sapera_diagnose_report(self, report) -> None:
+        """One short line per step plus the summary line; shown even when the run failed."""
+
+        lines = tuple(str(line) for line in getattr(report, "lines", lambda: ())())
+        summary = str(getattr(report, "summary", lambda: "")())
+        self.sapera_diagnose_lines = lines
+        self._refresh_sapera_diagnostics_controls()
+        if not lines and not summary:
+            self.sapera_diagnose_result_label.setText("")
+            self.sapera_diagnose_result_label.setVisible(False)
+            return
+        display = [f"總結：{summary}"] if summary else []
+        display.extend(lines)
+        failures = [
+            str(getattr(step, "code", "")) for step in getattr(report, "steps", ()) or ()
+            if getattr(step, "status", "") == "FAIL"
+        ]
+        if failures:
+            display.append(f"FAIL 步驟：{'、'.join(code for code in failures if code)}")
+        self.sapera_diagnose_result_label.setText("\n".join(display))
+        self.sapera_diagnose_result_label.setVisible(True)
+
+    def _refresh_sapera_diagnostics_controls(self) -> None:
+        self.gate.set_enabled(self.diagnose_button, not self._sapera_diagnose_running)
+        self.gate.set_enabled(self.export_diagnostics_button, not self._sapera_diagnose_running)
 
     def set_save_stats(self, stats: SaveQueueStats) -> None:
         self.save_stats_label.setText(

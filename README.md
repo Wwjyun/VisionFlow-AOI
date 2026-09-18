@@ -297,13 +297,26 @@ YOLOX 的 `models/yolox/yolox_tiny_fixture.onnx` 只輸出固定測試資料。�
 
 - CCD 畫面、型別化設定、模擬相機、觸發自動化、背景存圖與相機 frame 檢測已整合。
 - LSI-8181 使用選用的 vendor DLL；DLL／驅動缺少時只會讓米輪功能不可用，不影響 GUI 或檢測。
-- Sapera LT `pythonnet` 相機 binding 尚未完成；一般環境會顯示不可用原因。
+- Sapera LT 線掃相機以 `pythonnet` 綁定（`devices/sapera_api.py`、`devices/sapera_camera.py`）。`SapClassBasic.dll` 一律從相機機台自己的 Sapera LT 安裝載入，**不打包、不隨程式散佈**；找不到時 CCD 畫面顯示含短碼的不可用原因，其餘功能照常運作。
+- 相機參數分兩層：機台層（Sapera server／resource、CCF、米輪卡片與 CMP0–7）存 `config/ccd_machine.json`；產品層（曝光、增益、影像長度、內部線速率、觸發、自動存圖）存 Recipe 選用 `camera` 區段。
+- 相機機台沒有 Python、IDE 與網路，且檔案只能帶進去。因此相機綁定以相機機台為目標在本機完成，帶進現場的 EXE 提供 `--sapera-diagnose` 分步診斷；完整錯誤碼與短碼對照見 [`docs/sapera-diagnose.md`](docs/sapera-diagnose.md)。
 - 開發與展示可先啟用模擬裝置：
 
 ```powershell
 $env:VISIONFLOW_CCD_SIMULATOR = '1'
 .\env\Scripts\python.exe main.py --gui
 ```
+
+相機機台部署（離線）：安裝 Sapera LT 8.60 與 .NET Framework 4.7.2 以上，帶入的 EXE 已含 pythonnet。先跑診斷再開 GUI；S1–S8 每步一行可抄寫的短碼，任一步失敗時後續標示略過，完整報告寫在機台 `outputs/logs/camera/`（不預期能帶出）。
+
+```powershell
+.\VisionFlow AOI.exe --sapera-diagnose                 # 視窗版沒有主控台，結果以對話框顯示
+.\env\Scripts\python.exe main.py --sapera-diagnose     # 由原始碼執行時直接印在主控台
+```
+
+GUI 管理模式在「CCD 控制」頁也能執行同一套診斷、查看缺漏的 API 成員與版本，並匯出診斷報告。
+
+可用環境變數覆寫 Sapera 位置：`VISIONFLOW_SAPERA_DLL`（指定 `SapClassBasic.dll`，指定但不存在即不可用）、`SAPERADIR`（Sapera 安裝目錄）。
 
 硬體完成度與相機機台驗收項目請以 [`Todo.md`](Todo.md) 的 P11 為準。
 
