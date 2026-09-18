@@ -31,6 +31,7 @@ from devices.sapera_api import (
     SaperaError,
     SaperaRuntime,
     SaperaVersions,
+    describe_buffer_ctors,
     dotnet_exception_name,
     load_runtime,
     locate_assembly,
@@ -524,6 +525,15 @@ def _step_s3(context: _Context, state: _RuntimeState) -> tuple[str, str]:
         context.add_note(error.code, error.detail)
         return "FAIL", _badge(error.code, dotnet_exception_name(exc))
     state.interop = _RecordingInterop(interop, context.record_call)
+    buffer_class = getattr(interop, "buffer_class", None)
+    signatures = getattr(interop, "buffer_ctor_signatures", None) or {}
+    if buffer_class == "":
+        # Field `050503`: no buffer constructor matched, so every connect would fail at the buffer.
+        # Reported here, before hardware, with the constructors this build actually offers.
+        context.add_note("E-0506", describe_buffer_ctors(signatures))
+        return "FAIL", _badge("E-0506")
+    if buffer_class:
+        context.add(f"buffer 類別：{buffer_class}；{describe_buffer_ctors(signatures)}")
     return "PASS", "API 成員齊全"
 
 

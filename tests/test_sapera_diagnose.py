@@ -647,6 +647,28 @@ class FieldNumericCodeRegressionTests(DiagnoseHarness):
         self.assertEqual(report.steps[4].status, "PASS")
         self.assertIn("E-0501", Path(report.report_path).read_text(encoding="utf-8"))
 
+    def test_no_usable_buffer_constructor_fails_s3_with_e_0506_before_hardware(self):
+        """Field `050503` was a constructor mismatch; it must read as its own code, before S5."""
+
+        self.interop.buffer_class = ""
+        self.interop.buffer_ctor_signatures = {
+            "SapBufferWithTrash": (("System.Int32", "DALSA.SaperaLT.SapClassBasic.SapXferNode", "System.String"),),
+        }
+        report = self.run_diagnose()
+
+        self.assertEqual(self.statuses(report)[:3], ["PASS", "PASS", "FAIL"])
+        self.assertEqual(report.numeric_lines()[2], "030506")
+        self.assertEqual(self.interop.objects, [])
+        text = Path(report.report_path).read_text(encoding="utf-8")
+        self.assertIn("SapBufferWithTrash(Int32, SapXferNode, String)", text)
+
+    def test_s3_reports_the_selected_buffer_class(self):
+        self.interop.buffer_class = "SapBufferWithTrash"
+        report = self.run_diagnose()
+
+        self.assertEqual(report.steps[2].status, "PASS")
+        self.assertIn("buffer 類別：SapBufferWithTrash", Path(report.report_path).read_text(encoding="utf-8"))
+
     def test_machine_entry_diagnoses_the_location_saved_in_the_settings_file(self):
         store = CcdMachineSettingsStore(self.root / "config" / "ccd_machine.json")
         store.save(CcdMachineSettings(connection=self.connection()))

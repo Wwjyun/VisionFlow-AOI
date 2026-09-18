@@ -78,6 +78,7 @@ ERROR_MESSAGES = {
     "E-0503": "SapBuffer 建立失敗",
     "E-0504": "SapAcqToBuf 建立失敗",
     "E-0505": "未偵測到相機訊號",
+    "E-0506": "找不到可用的 SapBuffer 建構子",
     "E-0601": "Internal Line Rate 寫入失敗",
     "E-0602": "Exposure 寫入失敗",
     "E-0603": "Gain 寫入失敗",
@@ -336,7 +337,7 @@ SAPERA_API_MANIFEST = _build_manifest()
 
 
 def _full_type_name(name: str) -> str:
-    if name.startswith("System."):
+    if name.startswith("System.") or name.startswith(f"{SAPERA_NAMESPACE}."):
         return name
     return f"{SAPERA_NAMESPACE}.{name}"
 
@@ -345,28 +346,53 @@ def _parameter_type_names(method) -> tuple[str, ...]:
     return tuple(str(parameter.ParameterType.FullName) for parameter in method.GetParameters())
 
 
-def select_buffer_class(signatures: Mapping[str, Iterable[Iterable[str]]]) -> tuple[str, int]:
+# Sapera declares the buffer source as `SapXferNode`, the base class of `SapAcquisition`; the
+# reference app's `new SapBufferWithTrash(2, _acquisition, ...)` compiles through that conversion.
+DEFAULT_BUFFER_SOURCE_TYPES = ("SapAcquisition", "SapXferNode")
+
+
+def select_buffer_class(
+    signatures: Mapping[str, Iterable[Iterable[str]]],
+    source_types: Iterable[str] | None = None,
+) -> tuple[str, int]:
     """Pick the buffer class and memory-argument count from the constructors `signatures` lists.
 
     `signatures` maps a class name to its constructor parameter-type lists. A usable constructor takes
-    `(System.Int32, <SapAcquisition>, <SapBuffer+MemoryType>...)`; the memory type may repeat (some
-    Sapera builds take a separate trash memory type). Returns `("", 0)` when nothing matches. Pure so
-    the field shapes can be tested without .NET.
+    `(System.Int32, <source>, <SapBuffer+MemoryType>...)` where `<source>` is `SapAcquisition` or a
+    type it converts to (`source_types`: its base-type chain, as C# overload resolution allows); the
+    memory type may repeat (some Sapera builds take a separate trash memory type). Returns `("", 0)`
+    when nothing matches. Pure so the field shapes can be tested without .NET.
     """
 
-    acquisition_name = _full_type_name("SapAcquisition")
+    accepted = {
+        _full_type_name(name) for name in (source_types if source_types is not None else DEFAULT_BUFFER_SOURCE_TYPES)
+    }
+    accepted.add(_full_type_name("SapAcquisition"))
     memory_name = _full_type_name(MEMORY_TYPE)
     for class_name in BUFFER_CLASS_PREFERENCE:
         for parameters in signatures.get(class_name, ()):
             names = tuple(parameters)
             # At least one memory-type argument is required: dropping it would ignore the
             # ScatterGather/ScatterGatherPhysical choice the binding makes from the board capability.
-            if len(names) < 3 or names[0] != "System.Int32" or names[1] != acquisition_name:
+            if len(names) < 3 or names[0] != "System.Int32" or names[1] not in accepted:
                 continue
             if any(name != memory_name for name in names[2:]):
                 continue
             return class_name, len(names) - 2
     return "", 0
+
+
+def describe_buffer_ctors(signatures: Mapping[str, Iterable[Iterable[str]]]) -> str:
+    """The constructors this build offers, namespaces stripped, for the E-0506 report line."""
+
+    parts = []
+    for class_name in BUFFER_CLASS_PREFERENCE:
+        found = [
+            f"{class_name}({', '.join(name.rsplit('.', 1)[-1] for name in parameters)})"
+            for parameters in signatures.get(class_name, ())
+        ]
+        parts.append("、".join(found) if found else f"{class_name}（無公開建構子）")
+    return "機台提供的建構子：" + "；".join(parts)
 
 
 def check_api(assembly, manifest: Iterable[ApiMember] = SAPERA_API_MANIFEST) -> tuple[str, ...]:
@@ -682,6 +708,7 @@ class PythonnetSaperaInterop:
         self._buffer_class = ""
         self._buffer_memory_args = 0
         self.buffer_with_trash = False
+        self.buffer_ctor_signatures: dict[str, tuple[tuple[str, ...], ...]] = {}
         self._select_buffer_ctor()
 
     def _select_buffer_ctor(self) -> None:
@@ -693,6 +720,15 @@ class PythonnetSaperaInterop:
         """
 
         signatures: dict[str, list[tuple[str, ...]]] = {}
+        source_types = list(DEFAULT_BUFFER_SOURCE_TYPES)
+        try:
+            # Whatever `SapAcquisition` converts to on this build: its own type and every base class.
+            node = self._clr.GetClrType(self._sap.SapAcquisition)
+            while node is not None and str(node.FullName) != "System.Object":
+                source_types.append(str(node.FullName))
+                node = node.BaseType
+        except Exception:  # noqa: BLE001 - fall back to the documented Sapera names
+            LOGGER.debug("SapAcquisition base types unavailable", exc_info=True)
         for class_name in BUFFER_CLASS_PREFERENCE:
             clr_class = getattr(self._sap, class_name, None)
             if clr_class is None:
@@ -703,7 +739,8 @@ class PythonnetSaperaInterop:
                 signatures[class_name] = [_parameter_type_names(ctor) for ctor in clr_type.GetConstructors()]
             except Exception:  # noqa: BLE001 - treat an unreadable type as unavailable
                 continue
-        class_name, memory_args = select_buffer_class(signatures)
+        self.buffer_ctor_signatures = {name: tuple(found) for name, found in signatures.items()}
+        class_name, memory_args = select_buffer_class(signatures, source_types)
         if class_name:
             self._buffer_class = class_name
             self._buffer_memory_args = memory_args
@@ -868,10 +905,7 @@ class PythonnetSaperaInterop:
         """
 
         if not self._buffer_class:
-            raise SaperaError(
-                "E-0503",
-                "此 Sapera 版本沒有可用的 SapBuffer 建構子（SapBufferWithTrash／SapBuffer）",
-            )
+            raise SaperaError("E-0506", describe_buffer_ctors(self.buffer_ctor_signatures))
         memory = self._sap.SapBuffer.MemoryType
         factory = getattr(self._sap, self._buffer_class)
         if self._sap.SapBuffer.IsBufferTypeSupported(location, memory.ScatterGather):

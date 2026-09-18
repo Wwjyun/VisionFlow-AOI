@@ -157,6 +157,15 @@ class SaperaStubInteropTests(unittest.TestCase):
         self.assertEqual(interop.resource_count("System", "Acq"), 0)
         self.assertEqual(interop.resource_name(SERVER, "Acq", 0), "CameraLink Mono #1")
 
+    def test_buffer_constructor_declared_on_the_xfer_node_base_class_is_selected(self):
+        """Field `050503`: Sapera's buffer source parameter is `SapXferNode`, not `SapAcquisition`."""
+
+        interop = self.runtime.interop()
+        self.assertEqual(interop.buffer_class, "SapBufferWithTrash")
+        self.assertTrue(interop.buffer_with_trash)
+        signature = interop.buffer_ctor_signatures["SapBufferWithTrash"][0]
+        self.assertTrue(signature[1].endswith(".SapXferNode"), signature)
+
     # ---- connect write paths ---------------------------------------------------------------
     def test_continuous_connect_writes_line_rate_before_create_and_reads_back(self):
         self.stub.MissingParameters = CAM_LINE_RATE_BOUNDS

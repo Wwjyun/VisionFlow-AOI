@@ -33,6 +33,7 @@ from devices.sapera_api import (
     SaperaVersions,
     dotnet_exception_name,
     locate_assembly,
+    describe_buffer_ctors,
     select_buffer_class,
     translate_exception,
 )
@@ -280,6 +281,30 @@ class BufferClassSelectionTests(unittest.TestCase):
         ):
             with self.subTest(signatures=signatures):
                 self.assertEqual(select_buffer_class(signatures), ("", 0))
+
+    def test_sapera_declares_the_source_as_the_xfer_node_base_class(self):
+        """Field `050503`: the real constructor takes `SapXferNode`, which v1.7.4 rejected by name."""
+
+        node = f"{SAPERA_NAMESPACE}.SapXferNode"
+        signatures = {
+            "SapBufferWithTrash": [(self.INT32, node, self.MEM)],
+            "SapBuffer": [(self.INT32, node, self.MEM)],
+        }
+        self.assertEqual(select_buffer_class(signatures), ("SapBufferWithTrash", 1))
+
+    def test_reflected_base_types_are_accepted_as_the_source(self):
+        base = f"{SAPERA_NAMESPACE}.SapAcqXferNode"
+        signatures = {"SapBufferWithTrash": [(self.INT32, base, self.MEM)]}
+
+        self.assertEqual(select_buffer_class(signatures), ("", 0), "an unknown type is not guessed")
+        self.assertEqual(select_buffer_class(signatures, (self.ACQ, base)), ("SapBufferWithTrash", 1))
+
+    def test_describe_buffer_ctors_lists_what_the_machine_offers(self):
+        text = describe_buffer_ctors(
+            {"SapBufferWithTrash": [(self.INT32, f"{SAPERA_NAMESPACE}.SapXferNode", self.MEM)], "SapBuffer": []}
+        )
+        self.assertIn("SapBufferWithTrash(Int32, SapXferNode, SapBuffer+MemoryType)", text)
+        self.assertIn("SapBuffer（無公開建構子）", text)
 
     def test_manifest_does_not_require_the_disputed_trash_buffer_api(self):
         described = [member.describe() for member in SAPERA_API_MANIFEST]

@@ -332,7 +332,13 @@ namespace DALSA.SaperaLT.SapClassBasic
         public int Value { get; set; }
     }
 
-    public class SapAcquisition : IDisposable
+    // Real Sapera declares buffer sources as SapXferNode; SapAcquisition derives from it, which is why
+    // `new SapBufferWithTrash(2, acquisition, ...)` compiles in the reference app (field report 050503).
+    public abstract class SapXferNode
+    {
+    }
+
+    public class SapAcquisition : SapXferNode, IDisposable
     {
         public enum Prm
         {
@@ -636,7 +642,7 @@ namespace DALSA.SaperaLT.SapClassBasic
 
     public class SapBufferWithTrash : SapBuffer
     {
-        public SapBufferWithTrash(int count, SapAcquisition acquisition, MemoryType memoryType)
+        public SapBufferWithTrash(int count, SapXferNode srcNode, MemoryType memoryType)
         {
             StubHardware.Record("SapBufferWithTrash(" + count + "," + memoryType + ")");
         }

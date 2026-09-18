@@ -91,7 +91,7 @@ S8 PASS 已斷線並清理完整報告：outputs\logs\camera\sapera-diagnose-202
 | --- | --- | --- | --- |
 | S1 | Sapera 安裝與版本 | 機台找得到 Sapera 安裝目錄，且 `SapClassBasic.dll` 的檔案版本是 8.60 | `S1 PASS Sapera 8.60`，或 `E-0104`／`E-0201` |
 | S2 | 載入 SapClassBasic.dll | pythonnet／.NET Framework 可用，且機台自己的 managed DLL 載得進來（版本未與 runtime 不符） | `S2 PASS managed …／runtime …`，或 `E-0101`～`E-0203` |
-| S3 | Sapera API 自檢 | 相機程式用到的每個 .NET 成員都在這台機器的 DLL 裡（反射檢查，尚未碰硬體） | `S3 PASS`，或 `E-0301` 加上缺少的成員名稱 |
+| S3 | Sapera API 自檢 | 相機程式用到的每個 .NET 成員都在這台機器的 DLL 裡（反射檢查，尚未碰硬體） | `S3 PASS`，或 `E-0301` 加上缺少的成員名稱，或 `E-0506`（沒有可用的 buffer 建構子） |
 | S4 | 列舉 server／resource／CCF | 擷取卡 server、Acq／AcqDevice 數量與名稱、`CamFiles\User` 內的 CCF 檔數量 | `S4 PASS n 個 server、CCF m 個（檔名）`，或 `E-0401`／`E-0402`／`E-0403` |
 | S5 | 建立並釋放 Sapera 物件 | `SapAcqDevice`、`SapAcquisition`、`SapBufferWithTrash`、`SapAcqToBuf` 依相機順序建立後再完整釋放 | `S5 PASS 建立並釋放 n 個物件`，或 `E-0404`、`E-0502`～`E-0504`、`E-0801` |
 | S6 | 連線並寫入參數後讀回 | 真正用 `SaperaLineScanCamera` 連線、寫入 Exposure／Gain／Length／Line Rate／觸發並讀回 | `S6 PASS 參數寫入並讀回 n 項`，或 `E-0402`～`E-0404`／`E-0502`～`E-0505`／`E-0601`～`E-0607`／`E-0704` |
@@ -129,9 +129,10 @@ S8 PASS 已斷線並清理完整報告：outputs\logs\camera\sapera-diagnose-202
 | E-0404 | 尚未選擇 Sapera 擷取卡（server） | 機台設定檔沒有 server、設定檔不在工作目錄的 `config\ccd_machine.json` | 在 CCD 頁「Sapera 位置」選擇擷取卡後再診斷；報告開頭會寫出實際讀取的設定檔路徑 |
 | E-0501 | `SapAcqDevice` 建立失敗 | 相機未上電、Camera Link 線未接、AcqDevice 位置錯 | 檢查相機電源與 Camera Link 線；確認相機 feature 的 server#index |
 | E-0502 | `SapAcquisition` 建立失敗 | CCF 與卡不符、資源被佔用 | 確認 CCF 對應這張卡；關閉其他取像程式後重試 |
-| E-0503 | `SapBuffer 建立失敗` | 記憶體不足、Scatter-Gather 記憶體不可用 | 關閉其他吃記憶體的程式後重試；確認 Sapera 記憶體驅動正常 |
+| E-0503 | `SapBuffer` 建立失敗（`Create()` 回傳 false 或建構時例外） | 記憶體不足、Scatter-Gather 記憶體不可用、CCF 的 buffer 尺寸過大 | 關閉其他吃記憶體的程式後重試；確認 Sapera 記憶體驅動正常 |
 | E-0504 | `SapAcqToBuf` 建立失敗 | 前一個物件（buffer／acquisition）未正確建立 | 先看 S5 短碼中較早的錯誤碼，通常是被前面失敗連帶影響 |
 | E-0505 | 未偵測到相機訊號 | 相機未上電、線材鬆脫、線材損壞 | 檢查相機電源與 Camera Link 線；確認相機燈號 |
+| E-0506 | 找不到可用的 SapBuffer 建構子 | 這台機器的 Sapera 版本提供的 `SapBufferWithTrash`／`SapBuffer` 建構子形狀與程式預期不同（S3 就會回報，不碰硬體） | 回報 `030506`；報告檔會列出機台實際提供的建構子（例如 `SapBufferWithTrash(Int32, SapXferNode, SapBuffer+MemoryType)`），需要改程式 |
 | E-0601 | Internal Line Rate 寫入失敗 | 相機不支援 `AcquisitionLineRate`、板卡內部線觸發不可用 | 確認線速在允許範圍；必要時降低線速後重試 |
 | E-0602 | Exposure 寫入失敗 | 相機沒有可寫的曝光 feature、值超出範圍 | 用 CamExpert 確認曝光 feature 名稱與可寫範圍 |
 | E-0603 | Gain 寫入失敗 | 相機沒有 Gain feature、值超出範圍 | 用 CamExpert 確認 Gain 可寫範圍 |
@@ -147,7 +148,7 @@ S8 PASS 已斷線並清理完整報告：outputs\logs\camera\sapera-diagnose-202
 | E-0801 | Sapera 物件清理失敗 | Destroy／Dispose 卡住、驅動已異常 | 重新連線；若持續出現請重開機並記錄當時的 S6 結果 |
 | E-0901 | Sapera 呼叫發生未預期錯誤 | 上述分類以外的例外 | 把整行短碼抄回，並記下當時操作步驟 |
 
-> 交叉檢查結果：`ERROR_MESSAGES` 目前有 **31** 個錯誤碼，本表逐一列出 31 個，沒有缺漏、
+> 交叉檢查結果：`ERROR_MESSAGES` 目前有 **32** 個錯誤碼，本表逐一列出 32 個，沒有缺漏、
 > 也沒有文件裡多出來的字號。每個字號都能寫出上表那一欄「機台上怎麼處理」的具體動作；
 > 其中 `E-0203` 是提醒而非中斷（版本不符仍會繼續嘗試），`E-0401`／`E-0402` 的現場
 > 動作相近（都是驅動與硬體檢查），回報時請一併抄回 S4 那一行以便區分。
