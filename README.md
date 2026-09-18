@@ -8,7 +8,7 @@ CPU-only 是完整支援的執行模式，也是結果正確性的基準。專�
 
 | 項目 | 現況 |
 |---|---|
-| 最新發行版 | [VisionFlow AOI v1.6.2](https://github.com/wjcudalearning/VisionFlow/releases/tag/v1.6.2)，Windows x64、CUDA `sm_86` |
+| 最新發行版 | [VisionFlow AOI v1.6.3](https://github.com/wjcudalearning/VisionFlow/releases/tag/v1.6.3)，Windows x64、CUDA `sm_86` |
 | 支援環境 | Windows 10／11、Python 3.13 |
 | 檢測方式 | 10 個傳統 CV Detector + 1 個 YOLOX Detector |
 | 操作入口 | CLI、PySide6 GUI、批次資料夾、資料夾監控、相機直連監控 |
@@ -344,7 +344,7 @@ CUDA DLL 建置與驗證：
 .\gpu\build_cuda_dll.ps1 -RunTests
 ```
 
-目前 v1.6.2 在 RTX 3090 的合成正式尺寸案例（16384×13000、6 個 12000×2000 ROI、`202-CS-SN-1`）量得端到端 CPU 5453.3 ms、GPU 397.7 ms，median speedup 13.71×，3/3 輪判定欄位一致。這只代表該版本、硬體、影像幾何與 Detector，不可外推到真實產品。
+目前 v1.6.3 在 RTX 3090 的合成正式尺寸案例（16384×13000、6 個 12000×2000 ROI、`202-CS-SN-1`）量得端到端 CPU 5392.9 ms、GPU 271.5 ms，median speedup 19.86×，5/5 輪判定欄位一致。這只代表該版本、硬體、影像幾何與 Detector，不可外推到真實產品。
 
 完整的 ABI、resident image、傳輸量、CPU/GPU 等價、benchmark 口徑、已撤回方案與 RTX 指令請閱讀 [`gpu/README.md`](gpu/README.md)。
 

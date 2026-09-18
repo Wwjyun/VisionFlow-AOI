@@ -765,6 +765,15 @@ RTX 3090 正式尺寸（202-CS-SN-1，4 張批量各 3 次，median）：
 操作（其間開始的檢測在 session 上排隊）。offscreen `MainWindow` 全新 process 各 3 次，第一次檢測使用者等待
 median 467.8 ms（無自動預熱）→ 268.9 ms（自動預熱後），與第二次 266 ms 相當，判定全部 NG／558 defects。
 
+### v1.6.3 CUDA-enabled 發行範圍
+
+v1.6.3 收錄本頁「Session 重用 host 影像緩衝與 pinned 註冊」「GUI／批量／監控共用 GPU session」與 CUDA context
+逐類顯存統計（`vf_context_memory_stats_v1`）。發行 DLL 在最後一次 CUDA source 修改後以 CUDA 13.3、MSVC x64、
+`sm_86` 重編，發行前於 RTX 3090（Driver 610.62）重新執行 native smoke 與 `validate_cuda_dll.py --benchmark 5`
+通過；之後的 v1.6.3 提交未修改 CUDA source/header。DLL SHA-256 為
+`38433800568FAB7BBD8E7007A970ADE20B11B2960FEDD319829C78B8167B2345`；新增 export 皆為 optional，ABI v1
+舊 DLL 相容。正式尺寸基準為 CPU 5392.9 ms、GPU 271.5 ms（median，19.86×），5/5 輪判定欄位相同。
+
 ### v1.6.2 CUDA-enabled 發行範圍
 
 v1.6.2 收錄本頁「CCL＋ring CNR 留在 device」、「ring 統計平行化」、「BMP 平行 reader」、profiler／
