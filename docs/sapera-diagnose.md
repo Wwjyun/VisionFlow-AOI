@@ -62,6 +62,8 @@ S8 PASS 已斷線並清理完整報告：outputs\logs\camera\sapera-diagnose-202
 | `9998` | 這一步 FAIL 但沒有錯誤碼（細節只在報告檔） |
 | 其他四位 | 該步驟的錯誤碼，例如 `0602` ＝ `E-0602`（Exposure 寫入失敗） |
 
+**同一步有多個錯誤時會緊接著多列幾組**，前兩碼相同：例如 `060601 060602` 代表 S6 的線速率與曝光都寫入失敗。整列照抄即可，組數不一定是 8 組。
+
 範例：`060602` ＝ 第 6 步失敗、錯誤碼 `E-0602`；`010000` ＝ 第 1 步通過；
 `079999` ＝ 第 7 步略過。所以完整的回報可以是這一列：
 
@@ -94,7 +96,7 @@ S8 PASS 已斷線並清理完整報告：outputs\logs\camera\sapera-diagnose-202
 | S3 | Sapera API 自檢 | 相機程式用到的每個 .NET 成員都在這台機器的 DLL 裡（反射檢查，尚未碰硬體） | `S3 PASS`，或 `E-0301` 加上缺少的成員名稱，或 `E-0506`（沒有可用的 buffer 建構子） |
 | S4 | 列舉 server／resource／CCF | 擷取卡 server、Acq／AcqDevice 數量與名稱、`CamFiles\User` 內的 CCF 檔數量 | `S4 PASS n 個 server、CCF m 個（檔名）`，或 `E-0401`／`E-0402`／`E-0403` |
 | S5 | 建立並釋放 Sapera 物件 | `SapAcqDevice`、`SapAcquisition`、`SapBufferWithTrash`、`SapAcqToBuf` 依相機順序建立後再完整釋放 | `S5 PASS 建立並釋放 n 個物件`，或 `E-0404`、`E-0502`～`E-0504`、`E-0801` |
-| S6 | 連線並寫入參數後讀回 | 真正用 `SaperaLineScanCamera` 連線、寫入 Exposure／Gain／Length／Line Rate／觸發並讀回 | `S6 PASS 參數寫入並讀回 n 項`，或 `E-0402`～`E-0404`／`E-0502`～`E-0505`／`E-0601`～`E-0607`／`E-0704` |
+| S6 | 連線並寫入參數後讀回 | 真正用 `SaperaLineScanCamera` 連線、寫入 Exposure／Gain／Length／Line Rate／觸發並讀回 | `S6 PASS 參數寫入並讀回 n 項`，或 `E-0402`～`E-0404`／`E-0502`～`E-0505`／`E-0601`～`E-0608`／`E-0704` |
 | S7 | Snap 一張並檢查影像 | Snap 一張，檢查影像尺寸與灰階統計（min／max／mean） | `S7 PASS 寬×高 min.. max.. mean..`，或 `E-0701`～`E-0705` |
 | S8 | 斷線與清理 | 斷線並釋放所有 Sapera 物件，失敗會單獨回報 | `S8 PASS 已斷線並清理`，或 `E-0801` |
 
@@ -106,8 +108,8 @@ S8 PASS 已斷線並清理完整報告：outputs\logs\camera\sapera-diagnose-202
   硬體存取從 S5 才開始。
 - **S5 建立後立即釋放**：目的是單獨驗證物件能不能建立，不影響後面的 S6。沒有選 server 時直接`E-0404`，不碰硬體；`SapAcquisition`／buffer／`SapAcqToBuf` 任一建立失敗時 S5 就是 FAIL（`SapAcqDevice` 失敗只記在報告，相機 feature 寫入由 S6 回報）。
 - **S7 有等待上限**：最多等 5 秒，逾時即 `E-0702`，不會卡住畫面。
-- **S8 只要 S6 連上就會執行**：即使 S6 是「連上但參數寫入失敗」，S8 仍會斷線並
-  回報清理結果。
+- **S7、S8 只要 S6 連上就會執行**：即使 S6 是「連上但參數寫入失敗」，S7 仍會 Snap 一張，
+  S8 仍會斷線並回報清理結果，一次診斷就能看到取像結果。S6 沒有連上時兩者才 SKIP。
 
 ## 錯誤碼表
 
@@ -133,13 +135,14 @@ S8 PASS 已斷線並清理完整報告：outputs\logs\camera\sapera-diagnose-202
 | E-0504 | `SapAcqToBuf` 建立失敗 | 前一個物件（buffer／acquisition）未正確建立 | 先看 S5 短碼中較早的錯誤碼，通常是被前面失敗連帶影響 |
 | E-0505 | 未偵測到相機訊號 | 相機未上電、線材鬆脫、線材損壞 | 檢查相機電源與 Camera Link 線；確認相機燈號 |
 | E-0506 | 找不到可用的 SapBuffer 建構子 | 這台機器的 Sapera 版本提供的 `SapBufferWithTrash`／`SapBuffer` 建構子形狀與程式預期不同（S3 就會回報，不碰硬體） | 回報 `030506`；報告檔會列出機台實際提供的建構子（例如 `SapBufferWithTrash(Int32, SapXferNode, SapBuffer+MemoryType)`），需要改程式 |
-| E-0601 | Internal Line Rate 寫入失敗 | 相機不支援 `AcquisitionLineRate`、板卡內部線觸發不可用 | 確認線速在允許範圍；必要時降低線速後重試 |
+| E-0601 | 相機 Line Rate（`AcquisitionLineRate`）寫入失敗 | 以 Int64、小數字串、整數字串三種寫法都被相機拒絕：要求值低於相機最低線速率、feature 唯讀 | 報告檔會列出寫入前的值與存取模式；在 CamExpert 確認 `AcquisitionLineRate` 的可寫範圍，Recipe 的線速率改在範圍內 |
 | E-0602 | Exposure 寫入失敗 | 相機沒有可寫的曝光 feature、值超出範圍 | 用 CamExpert 確認曝光 feature 名稱與可寫範圍 |
 | E-0603 | Gain 寫入失敗 | 相機沒有 Gain feature、值超出範圍 | 用 CamExpert 確認 Gain 可寫範圍 |
 | E-0604 | Length（`CROP_HEIGHT`）寫入失敗 | 板卡不支援此參數、值超出範圍 | 確認 Length 在板卡允許範圍；對照 CamExpert 的 CROP_HEIGHT |
 | E-0605 | 外部觸發參數寫入失敗 | `EXT_LINE_TRIGGER_ENABLE` 寫不進去、CC1 對應錯誤 | 確認米輪編碼器接線與 CC1；用 CamExpert 檢查外部線觸發設定 |
 | E-0606 | One Frame（`EXT_FRAME_TRIGGER_ENABLE`）寫入失敗 | 板卡不支援單張模式 | 確認觸發模式；必要時改用連續模式測試 |
 | E-0607 | 外部觸發未 arm | 外部線觸發沒有真的開啟 | 確認米輪有在轉、編碼器脈衝有進來後重新連線 |
+| E-0608 | 板卡內部線觸發（`INT_LINE_TRIGGER`）寫入失敗 | 板卡的 `INT_LINE_TRIGGER_ENABLE`／`FREQ` 寫不進去（連續模式） | 報告檔列出要求值、限制後的值與讀回值；用 CamExpert 確認板卡 Internal Line Trigger 設定 |
 | E-0701 | Snap 啟動失敗 | `SapAcqToBuf.Snap()` 被拒、前一次取像尚未結束 | 停止預覽後再試；必要時重新連線 |
 | E-0702 | 等待影像逾時 | 沒有觸發（外部觸發未 arm）、相機沒送圖 | 連續模式先確認能取像；外部模式確認米輪脈衝 |
 | E-0703 | 影像複製失敗 | `ReadRect` 失敗、buffer 尚未建立 | 重新連線後再試；持續失敗通常是驅動或記憶體問題 |
@@ -148,7 +151,7 @@ S8 PASS 已斷線並清理完整報告：outputs\logs\camera\sapera-diagnose-202
 | E-0801 | Sapera 物件清理失敗 | Destroy／Dispose 卡住、驅動已異常 | 重新連線；若持續出現請重開機並記錄當時的 S6 結果 |
 | E-0901 | Sapera 呼叫發生未預期錯誤 | 上述分類以外的例外 | 把整行短碼抄回，並記下當時操作步驟 |
 
-> 交叉檢查結果：`ERROR_MESSAGES` 目前有 **32** 個錯誤碼，本表逐一列出 32 個，沒有缺漏、
+> 交叉檢查結果：`ERROR_MESSAGES` 目前有 **33** 個錯誤碼，本表逐一列出 33 個，沒有缺漏、
 > 也沒有文件裡多出來的字號。每個字號都能寫出上表那一欄「機台上怎麼處理」的具體動作；
 > 其中 `E-0203` 是提醒而非中斷（版本不符仍會繼續嘗試），`E-0401`／`E-0402` 的現場
 > 動作相近（都是驅動與硬體檢查），回報時請一併抄回 S4 那一行以便區分。

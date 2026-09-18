@@ -29,7 +29,7 @@ from devices.ccd_settings_store import CcdMachineSettingsStore
 from devices.factory import CcdDevices
 from devices.sapera_api import SaperaVersions
 from devices.sapera_camera import ApplyNote
-from devices.sapera_diagnose import DiagnoseReport, DiagnoseStep, STEP_TITLES
+from devices.sapera_diagnose import DiagnoseNote, DiagnoseReport, DiagnoseStep, STEP_TITLES
 from devices.simulated import SimulatedLineScanCamera, SimulatedMeterWheel
 from gui.ccd_controller import CcdController
 from gui.sapera_diagnostics import (
@@ -571,6 +571,23 @@ class SaperaGuiTests(unittest.TestCase):
         self.assertTrue(controller.start_camera_diagnose())
         self.assertTrue(_wait_until(self.app, lambda: not controller.diagnose_running))
         self.assertEqual(len(calls), 1)
+
+    def test_panel_numeric_row_lists_every_code_of_a_failed_step(self):
+        camera = FakeSaperaCamera(versions=SaperaVersions(assembly_file_version="8.60.0.0"))
+        screen, _controller = self._screen(camera)
+        screen.set_mode("admin")
+        steps = list(self._diagnose_steps())
+        steps[5] = _step(
+            "S6",
+            "FAIL",
+            "S6 FAIL E-0601 相機 Line Rate（AcquisitionLineRate）寫入失敗",
+            (DiagnoseNote("E-0601", "[Internal Line Rate] …"), DiagnoseNote("E-0602", "[Exposure] …")),
+        )
+
+        screen.set_sapera_diagnose_report(_report(tuple(steps)))
+
+        text = screen.sapera_diagnose_result_label.text()
+        self.assertIn("數字短碼（優先抄這組）：010000 020000 030000 040000 050000 060601 060602 070000 080000", text)
 
     def test_failing_report_keeps_the_failing_short_code_visible(self):
         camera = FakeSaperaCamera(versions=SaperaVersions(assembly_file_version="8.60.0.0"))

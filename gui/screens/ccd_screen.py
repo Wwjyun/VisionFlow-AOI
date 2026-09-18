@@ -783,7 +783,12 @@ class CcdScreen(QWidget):
 
         lines = tuple(str(line) for line in getattr(report, "lines", lambda: ())())
         summary = str(getattr(report, "summary", lambda: "")())
-        numeric = tuple(str(code) for code in getattr(report, "numeric_lines", lambda: ())())
+        # The full row also carries a failed step's other codes (e.g. `060601 060602`).
+        row = getattr(report, "numeric_line", None)
+        numeric = (str(row()),) if callable(row) else tuple(
+            str(code) for code in getattr(report, "numeric_lines", lambda: ())()
+        )
+        numeric = tuple(code for code in numeric if code)
         self.sapera_diagnose_lines = lines
         self._refresh_sapera_diagnostics_controls()
         if not lines and not summary:

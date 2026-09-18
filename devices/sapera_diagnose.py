@@ -154,9 +154,13 @@ class DiagnoseReport:
         return tuple(numeric_code(step) for step in self.steps)
 
     def numeric_line(self) -> str:
-        """All step codes on one line, space separated, for a single hand-copied row."""
+        """All step codes on one line, space separated, for a single hand-copied row.
 
-        return " ".join(self.numeric_lines())
+        A failed step may add groups for its other failures right after its own, e.g.
+        `060601 060602` when S6 failed both the line rate and the exposure write.
+        """
+
+        return " ".join(group for step in self.steps for group in numeric_codes(step))
 
     def summary(self) -> str:
         return self.summary_text or _summary_text(self.steps)
@@ -196,6 +200,27 @@ def numeric_code(step: DiagnoseStep) -> str:
         match = _ERROR_CODE_RE.search(str(step.short))
         cause = match.group(1) if match else _NUMERIC_FAIL_NO_CODE
     return f"{step_part}{cause}"
+
+
+_MAX_EXTRA_NUMERIC = 4
+
+
+def numeric_codes(step: DiagnoseStep) -> tuple[str, ...]:
+    """The step's own group, then (FAIL only) one group per other distinct code in its details."""
+
+    primary = numeric_code(step)
+    if step.status != "FAIL":
+        return (primary,)
+    step_part = primary[:2]
+    seen = {primary[2:]}
+    extra: list[str] = []
+    for note in step.details:
+        match = _ERROR_CODE_RE.fullmatch(str(note.code or ""))
+        if not match or match.group(1) in seen:
+            continue
+        seen.add(match.group(1))
+        extra.append(f"{step_part}{match.group(1)}")
+    return (primary, *extra[:_MAX_EXTRA_NUMERIC])
 
 
 def numeric_legend() -> dict[str, str]:
@@ -712,7 +737,11 @@ def _step_s6(
     notes = tuple(camera.apply_notes())
     context.add(f"連線狀態：{status.state.value}、{status.frame_width}×{status.frame_height}、訊號 {'有' if status.has_signal else '無'}")
     for note in notes:
-        context.add(f"[{note.item}] {note.line()}")
+        if note.code:
+            # Coded so every failed write, not only the first, reaches the numeric row.
+            context.add_note(note.code, f"[{note.item}] {note.item}：{note.detail}")
+        else:
+            context.add(f"[{note.item}] {note.line()}")
     context.add("板卡參數讀回：" + _readback(acquisition))
     failures = [note for note in notes if note.code]
     if failures:
@@ -824,7 +853,7 @@ def _steps_payload(steps: tuple[DiagnoseStep, ...]) -> list[dict]:
             "code": step.code,
             "title": step.title,
             "status": step.status,
-            "numeric": numeric_code(step),
+            "numeric": " ".join(numeric_codes(step)),
             "short": step.short,
             "details": [note.line() for note in step.details],
         }
@@ -978,7 +1007,9 @@ def run_sapera_diagnose(
             ("S7", lambda: _step_s7(context, camera, lambda: _wait_for_frame(camera, session_clock))),
         ):
             note_from = len(context.notes)
-            if status != "PASS":
+            # A connected camera whose parameter writes partly failed still gets one Snap: the
+            # reference app keeps connecting after such writes, and every field trip is expensive.
+            if status != "PASS" and not (code == "S7" and connected):
                 _skip(context, code, "前一步失敗", note_from, results)
                 continue
             status, short = _run_guarded(context, code, action)
@@ -1012,7 +1043,7 @@ def run_sapera_diagnose(
         "schema": DIAGNOSE_SCHEMA,
         "timestamp": stamp,
         "summary": summary,
-        "numeric": " ".join(numeric_code(step) for step in steps),
+        "numeric": " ".join(group for step in steps for group in numeric_codes(step)),
         "passed": bool(steps) and all(step.status == "PASS" for step in steps),
         "versions": {
             "assembly_path": versions.assembly_path,

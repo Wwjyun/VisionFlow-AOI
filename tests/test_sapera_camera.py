@@ -49,6 +49,8 @@ class FakeSaperaInterop:
         self.servers = {"System": {"Acq": 0, "AcqDevice": 0}, SERVER: {"Acq": 1, "AcqDevice": 1}}
         self.features = {name: "0" for name in ("AcquisitionLineRate", "ExposureTime", "Gain", "TriggerSelector", "TriggerMode", "TriggerSource")}
         self.read_only_features: set[str] = set()
+        # Float features that reject the Int64 overload (GenICam AcquisitionLineRate is a Float).
+        self.int64_rejected: set[str] = set()
         self.params = {name: 0 for name in ACQ_PARAMETERS}
         self.params.update(INT_LINE_TRIGGER_FREQ_MIN=100, INT_LINE_TRIGGER_FREQ_MAX=40000)
         self.missing_params = {"CAM_LINE_TRIGGER_FREQ_MIN", "CAM_LINE_TRIGGER_FREQ_MAX"}
@@ -137,7 +139,7 @@ class FakeSaperaInterop:
 
     def set_feature_int64(self, device, name, value):
         self._record("set_feature_int64", name, value)
-        if name not in self.features or name in self.read_only_features:
+        if name not in self.features or name in self.read_only_features or name in self.int64_rejected:
             return False
         self.features[name] = str(value)
         return True
@@ -376,6 +378,50 @@ class ConnectSequenceTests(SaperaCameraTestBase):
         self.assertEqual(status.state, CameraState.IDLE)
         self.assertIn("E-0602", status.message)
         self.assertIn("E-0603", status.message)
+
+    def test_line_rate_falls_back_to_text_when_the_float_feature_rejects_int64(self):
+        """Field `060601`: the port only tried Int64; xx_ccd also writes the decimal and integer text."""
+
+        self.interop.int64_rejected.add("AcquisitionLineRate")
+        self.connect(internal_line_rate_hz=5000)
+
+        writes = [call for call in self.interop.calls if call[0].startswith("set_feature") and call[1] == "AcquisitionLineRate"]
+        self.assertEqual(
+            writes,
+            [
+                ("set_feature_int64", "AcquisitionLineRate", 5000),
+                ("set_feature_string", "AcquisitionLineRate", "5000.00"),
+            ],
+        )
+        self.assertEqual(self.interop.features["AcquisitionLineRate"], "5000.00")
+        self.assertEqual([note.code for note in self.camera.apply_notes() if note.code], [])
+        line_rate = next(note for note in self.camera.apply_notes() if note.item == "Internal Line Rate")
+        self.assertIn("String", line_rate.detail)
+
+    def test_camera_line_rate_that_rejects_every_form_is_e0601_and_names_the_access_mode(self):
+        self.interop.read_only_features.add("AcquisitionLineRate")
+        status = self.connect()
+
+        self.assertEqual(status.state, CameraState.IDLE, "a rejected line rate never blocks the connection")
+        failed = [note for note in self.camera.apply_notes() if note.code]
+        self.assertEqual([note.code for note in failed], ["E-0601"])
+        self.assertIn("ReadOnly", failed[0].detail)
+        attempts = [call[0] for call in self.interop.calls if call[0].startswith("set_feature") and call[1] == "AcquisitionLineRate"]
+        self.assertEqual(attempts, ["set_feature_int64", "set_feature_string", "set_feature_string"])
+
+    def test_board_internal_line_trigger_failure_has_its_own_code(self):
+        original = self.interop.acq_set_int
+
+        def reject_frequency(acquisition, name, value):
+            if name == "INT_LINE_TRIGGER_FREQ":
+                self.interop._record("set_int", name, value)
+                return False
+            return original(acquisition, name, value)
+
+        self.interop.acq_set_int = reject_frequency
+        self.connect()
+
+        self.assertEqual([note.code for note in self.camera.apply_notes() if note.code], ["E-0608"])
 
     def test_multiple_acq_devices_require_selection_but_connection_continues(self):
         self.interop.servers[SERVER]["AcqDevice"] = 2

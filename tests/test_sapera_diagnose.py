@@ -545,18 +545,38 @@ class MissingApiMemberTests(DiagnoseHarness):
 
 
 class ParameterWriteFailureTests(DiagnoseHarness):
-    """A camera that connects but cannot write one parameter: S6 FAIL, S7 SKIP, S8 still cleans up."""
+    """A camera that connects but cannot write one parameter: S6 FAIL, S7 still snaps, S8 cleans up."""
 
-    def test_s6_failure_uses_the_documented_short_line_and_s8_still_runs(self):
+    def test_s6_failure_uses_the_documented_short_line_and_s7_s8_still_run(self):
         self.interop.features.pop("ExposureTime")  # no Exposure feature left to write
         report = self.run_diagnose()
 
         self.assertEqual(self.statuses(report)[:5], ["PASS", "PASS", "PASS", "PASS", "PASS"])
         self.assertEqual(report.steps[5].short, "S6 FAIL E-0602 Exposure 寫入失敗")
-        self.assertEqual(report.steps[6].status, "SKIP")
+        # Field `060601`: S7 used to be skipped although the camera was connected.
+        self.assertEqual(report.steps[6].status, "PASS")
         self.assertEqual(report.steps[7].status, "PASS")
+        self.assertEqual(report.numeric_line().split()[5:], ["060602", "070000", "080000"])
         self.assertFalse(report.passed)
         self.assertIn("E-0602", Path(report.report_path).read_text(encoding="utf-8"))
+
+    def test_every_failed_write_reaches_the_numeric_row_after_its_step(self):
+        self.interop.features.pop("AcquisitionLineRate")
+        self.interop.features.pop("ExposureTime")
+        report = self.run_diagnose()
+
+        self.assertEqual(report.steps[5].short, "S6 FAIL E-0601 相機 Line Rate（AcquisitionLineRate）寫入失敗")
+        self.assertEqual(report.numeric_lines()[5], "060601", "one group per step stays available")
+        self.assertEqual(report.numeric_line().split()[5:], ["060601", "060602", "070000", "080000"])
+        payload = json.loads(Path(report.log_path).read_text(encoding="utf-8"))
+        self.assertIn("060601 060602", payload["numeric"])
+
+    def test_s7_is_skipped_when_s6_could_not_connect(self):
+        camera = SaperaLineScanCamera(interop=self.interop, clock=FakeMonotonic())
+        with patch.object(camera, "connect", side_effect=SaperaError("E-0502", "Create() 回傳 false")):
+            report = self.run_diagnose(camera=camera)
+
+        self.assertEqual([step.status for step in report.steps[5:]], ["FAIL", "SKIP", "SKIP"])
 
     def test_a_parameter_write_failure_never_hides_the_readback_report(self):
         self.interop.features.pop("ExposureTime")

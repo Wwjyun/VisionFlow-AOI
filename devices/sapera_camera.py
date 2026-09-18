@@ -454,11 +454,27 @@ class SaperaLineScanCamera(LineScanCamera):
             log.fail("E-0601", "Internal Line Rate", f"{LINE_RATE_FEATURE} 不存在")
             return False
         before = self._quiet(lambda: interop.get_feature_string(device, LINE_RATE_FEATURE), None)
-        if self._quiet(lambda: interop.set_feature_int64(device, LINE_RATE_FEATURE, int(line_rate_hz))):
-            readback = self._quiet(lambda: interop.get_feature_string(device, LINE_RATE_FEATURE), None)
-            log.ok("Internal Line Rate", f"{LINE_RATE_FEATURE}={int(line_rate_hz)}（Int64）寫入前 {_fmt(before)} 讀回 {_fmt(readback)}")
-            return True
-        log.fail("E-0601", "Internal Line Rate", f"{LINE_RATE_FEATURE}={int(line_rate_hz)} 寫入失敗，寫入前 {_fmt(before)}")
+        rate = int(line_rate_hz)
+        # xx_ccd TrySetNotebookInternalLineRateFeatures: Int64, then the decimal text, then the integer
+        # text. GenICam declares AcquisitionLineRate as a Float, which may reject the Int64 overload
+        # (field report `060601` came from a port that only tried Int64).
+        attempts = (
+            ("Int64", lambda: interop.set_feature_int64(device, LINE_RATE_FEATURE, rate)),
+            ("String", lambda: interop.set_feature_string(device, LINE_RATE_FEATURE, f"{float(rate):.2f}")),
+            ("String", lambda: interop.set_feature_string(device, LINE_RATE_FEATURE, str(rate))),
+        )
+        for kind, attempt in attempts:
+            if self._quiet(attempt):
+                readback = self._quiet(lambda: interop.get_feature_string(device, LINE_RATE_FEATURE), None)
+                log.ok("Internal Line Rate", f"{LINE_RATE_FEATURE}={rate}（{kind}）寫入前 {_fmt(before)} 讀回 {_fmt(readback)}")
+                return True
+        access = self._quiet(lambda: interop.feature_access_mode(device, LINE_RATE_FEATURE), None)
+        log.fail(
+            "E-0601",
+            "Internal Line Rate",
+            f"{LINE_RATE_FEATURE}={rate} 以 Int64／字串皆寫入失敗，寫入前 {_fmt(before)}、存取 {_fmt(access)}"
+            "（要求值可能低於相機最低線速率）",
+        )
         return False
 
     def _write_exposure(self, interop, device, exposure_time: float, log: _ApplyLog) -> bool:
@@ -642,7 +658,8 @@ class SaperaLineScanCamera(LineScanCamera):
         if enabled and freq_ok:
             log.ok("板卡 Internal Line Trigger", detail)
         else:
-            log.fail("E-0601", "板卡 Internal Line Trigger", detail)
+            # Its own code: the camera-side AcquisitionLineRate write keeps E-0601.
+            log.fail("E-0608", "板卡 Internal Line Trigger", detail)
 
     def _apply_external_line_trigger(self, interop, acq, trigger: TriggerSettings, log: _ApplyLog) -> None:
         """xx_ccd TryApplyExternalLineTrigger: one meter-wheel pulse per line, CamExpert Method 3 mapping."""
