@@ -1,6 +1,6 @@
 # ARTIFACTS.md — 未追蹤產物地圖
 
-本檔說明 repository 內**不進版控**的使用者產物放在哪裡、為什麼這樣分，以及搬動時的規則。這些檔案依 `AGENT.md` 一律不得 stage、不得刪除。整理日期：2026-09-14。
+本檔說明 repository 內**不進版控**的使用者產物放在哪裡、為什麼這樣分，以及搬動時的規則。這些檔案依 `AGENT.md` 一律不得 stage、不得刪除。整理日期：2026-09-14（2026-09-18 增列 `eiptest/` 與不變規則 7）。
 
 ## 目錄地圖
 
@@ -30,7 +30,12 @@
 cuda_course/                           30 天 CUDA 自學課程（Markdown，含練習題說明）
 interview_prep/                        面試準備教材 L00–L05＋README
 xx_ccd/                                線掃相機擷取 C# WinForms 專案（Sapera LT＋LSI-8181 米輪）
-                                       另一個 repository 的複本，只作 Todo.md P11 移植的行為參考
+                                       另一個 repository 的複本（自帶 `.git`，見不變規則 7）
+                                       只作 Todo.md P11 移植的行為參考，不帶進產線
+eiptest/                               Keyence PLC 通訊工具（KV-8000／KV-XLE02；上位鏈結 TCP 8501＋EtherNet/IP CIP）
+                                       另一個 repository 的複本（remote `keyence-plc-hud`，自帶 `.git`，見不變規則 7）
+                                       內含 Python `src/`、Electron `electron/`＋`frontend/`，以及 `env/`、`node_modules/` 本機依賴
+                                       用途：PLC 通訊層與逐排訊號的參考實作，對應 `docs/reports/Phase2_改動一_PLC逐排訊號評估.md`
 .codex_ppt_build/                      產生 `簡報/` 的 Node 工作區
   interview_deck.mjs / interview_deck_v2.mjs / arch_interview_deck.mjs / vp_decision_deck.mjs
                                        deck 產生腳本，輸出路徑已指向 `簡報/`
@@ -47,6 +52,7 @@ docs/reports/*.md                      尚未進版控的技術／階段報告�
 4. **`_backup_20260911/` 是凍結快照**，內容不再更新，其內部規格檔的 `output` 欄位仍指向舊路徑，屬預期現象。
 5. **`.codex_ppt_build/assets/` 是複本**，來源是 `架構圖/01`–`09` 的 PNG。重跑 deck 腳本前若要更新圖，先更新 `架構圖/`，再同步複製到 `assets/`。
 6. **重跑 deck 腳本會覆寫 `簡報/` 內的 pptx**，不會再產生根目錄檔案（4 個腳本的 `OUT` 已一併修正）。
+7. **`xx_ccd/` 與 `eiptest/` 是巢狀 repository，永遠不可 stage。** 兩者各自帶 `.git`，所以母 repo 的 `git status` 只會把它們各顯示成一行未追蹤項目（`?? xx_ccd/`、`?? eiptest/`），內部檔案不會展開；`git add -A`／`git add .` 會把它們收成 gitlink（子模組指標），既污染 VisionFlow 又會誤導另一個 repository 的歷史。要 stage 一律明列檔案路徑（見 `AGENT.md` 的 Git 規則）。巢狀 repo 內部若有未提交變更，須進該目錄自行 `git status` 才看得到。
 
 ## 已知狀況
 
