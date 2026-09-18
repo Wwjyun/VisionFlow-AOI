@@ -98,6 +98,50 @@ class ValueObjectTests(unittest.TestCase):
         self.assertEqual(SaveSettings(max_concurrent_saves=99).normalized().max_concurrent_saves, 8)
         self.assertEqual(CameraConnectionSettings(" srv ", -3).normalized().server_name, "srv")
 
+    def test_declared_ranges_cover_the_confirmed_production_camera(self):
+        """Xtium-CL MX4 + Linea Mono 16K (`LA-HM-16K05A-00-R`): 16384 px, 48 kHz maximum line rate.
+
+        The camera must be settable from the GUI and from a Recipe as shipped, so a narrowing of these
+        ranges below the real hardware has to fail here rather than on the camera machine.
+        """
+
+        from devices.ccd_models import (
+            EXPOSURE_RANGE,
+            GAIN_RANGE,
+            LENGTH_LINES_RANGE,
+            LINE_RATE_HZ_RANGE,
+        )
+
+        line_rate = 48_000
+        long_frame = 50_000  # 16384 × 50000 mono is the documented large-frame case (819 MB).
+        self.assertLessEqual(line_rate, LINE_RATE_HZ_RANGE[1])
+        self.assertLessEqual(long_frame, LENGTH_LINES_RANGE[1])
+        # 48000 Hz is a 20.8 µs line period; 30 Hz is 33.3 ms, both inside the exposure range.
+        self.assertLessEqual(20.8, EXPOSURE_RANGE[1])
+        self.assertGreaterEqual(EXPOSURE_RANGE[1], 33_333)
+        self.assertLessEqual(10.0, GAIN_RANGE[1])
+
+        acquisition = AcquisitionSettings(
+            exposure_time=20.8, gain=10.0, length_lines=long_frame, internal_line_rate_hz=line_rate
+        ).normalized()
+        self.assertEqual(acquisition.internal_line_rate_hz, line_rate)
+        self.assertEqual(acquisition.length_lines, long_frame)
+        self.assertEqual(acquisition.exposure_time, 20.8)
+
+    def test_confirmed_hardware_settings_survive_the_recipe_camera_section(self):
+        from devices.ccd_models import CameraRecipeSettings
+        from devices.ccd_recipe import camera_section, parse_camera_section
+
+        settings = CameraRecipeSettings(
+            acquisition=AcquisitionSettings(
+                exposure_time=20.8, gain=10.0, length_lines=50_000, internal_line_rate_hz=48_000
+            )
+        )
+        section = camera_section(settings)
+        self.assertEqual(section["internal_line_rate_hz"], 48_000)
+        self.assertEqual(section["length_lines"], 50_000)
+        self.assertEqual(parse_camera_section(section), settings)
+
 
 class SettingsStoreTests(unittest.TestCase):
     def test_round_trip_preserves_every_machine_setting_in_a_unicode_path(self):

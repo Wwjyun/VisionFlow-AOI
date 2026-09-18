@@ -131,6 +131,41 @@ S8 PASS 已斷線並清理完整報告：outputs\logs\camera\sapera-diagnose-202
 - 缺少 Sapera LT／pythonnet／相機時，診斷本身仍會跑完並以短碼回報原因；
   GUI、CLI、批次與監看模式的啟動不受影響。
 
+## 本產線硬體與預期結果
+
+| 項目 | 值 |
+| --- | --- |
+| 擷取卡 | Teledyne DALSA Xtium-CL MX4（`OR-Y4C0-XMX00`），Sapera `Acq` resource |
+| 相機 | Teledyne DALSA Linea Mono 16K（`LA-HM-16K05A-00-R`），Camera Link，Sapera `AcqDevice` resource |
+| 影像 | 16384 × `CROP_HEIGHT`、8-bit 單色（CCF 需設為 Mono8） |
+| 線速率 | 最高 48000 Hz（實際上下限由板卡 `INT_LINE_TRIGGER_FREQ_MIN/MAX` 與相機 `AcquisitionLineRate` 讀回決定） |
+| 外部觸發 | 米輪編碼器脈衝進 CC1，`LINE_INTEGRATE_METHOD_3`、`EXT_LINE_TRIGGER_ENABLE=1` |
+
+診斷跑完時，短碼應該長得像（數值依現場設定）：
+
+```text
+S1-S8：8 PASS、0 FAIL、0 SKIP
+S1 PASS Sapera 8.60
+S2 PASS managed 8.60.0.00／runtime 8.60.0.00
+S3 PASS API 成員齊全
+S4 PASS 2 個 server、CCF 1 個（line_scan.ccf）
+S5 PASS 建立並釋放 n 個物件
+S6 PASS 參數寫入並讀回 n 項
+S7 PASS 16384×720 min0 max255 mean128.3
+S8 PASS 已斷線並清理
+```
+
+判讀重點：
+
+- **S4 只列出一個 `Acq`（Xtium）與一個 `AcqDevice`（Linea）**。一個都沒有通常是卡未插好或驅動沒上；
+  server 名稱尾碼（`_1`、`_2`）依卡序變動，以列舉結果為準，不要照抄。
+- **S7 的寬度必須是 16384**。出現 8192／4096 代表 CCF 的 tap／幾何設定不對；寬度正確但長度不符
+  `CROP_HEIGHT` 代表 Length 沒寫進去。
+- **S7 只有 8-bit 單色會被接受**。`E-0704` 會直接寫出讀到的 `PIXEL_DEPTH` 與尺寸，請在 CamExpert
+  把 CCF 改成 Mono8 後重新匯出。
+- **S6 的 Exposure 讀回值必須小於線週期**（48000 Hz 時約 20.8 µs、30 Hz 時約 33 ms）。設定值大於
+  線週期時相機會自己夾住，讀回值與要求值不同是正常現象，報告會同時列出兩者。
+
 ## 已知限制
 
 - 診斷只涵蓋 xx_ccd 已確認的參數寫入路徑，不做 Live Features 或 Acq Params 全列舉；
