@@ -39,6 +39,12 @@ KNOWN_ASSEMBLY_SUBPATHS = (
 NATIVE_RUNTIME_FILE = "corapi.dll"
 TARGET_SAPERA_VERSION = "8.60.0.00.2120"
 DEFAULT_CCF_SUBDIR = ("CamFiles", "User")
+# Buffer classes in preference order. `SapBufferWithTrash` additionally reports frames that landed in
+# the trash buffer; plain `SapBuffer` is the documented fallback when that class or its constructor
+# is absent. The accepted constructor shape is `(int count, SapAcquisition acq, MemoryType...)` with
+# the memory type repeated for every remaining parameter.
+BUFFER_CLASS_PREFERENCE = ("SapBufferWithTrash", "SapBuffer")
+BUFFER_WITH_TRASH_CLASS = BUFFER_CLASS_PREFERENCE[0]
 _SEARCH_MAX_DEPTH = 6
 _SAMPLE_DIR_WORDS = ("demo", "example", "sample")
 
@@ -238,7 +244,6 @@ def _build_manifest() -> tuple[ApiMember, ...]:
         "SapAcqDevice",
         "SapAcquisition",
         "SapBuffer",
-        "SapBufferWithTrash",
         "SapAcqToBuf",
         "SapXferPair",
         "SapAcqNotifyEventArgs",
@@ -259,7 +264,7 @@ def _build_manifest() -> tuple[ApiMember, ...]:
     # Attached-camera features (SapAcqDevice / SapFeature)
     add(ApiMember("ctor", "SapAcqDevice", params=("SapLocation",)))
     add(ApiMember("ctor", "SapFeature", params=("SapLocation",)))
-    for type_name in ("SapAcqDevice", "SapFeature", "SapAcquisition", "SapBufferWithTrash", "SapAcqToBuf"):
+    for type_name in ("SapAcqDevice", "SapFeature", "SapAcquisition", "SapBuffer", "SapAcqToBuf"):
         add(ApiMember("method", type_name, "Create"))
         add(ApiMember("method", type_name, "Destroy"))
         add(ApiMember("method", type_name, "Dispose"))
@@ -300,12 +305,18 @@ def _build_manifest() -> tuple[ApiMember, ...]:
     add(ApiMember("method", "SapBuffer", "IsBufferTypeSupported", ("SapLocation", MEMORY_TYPE)))
     add(ApiMember("enum", MEMORY_TYPE, "ScatterGather"))
     add(ApiMember("enum", MEMORY_TYPE, "ScatterGatherPhysical"))
-    add(ApiMember("ctor", "SapBufferWithTrash", params=(INT32, "SapAcquisition", MEMORY_TYPE)))
-    add(ApiMember("method", "SapBufferWithTrash", "Clear"))
-    add(ApiMember("property", "SapBufferWithTrash", "Width"))
-    add(ApiMember("property", "SapBufferWithTrash", "Height"))
-    add(ApiMember("method", "SapBufferWithTrash", "GetParameter", (BUFFER_PRM, INT32_OUT)))
-    add(ApiMember("method", "SapBufferWithTrash", "ReadRect", (INT32, INT32, INT32, INT32, INTPTR)))
+    # The buffer class constructor is NOT asserted here: the reference app was compiled against a
+    # Sapera build whose `SapBufferWithTrash(Int32, SapAcquisition, SapBuffer+MemoryType)` does not
+    # exist on the field machine (8.60 reports it through E-0301), and a missing overload must not
+    # make the whole camera unusable. `PythonnetSaperaInterop` probes the available constructors by
+    # reflection and falls back to `SapBuffer`; see `BUFFER_CLASS_PREFERENCE`.
+    # Buffer members are asserted on the base class: `SapBufferWithTrash` is only a probed
+    # enhancement (see BUFFER_CLASS_PREFERENCE), and every member below is inherited from `SapBuffer`.
+    add(ApiMember("method", "SapBuffer", "Clear"))
+    add(ApiMember("property", "SapBuffer", "Width"))
+    add(ApiMember("property", "SapBuffer", "Height"))
+    add(ApiMember("method", "SapBuffer", "GetParameter", (BUFFER_PRM, INT32_OUT)))
+    add(ApiMember("method", "SapBuffer", "ReadRect", (INT32, INT32, INT32, INT32, INTPTR)))
     add(ApiMember("enum", BUFFER_PRM, "PIXEL_DEPTH"))
     add(ApiMember("enum", BUFFER_PRM, "PITCH"))
     add(ApiMember("ctor", "SapAcqToBuf", params=("SapAcquisition", "SapBuffer")))
@@ -329,6 +340,34 @@ def _full_type_name(name: str) -> str:
     return f"{SAPERA_NAMESPACE}.{name}"
 
 
+def _parameter_type_names(method) -> tuple[str, ...]:
+    return tuple(str(parameter.ParameterType.FullName) for parameter in method.GetParameters())
+
+
+def select_buffer_class(signatures: Mapping[str, Iterable[Iterable[str]]]) -> tuple[str, int]:
+    """Pick the buffer class and memory-argument count from the constructors `signatures` lists.
+
+    `signatures` maps a class name to its constructor parameter-type lists. A usable constructor takes
+    `(System.Int32, <SapAcquisition>, <SapBuffer+MemoryType>...)`; the memory type may repeat (some
+    Sapera builds take a separate trash memory type). Returns `("", 0)` when nothing matches. Pure so
+    the field shapes can be tested without .NET.
+    """
+
+    acquisition_name = _full_type_name("SapAcquisition")
+    memory_name = _full_type_name(MEMORY_TYPE)
+    for class_name in BUFFER_CLASS_PREFERENCE:
+        for parameters in signatures.get(class_name, ()):
+            names = tuple(parameters)
+            # At least one memory-type argument is required: dropping it would ignore the
+            # ScatterGather/ScatterGatherPhysical choice the binding makes from the board capability.
+            if len(names) < 3 or names[0] != "System.Int32" or names[1] != acquisition_name:
+                continue
+            if any(name != memory_name for name in names[2:]):
+                continue
+            return class_name, len(names) - 2
+    return "", 0
+
+
 def check_api(assembly, manifest: Iterable[ApiMember] = SAPERA_API_MANIFEST) -> tuple[str, ...]:
     """Return a description of every manifest member missing from `assembly` (.NET reflection)."""
 
@@ -343,7 +382,32 @@ def check_api(assembly, manifest: Iterable[ApiMember] = SAPERA_API_MANIFEST) -> 
         return types[type_name]
 
     def parameter_names(method) -> tuple[str, ...]:
-        return tuple(str(parameter.ParameterType.FullName) for parameter in method.GetParameters())
+        return _parameter_type_names(method)
+
+    def available(member: ApiMember, clr_type) -> tuple[str, ...]:
+        """What the assembly actually offers for this member, so a field report is conclusive."""
+
+        try:
+            if member.kind == "ctor":
+                return tuple(
+                    f"{member.type_name}({', '.join(parameter_names(ctor))})"
+                    for ctor in clr_type.GetConstructors()
+                )
+            if member.kind == "method":
+                return tuple(
+                    f"{member.type_name}.{method.Name}({', '.join(parameter_names(method))})"
+                    for method in clr_type.GetMethods()
+                    if str(method.Name) == member.name
+                )
+            if member.kind == "property":
+                return tuple(f"{member.type_name}.{prop.Name}" for prop in clr_type.GetProperties())
+            if member.kind == "event":
+                return tuple(f"{member.type_name}.{event.Name}" for event in clr_type.GetEvents())
+            if member.kind == "enum":
+                return tuple(str(name) for name in System.Enum.GetNames(clr_type))
+        except Exception:  # noqa: BLE001 - reflection detail is best effort only
+            return ()
+        return ()
 
     for member in manifest:
         clr_type = resolve(member.type_name)
@@ -369,7 +433,14 @@ def check_api(assembly, manifest: Iterable[ApiMember] = SAPERA_API_MANIFEST) -> 
         else:  # pragma: no cover - manifest typo
             raise ValueError(f"unknown manifest kind {member.kind}")
         if not found:
-            missing.append(member.describe())
+            # The field can only copy short text back, so a failure must name what the assembly does
+            # expose instead of only what the manifest expected.
+            shown = available(member, clr_type)
+            if shown:
+                listed = "、".join(shown[:6]) + ("…" if len(shown) > 6 else "")
+                missing.append(f"{member.describe()}（實際可用：{listed}）")
+            else:
+                missing.append(member.describe())
     return tuple(missing)
 
 
@@ -607,6 +678,44 @@ class PythonnetSaperaInterop:
         self._sig_get_string = (clr_type(System.String), string_out)
         self._sig_resource_count = (System.String, sap.SapManager.ResourceType)
         self._handlers: dict[int, list[tuple[str, object]]] = {}
+        self._buffer_class = ""
+        self._buffer_memory_args = 0
+        self.buffer_with_trash = False
+        self._select_buffer_ctor()
+
+    def _select_buffer_ctor(self) -> None:
+        """Choose the buffer class this Sapera build exposes. Reflection only: no hardware calls.
+
+        A wrong constructor would otherwise fail the whole API self-check (field report E-0301 for
+        `SapBufferWithTrash(Int32, SapAcquisition, SapBuffer+MemoryType)` on Sapera LT 8.60), so the
+        exact overload is discovered here instead of being asserted in the manifest.
+        """
+
+        signatures: dict[str, list[tuple[str, ...]]] = {}
+        for class_name in BUFFER_CLASS_PREFERENCE:
+            clr_class = getattr(self._sap, class_name, None)
+            if clr_class is None:
+                continue
+            try:
+                # pythonnet's class object has no GetConstructors(); reflection needs the CLR type.
+                clr_type = self._clr.GetClrType(clr_class)
+                signatures[class_name] = [_parameter_type_names(ctor) for ctor in clr_type.GetConstructors()]
+            except Exception:  # noqa: BLE001 - treat an unreadable type as unavailable
+                continue
+        class_name, memory_args = select_buffer_class(signatures)
+        if class_name:
+            self._buffer_class = class_name
+            self._buffer_memory_args = memory_args
+            self.buffer_with_trash = class_name == BUFFER_WITH_TRASH_CLASS
+            return
+        LOGGER.warning("Sapera 沒有可用的 SapBuffer 建構子：%s", BUFFER_CLASS_PREFERENCE)
+        LOGGER.debug("Sapera buffer 建構子簽名：%s", signatures)
+
+    @property
+    def buffer_class(self) -> str:
+        """The selected buffer class, or an empty string when this Sapera build offers none."""
+
+        return self._buffer_class
 
     # enumeration
     def server_count(self) -> int:
@@ -751,10 +860,25 @@ class PythonnetSaperaInterop:
 
     # buffers and transfer
     def new_buffers(self, acquisition, location, count: int = 2):
+        """Create the buffer set with the class chosen by `_select_buffer_ctor`.
+
+        Returns `(buffers, memory_type_name)`; the memory type name carries the class actually used so
+        the status text and the diagnosis report show whether trash frames can be reported.
+        """
+
+        if not self._buffer_class:
+            raise SaperaError(
+                "E-0503",
+                "此 Sapera 版本沒有可用的 SapBuffer 建構子（SapBufferWithTrash／SapBuffer）",
+            )
         memory = self._sap.SapBuffer.MemoryType
+        factory = getattr(self._sap, self._buffer_class)
         if self._sap.SapBuffer.IsBufferTypeSupported(location, memory.ScatterGather):
-            return self._sap.SapBufferWithTrash(int(count), acquisition, memory.ScatterGather), "ScatterGather"
-        return self._sap.SapBufferWithTrash(int(count), acquisition, memory.ScatterGatherPhysical), "ScatterGatherPhysical"
+            value, name = memory.ScatterGather, "ScatterGather"
+        else:
+            value, name = memory.ScatterGatherPhysical, "ScatterGatherPhysical"
+        args = [int(count), acquisition] + [value] * self._buffer_memory_args
+        return factory(*args), f"{self._buffer_class}/{name}"
 
     @staticmethod
     def buffer_clear(buffers) -> bool:

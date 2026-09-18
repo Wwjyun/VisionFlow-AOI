@@ -8,7 +8,7 @@ CPU-only 是完整支援的執行模式，也是結果正確性的基準。專�
 
 | 項目 | 現況 |
 |---|---|
-| 最新發行版 | [VisionFlow AOI v1.7.0](https://github.com/wjcudalearning/VisionFlow/releases/tag/v1.7.0)，Windows x64、CUDA `sm_86` |
+| 最新發行版 | [VisionFlow AOI v1.7.1](https://github.com/wjcudalearning/VisionFlow/releases/tag/v1.7.1)，Windows x64、CUDA `sm_86` |
 | 支援環境 | Windows 10／11、Python 3.13 |
 | 檢測方式 | 10 個傳統 CV Detector + 1 個 YOLOX Detector |
 | 操作入口 | CLI、PySide6 GUI、批次資料夾、資料夾監控、相機直連監控 |
@@ -91,6 +91,16 @@ CLI 會在終端輸出 JSON 摘要：
 | `--debug` | 保存 Detector 支援的中間影像 |
 | `--log-level LEVEL` | `DEBUG`／`INFO`／`WARNING`／`ERROR` |
 | `--log-dir DIR` | 輪替日誌目錄，預設為輸出目錄下的 `logs` |
+
+打包版（`VisionFlow AOI.exe`，視窗程式沒有主控台）：
+
+| 參數 | 說明 |
+|---|---|
+| `--self-check` | 逐一匯入每個執行期模組、載入 .NET、載入 LSI-8181 與 Sapera 並列出 PASS／FAIL；結果以對話框顯示並寫入 `outputs\logs\camera\`，可用來查出「缺模組」 |
+| `--sapera-diagnose` | Sapera 現場診斷 S1–S8，每步一行可抄寫的短碼 |
+| `--smoke-test` | 打包自我測試，exit 0 代表通過 |
+
+啟動時若發生任何例外（例如缺少模組或原生 DLL），程式會以對話框顯示摘要並把完整堆疊寫到 `outputs\logs\camera\startup-error-*.txt`，不會無訊息結束。
 
 日誌也可用環境變數設定：
 

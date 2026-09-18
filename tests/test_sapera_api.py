@@ -33,6 +33,7 @@ from devices.sapera_api import (
     SaperaVersions,
     dotnet_exception_name,
     locate_assembly,
+    select_buffer_class,
     translate_exception,
 )
 
@@ -231,6 +232,69 @@ class LoadRuntimeOrderingTests(unittest.TestCase):
         self.assertEqual(caught.exception.code, "E-0104")
         self.assertIn(absent, caught.exception.detail)
         bootstrap.assert_not_called()
+
+
+class BufferClassSelectionTests(unittest.TestCase):
+    """The field machine reported E-0301 for the trash-buffer constructor Sapera LT 8.60 lacks.
+
+    The binding must keep working with whatever buffer constructor the installed Sapera exposes, so
+    the decision is a pure function over the reflected constructor signatures.
+    """
+
+    ACQ = f"{SAPERA_NAMESPACE}.SapAcquisition"
+    MEM = f"{SAPERA_NAMESPACE}.SapBuffer+MemoryType"
+    INT32 = "System.Int32"
+
+    def test_declared_three_argument_constructor_keeps_the_trash_buffer(self):
+        chosen, memory_args = select_buffer_class(
+            {"SapBufferWithTrash": [(self.INT32, self.ACQ, self.MEM)]}
+        )
+        self.assertEqual((chosen, memory_args), ("SapBufferWithTrash", 1))
+
+    def test_an_extra_memory_type_argument_is_still_the_trash_buffer(self):
+        chosen, memory_args = select_buffer_class(
+            {"SapBufferWithTrash": [(self.INT32, self.ACQ, self.MEM, self.MEM)]}
+        )
+        self.assertEqual((chosen, memory_args), ("SapBufferWithTrash", 2))
+
+    def test_falls_back_to_the_plain_buffer_when_the_trash_constructor_differs(self):
+        chosen, memory_args = select_buffer_class(
+            {
+                "SapBufferWithTrash": [(self.INT32, self.ACQ, "System.String")],
+                "SapBuffer": [(self.INT32, self.ACQ, self.MEM)],
+            }
+        )
+        self.assertEqual((chosen, memory_args), ("SapBuffer", 1))
+
+    def test_falls_back_when_the_trash_class_is_absent(self):
+        chosen, memory_args = select_buffer_class({"SapBuffer": [(self.INT32, self.ACQ, self.MEM, self.MEM)]})
+        self.assertEqual((chosen, memory_args), ("SapBuffer", 2))
+
+    def test_no_usable_constructor_is_reported_as_an_empty_selection(self):
+        for signatures in (
+            {},
+            {"SapBufferWithTrash": [], "SapBuffer": []},
+            {"SapBufferWithTrash": [("System.Int64", self.ACQ, self.MEM)]},
+            {"SapBufferWithTrash": [(self.INT32, "System.Object", self.MEM)]},
+            {"SapBufferWithTrash": [(self.INT32, self.ACQ)]},
+        ):
+            with self.subTest(signatures=signatures):
+                self.assertEqual(select_buffer_class(signatures), ("", 0))
+
+    def test_manifest_does_not_require_the_disputed_trash_buffer_api(self):
+        described = [member.describe() for member in SAPERA_API_MANIFEST]
+
+        self.assertFalse([text for text in described if text.startswith("SapBufferWithTrash")])
+        # The members the binding actually uses are asserted on the base class both buffers share.
+        for expected in (
+            "SapBuffer.Clear",
+            "SapBuffer.Width",
+            "SapBuffer.Height",
+            "SapBuffer.GetParameter",
+            "SapBuffer.ReadRect",
+        ):
+            with self.subTest(expected=expected):
+                self.assertTrue(any(text.startswith(expected) for text in described), expected)
 
 
 class ManifestTests(unittest.TestCase):

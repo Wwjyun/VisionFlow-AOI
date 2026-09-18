@@ -21,6 +21,7 @@ from devices.ccd_models import (
 )
 from devices.interfaces import FrameListener, LineScanCamera, TriggerListener
 from devices.sapera_api import (
+    BUFFER_WITH_TRASH_CLASS,
     CONTINUOUS_TRIGGER_SELECTORS,
     DEVICE_EXPOSURE_FEATURES,
     DEVICE_GAIN_FEATURE,
@@ -549,8 +550,16 @@ class SaperaLineScanCamera(LineScanCamera):
             log.fail("E-0606", "One Frame", f"EXT_FRAME_TRIGGER_ENABLE={one_frame} 寫入失敗")
 
         self._buffers, self._memory_type = interop.new_buffers(acq, location, BUFFER_COUNT)
+        if not getattr(interop, "buffer_with_trash", True):
+            # Sapera LT 8.60 does not expose the reference app's SapBufferWithTrash overload; losing
+            # the trash-frame report must not make the camera unusable, but the field has to see it.
+            log.ok(
+                "Buffer",
+                f"此 Sapera 版本沒有 {BUFFER_WITH_TRASH_CLASS} 建構子，改用 {self._memory_type}；"
+                "落在 trash buffer 的 frame 不會被回報",
+            )
         if not interop.create(self._buffers):
-            raise SaperaError("E-0503", f"SapBufferWithTrash({BUFFER_COUNT}, {self._memory_type})")
+            raise SaperaError("E-0503", f"{self._memory_type}（{BUFFER_COUNT} 個 buffer）")
         self._call(lambda: interop.buffer_clear(self._buffers), "E-0503")
         self._transfer = interop.new_transfer(acq, self._buffers, self._on_frame)
         if not interop.create(self._transfer):

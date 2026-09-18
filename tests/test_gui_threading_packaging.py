@@ -26,11 +26,22 @@ class GuiThreadingPackagingContractTests(unittest.TestCase):
         launcher = (ROOT / "gui_launcher.py").read_text(encoding="utf-8")
         spec = (SPEC_DIR / "VisionFlow AOI.spec").read_text(encoding="utf-8")
 
-        self.assertIn('"--smoke-test" in sys.argv[1:]', launcher)
+        self.assertIn('if "--smoke-test" in args:', launcher)
         self.assertIn("run_packaged_yolox_smoke_test", launcher)
         self.assertIn("models/yolox", spec)
         self.assertIn("window.recipe_panel.load_recipe(recipe_path)", launcher)
         self.assertIn("window.recipe_panel.detector_list.count() > 0", launcher)
+
+    def test_gui_launcher_entry_point_reports_failures_instead_of_dying_silently(self):
+        launcher = (ROOT / "gui_launcher.py").read_text(encoding="utf-8")
+
+        # The GUI import lives inside main() so the guard covers it; a windowed EXE has no console.
+        self.assertEqual(launcher.count("from gui.main_window import run_app"), 1)
+        self.assertNotIn("\nfrom gui.main_window import run_app\n", launcher)
+        self.assertIn('if "--self-check" in args:', launcher)
+        self.assertIn("def write_startup_error(", launcher)
+        self.assertIn("MessageBoxW", launcher)
+        self.assertIn("raise SystemExit(main())", launcher)
 
     def test_packaged_smoke_uses_isolated_gui_settings(self):
         import gui.main_window
@@ -163,6 +174,76 @@ class GuiThreadingPackagingContractTests(unittest.TestCase):
 
         self.assertEqual(gui_launcher.run_packaged_ccd_smoke_test(), 0)
         self.assertEqual(gui_launcher.run_packaged_sapera_diagnose_smoke_test(), 0)
+
+    def test_packaged_module_smoke_covers_every_runtime_module(self):
+        import gui_launcher
+
+        checked, failed = gui_launcher.missing_modules()
+        self.assertEqual(failed, (), "every packaged runtime module must import")
+        for name in ("devices.sapera_api", "devices.sapera_camera", "devices.sapera_diagnose",
+                     "gui.sapera_diagnostics", "gui.sapera_location_dialog", "gui.main_window"):
+            self.assertIn(name, checked)
+        self.assertEqual(gui_launcher.run_packaged_module_smoke_test(), 0)
+
+    def test_packaged_module_smoke_fails_when_a_module_is_missing(self):
+        import gui_launcher
+
+        with patch.object(gui_launcher, "SELF_CHECK_MODULES", ("json", "definitely_absent_module_xyz")):
+            self.assertEqual(gui_launcher.run_packaged_module_smoke_test(), 22)
+
+    def test_self_check_names_the_missing_module_and_writes_a_report(self):
+        import gui_launcher
+
+        with tempfile.TemporaryDirectory(prefix="visionflow_self_check_") as directory:
+            with patch.object(gui_launcher, "SELF_CHECK_MODULES", ("json", "definitely_absent_module_xyz")):
+                lines, failures = gui_launcher.self_check_lines(deep_sapera=False)
+                code = gui_launcher.run_self_check(show_ui=False, log_dir=directory)
+            reports = list(Path(directory).glob("self-check-*.txt"))
+            self.assertEqual(len(reports), 1)
+            text = reports[0].read_text(encoding="utf-8")
+        self.assertEqual(code, 1, "a failing check must not look like success")
+        self.assertIn("definitely_absent_module_xyz", " ".join(failures))
+        self.assertIn("模組 json", "\n".join(lines))
+        self.assertIn("definitely_absent_module_xyz", text)
+        self.assertIn("失敗項目", text)
+        self.assertIn("self-check-", text)
+
+    def test_startup_error_text_names_the_missing_module(self):
+        import gui_launcher
+
+        text = gui_launcher.startup_error_text(ModuleNotFoundError("No module named 'clr'", name="clr"))
+        self.assertIn("缺少 Python 模組：clr", text)
+        self.assertIn("沒有被打包進 EXE", text)
+        self.assertIn("ModuleNotFoundError", text)
+
+    def test_startup_error_text_explains_a_native_dll_that_could_not_be_found(self):
+        import gui_launcher
+
+        error = OSError("Could not find module 'LSI8181_64.dll' (or one of its dependencies).")
+        error.winerror = 126
+        text = gui_launcher.startup_error_text(error)
+        self.assertIn("找不到指定的模組", text)
+        self.assertIn("錯誤 126", text)
+        self.assertIn("Sapera LT", text)
+
+    def test_launcher_reports_a_startup_failure_instead_of_dying_silently(self):
+        import gui_launcher
+
+        shown: list[str] = []
+        with tempfile.TemporaryDirectory(prefix="visionflow_startup_") as directory:
+            report = Path(directory) / "startup-error.txt"
+            with patch.object(
+                gui_launcher,
+                "run_packaged_smoke_test",
+                side_effect=ModuleNotFoundError("No module named 'onnxruntime'", name="onnxruntime"),
+            ), patch.object(gui_launcher, "show_message", lambda title, text, **kwargs: shown.append(text)), \
+                    patch.object(gui_launcher, "write_startup_error", return_value=report) as writer:
+                code = gui_launcher.main(["--smoke-test"])
+        self.assertEqual(code, 4)
+        self.assertEqual(writer.call_count, 1)
+        self.assertEqual(len(shown), 1)
+        self.assertIn("onnxruntime", shown[0])
+        self.assertIn(str(report), shown[0])
 
     def test_rtx_workflow_can_accept_production_samples_and_capture_nsight(self):
         workflow = (ROOT / ".github" / "workflows" / "rtx3090-validation.yml").read_text(

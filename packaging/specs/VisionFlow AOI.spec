@@ -22,7 +22,10 @@ a = Analysis(
     # pythonnet loads the camera machine's own Sapera LT SapClassBasic.dll at runtime on the .NET
     # Framework runtime. The managed hooks collect clr.pyd/Python.Runtime.dll; the vendor DLL and
     # the LSI-8181 driver stay on the machine and must never be bundled.
-    hiddenimports=['pythonnet', 'clr_loader'],
+    # `devices.ccd_settings_import` has no caller yet (its GUI action is a pending Todo item), so
+    # PyInstaller would drop it; bundling it keeps the packaged app matching the documented CCD
+    # capability set, so wiring that action later cannot fail on the offline camera machine.
+    hiddenimports=['pythonnet', 'clr_loader', 'devices.ccd_settings_import'],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],

@@ -1,12 +1,52 @@
 from __future__ import annotations
 
+import importlib
 import os
 from copy import deepcopy
+from datetime import datetime
 from pathlib import Path
 import sys
 import tempfile
+import traceback
 
-from gui.main_window import run_app
+# `gui.main_window` is imported inside main(): when a build is incomplete or a native dependency is
+# missing, a windowed EXE has no console and would otherwise die before any of our code runs.
+STARTUP_ERROR_LOG_SUBDIR = Path("outputs") / "logs" / "camera"
+
+# Modules the packaged application must be able to import. A missing entry here is the exact
+# "缺模組" report the field machine needs, so this list covers every runtime entry point, not only
+# the ones the smoke test happens to touch. `Pillow` and `plotly` are deliberately absent: they are
+# dependencies of the standalone tile/plot tools, which ship as their own builds, not of this app.
+SELF_CHECK_MODULES = (
+    "cv2",
+    "numpy",
+    "onnxruntime",
+    "yaml",
+    "PySide6.QtCore",
+    "PySide6.QtWidgets",
+    "pythonnet",
+    "clr",
+    "clr_loader",
+    "core.pipeline",
+    "core.gpu_runtime",
+    "core.recipe_manager",
+    "detectors",
+    "devices.factory",
+    "devices.ccd_models",
+    "devices.ccd_recipe",
+    "devices.ccd_settings_import",
+    "devices.frame_writer",
+    "devices.interfaces",
+    "devices.lsi8181",
+    "devices.sapera_api",
+    "devices.sapera_camera",
+    "devices.sapera_diagnose",
+    "gui.main_window",
+    "gui.screens.ccd_screen",
+    "gui.sapera_diagnostics",
+    "gui.sapera_location_dialog",
+    "gui.workers",
+)
 
 
 def bundled_recipe_path() -> Path:
@@ -40,6 +80,9 @@ def run_packaged_smoke_test() -> int:
         settings.sync()
     if not valid:
         return 3
+    module_status = run_packaged_module_smoke_test()
+    if module_status:
+        return module_status
     ccd_status = run_packaged_ccd_smoke_test()
     if ccd_status:
         return ccd_status
@@ -101,6 +144,18 @@ def run_packaged_sapera_diagnose_smoke_test() -> int:
         return 18
     if not reports_written:
         return 19
+    return 0
+
+
+def run_packaged_module_smoke_test() -> int:
+    """Every packaged runtime module must import; this is the build-time guard for "缺模組"."""
+
+    checked, failed = missing_modules()
+    if not checked:
+        return 21
+    if failed:
+        _write_stderr("缺少模組：" + "；".join(failed))
+        return 22
     return 0
 
 
@@ -369,9 +424,234 @@ def run_packaged_sapera_diagnose(runner=None, *, show_dialog: bool = True) -> in
     return 0 if report.passed else 1
 
 
+def startup_error_text(exc: BaseException, trace: str = "") -> str:
+    """One copyable Traditional-Chinese summary plus the raw traceback for a startup failure."""
+
+    name = type(exc).__name__
+    message = str(exc)
+    if isinstance(exc, ModuleNotFoundError):
+        summary = (
+            f"缺少 Python 模組：{getattr(exc, 'name', '') or message}。"
+            "這個模組沒有被打包進 EXE，或 EXE 沒有與 _internal 資料夾一起複製。"
+        )
+    elif isinstance(exc, ImportError):
+        summary = f"匯入失敗：{message}。EXE 與 _internal 資料夾必須一起複製。"
+    elif isinstance(exc, OSError) and getattr(exc, "winerror", None) == 126:
+        summary = (
+            "找不到指定的模組（Windows 錯誤 126）：某個原生 DLL 或它的相依檔不存在。"
+            "請確認 EXE 是完整解壓縮的資料夾，並確認相機機台已安裝 Sapera LT 與 .NET Framework 4.7.2 以上。"
+        )
+    else:
+        summary = f"{name}：{message}"
+    lines = [
+        "VisionFlow AOI 啟動失敗",
+        "",
+        f"摘要：{summary}",
+        f"例外：{name}: {message}",
+        "",
+        "完整堆疊（可抄寫或截圖）：",
+        trace or "".join(traceback.format_exception(type(exc), exc, exc.__traceback__)),
+    ]
+    return "\n".join(lines)
+
+
+def write_startup_error(exc: BaseException, log_dir: str | Path | None = None) -> Path:
+    """Persist a startup failure next to the diagnosis reports; the machine keeps the full text."""
+
+    directory = Path(log_dir) if log_dir is not None else STARTUP_ERROR_LOG_SUBDIR
+    directory.mkdir(parents=True, exist_ok=True)
+    path = directory / f"startup-error-{datetime.now():%Y%m%d-%H%M%S}.txt"
+    path.write_text(startup_error_text(exc), encoding="utf-8")
+    return path
+
+
+def _write_stderr(text: str) -> None:
+    """A windowed EXE has no console; never let reporting a problem raise another one."""
+
+    stream = getattr(sys, "stderr", None)
+    if stream is None:
+        return
+    try:
+        stream.write(text + "\n")
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def show_message(title: str, text: str, *, show_ui: bool = True) -> None:
+    """Report on a machine with no console: a native message box, then stderr as a fallback."""
+
+    if show_ui and os.name == "nt":
+        try:
+            import ctypes
+
+            body = text if len(text) <= 8000 else text[:8000] + "\n…（其餘內容請看報告檔）"
+            ctypes.windll.user32.MessageBoxW(None, body, title, 0x40 | 0x1000)
+            return
+        except Exception:  # noqa: BLE001 - never fail while reporting a failure
+            pass
+    _write_stderr(f"{title}\n{text}")
+
+
+def missing_modules() -> tuple[tuple[str, ...], tuple[str, ...]]:
+    """Import every packaged runtime module and return `(checked, failed)`.
+
+    Used both by `--self-check` and by the packaged smoke test, so a module that PyInstaller did not
+    collect is caught at build time on the development machine instead of on the camera machine.
+    """
+
+    checked: list[str] = []
+    failed: list[str] = []
+    for name in SELF_CHECK_MODULES:
+        checked.append(name)
+        try:
+            importlib.import_module(name)
+        except Exception as exc:  # noqa: BLE001 - the failure text is the whole point
+            failed.append(f"{name} ({type(exc).__name__}: {exc})")
+    return tuple(checked), tuple(failed)
+
+
+def self_check_lines(*, environ=None, deep_sapera: bool = True) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    """Return `(lines, failures)`: one line per check and the subset that failed.
+
+    The checks are deliberately shallow except for the Sapera and LSI load tests: the point is to name
+    the missing piece on a factory machine in one shot.
+    """
+
+    env = os.environ if environ is None else environ
+    lines: list[str] = []
+    failures: list[str] = []
+
+    def record(item: str, ok: bool, detail: str = "") -> None:
+        status = "PASS" if ok else "FAIL"
+        line = f"[{status}] {item}" + (f"：{detail}" if detail else "")
+        lines.append(line)
+        if not ok:
+            failures.append(item)
+
+    frozen = bool(getattr(sys, "_MEIPASS", ""))
+    bundle = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent))
+    record("執行環境", True, f"frozen={frozen}、64-bit={sys.maxsize > 2**32}、Python {sys.version.split()[0]}")
+    record("程式路徑", True, f"exe={sys.executable}")
+    record("打包內容根目錄", bundle.is_dir(), str(bundle))
+
+    recipe = bundled_recipe_path()
+    record("內建 Recipe", recipe.is_file(), str(recipe))
+    registry = bundle / "models" / "yolox" / "registry.yaml"
+    record("YOLOX registry", registry.is_file(), str(registry))
+
+    checked, failed = missing_modules()
+    for name in checked:
+        detail = next((text for text in failed if text.startswith(f"{name} ")), "")
+        if detail:
+            record(f"模組 {name}", False, detail[len(name) + 1 :])
+        else:
+            record(f"模組 {name}", True)
+
+    try:
+        from devices.sapera_api import SaperaError, ensure_dotnet_runtime
+
+        ensure_dotnet_runtime()
+        record(".NET Framework runtime", True, "netfx 已載入")
+    except Exception as exc:  # noqa: BLE001
+        detail = f"{getattr(exc, 'code', '')} {exc}".strip()
+        record(".NET Framework runtime", False, detail)
+
+    try:
+        from devices import lsi8181
+
+        library = lsi8181.Lsi8181Library.load(environ=env)
+        record("LSI-8181 DLL 載入", True, str(getattr(library, "path", "") or "已載入"))
+    except Exception as exc:  # noqa: BLE001
+        record("LSI-8181 DLL 載入", False, f"{type(exc).__name__}: {exc}")
+
+    if deep_sapera:
+        try:
+            from devices.sapera_api import load_runtime, locate_assembly
+
+            search = locate_assembly(environ=env)
+            record("Sapera assembly 位置", search.chosen is not None, search.chosen or "找不到（見下一步）")
+            if search.chosen is not None:
+                runtime = load_runtime(environ=env)
+                missing = runtime.check_api()
+                record("Sapera managed 載入", True, runtime.versions.summary())
+                record(
+                    "Sapera API 自檢",
+                    not missing,
+                    "成員齊全" if not missing else "缺少 " + "、".join(missing[:5]),
+                )
+            else:
+                record("Sapera managed 載入", False, "找不到 SapClassBasic.dll；請設定 SAPERADIR 或 VISIONFLOW_SAPERA_DLL")
+                record("Sapera API 自檢", False, "略過（上一步失敗）")
+        except Exception as exc:  # noqa: BLE001
+            record("Sapera managed 載入", False, f"{getattr(exc, 'code', '')} {exc}".strip())
+            record("Sapera API 自檢", False, "略過（上一步失敗）")
+
+    return tuple(lines), tuple(failures)
+
+
+def self_check_text(lines, failures, *, log_path: Path | None = None) -> str:
+    """The report text: header, one line per check, and what to do with it."""
+
+    passed = len(lines) - len(failures)
+    header = [
+        "VisionFlow AOI 自我檢查（--self-check）",
+        f"時間：{datetime.now():%Y-%m-%d %H:%M:%S}",
+        f"結果：{passed} PASS、{len(failures)} FAIL",
+        "",
+    ]
+    if failures:
+        header.extend(["失敗項目：", *[f"  - {item}" for item in failures], ""])
+    tail = [
+        "",
+        "請把上面每一行抄回或用 --sapera-diagnose 產生短碼；",
+        "完整報告同時寫在本檔與機台的 outputs/logs/camera/。",
+    ]
+    if log_path is not None:
+        tail.append(f"報告檔：{log_path}")
+    return "\n".join([*header, *lines, *tail])
+
+
+def run_self_check(*, show_ui: bool = True, log_dir: str | Path | None = None, environ=None) -> int:
+    """Verify every packaged entry point in one shot and report it in a way the field can copy."""
+
+    lines, failures = self_check_lines(environ=environ)
+    directory = Path(log_dir) if log_dir is not None else STARTUP_ERROR_LOG_SUBDIR
+    path = None
+    try:
+        directory.mkdir(parents=True, exist_ok=True)
+        path = directory / f"self-check-{datetime.now():%Y%m%d-%H%M%S}.txt"
+        path.write_text(self_check_text(lines, failures, log_path=path), encoding="utf-8")
+    except OSError as exc:  # noqa: BLE001 - reporting must not fail the check itself
+        path = None
+        _write_stderr(f"無法寫出自我檢查報告：{exc}")
+    text = self_check_text(lines, failures, log_path=path)
+    show_message("VisionFlow AOI 自我檢查", text, show_ui=show_ui)
+    return 1 if failures else 0
+
+
+def main(argv=None) -> int:
+    """Every entry point, with a readable failure path for a console-less EXE."""
+
+    args = list(sys.argv[1:] if argv is None else argv)
+    try:
+        if "--self-check" in args:
+            return run_self_check()
+        if "--smoke-test" in args:
+            return run_packaged_smoke_test()
+        if "--sapera-diagnose" in args:
+            return run_packaged_sapera_diagnose()
+        from gui.main_window import run_app
+
+        return run_app()
+    except Exception as exc:  # noqa: BLE001 - a windowed EXE must never fail silently
+        try:
+            path = write_startup_error(exc)
+            detail = f"\n\n完整內容：{path}"
+        except OSError:
+            detail = ""
+        show_message("VisionFlow AOI 啟動失敗", startup_error_text(exc) + detail)
+        return 4
+
+
 if __name__ == "__main__":
-    if "--smoke-test" in sys.argv[1:]:
-        raise SystemExit(run_packaged_smoke_test())
-    if "--sapera-diagnose" in sys.argv[1:]:
-        raise SystemExit(run_packaged_sapera_diagnose())
-    raise SystemExit(run_app())
+    raise SystemExit(main())
