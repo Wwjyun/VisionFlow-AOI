@@ -76,9 +76,16 @@ class ApplyNote:
         return f"{prefix}{self.item}：{self.detail}"
 
 
+# Keys of pply_readbacks(), in the order the diagnosis prints them: camera TriggerMode, camera line
+# rate and its reported range, board INT_LINE_TRIGGER_FREQ, exposure, gain, buffer width/height.
+READBACK_KEYS = ("TM", "LR", "LRMIN", "LRMAX", "BLR", "EXP", "GAIN", "W", "H")
+
+
 class _ApplyLog:
     def __init__(self):
         self.notes: list[ApplyNote] = []
+        # Short ASCII key -> value actually read from the hardware, for the field's copyable row.
+        self.readbacks: dict[str, str] = {}
 
     def ok(self, item: str, detail: str) -> None:
         self.notes.append(ApplyNote(item, detail))
@@ -89,6 +96,15 @@ class _ApplyLog:
 
 def _fmt(value) -> str:
     return "無法讀取" if value is None else str(value)
+
+
+def _short_value(value) -> str:
+    """A readback for the copyable ASCII row: `?` when unreadable, no spaces, at most 12 chars."""
+
+    if value is None:
+        return "?"
+    text = "".join(str(value).split())
+    return text[:12] or "?"
 
 
 class SaperaLineScanCamera(LineScanCamera):
@@ -133,6 +149,7 @@ class SaperaLineScanCamera(LineScanCamera):
         self._buffers = None
         self._transfer = None
         self._apply_notes: tuple[ApplyNote, ...] = ()
+        self._apply_readbacks: dict[str, str] = {}
         self._memory_type = ""
 
     # ---- runtime --------------------------------------------------------------------------
@@ -171,6 +188,13 @@ class SaperaLineScanCamera(LineScanCamera):
 
         with self._state_lock:
             return self._apply_notes
+
+    def apply_readbacks(self) -> dict[str, str]:
+        """Values the last `connect()` read back from the hardware, keyed by short ASCII names
+        (TM, LR, LRMIN, LRMAX, EXP, GAIN, W, H) so the offline field can copy them as one row."""
+
+        with self._state_lock:
+            return dict(self._apply_readbacks)
 
     def _require_interop(self):
         availability = self.availability()
@@ -231,6 +255,7 @@ class SaperaLineScanCamera(LineScanCamera):
                 self._cleanup(interop, "連線失敗清理")
                 with self._state_lock:
                     self._apply_notes = tuple(log.notes)
+                    self._apply_readbacks = dict(log.readbacks)
                     self._message = str(error)
                 raise error from exc
 
@@ -243,6 +268,7 @@ class SaperaLineScanCamera(LineScanCamera):
             self._stop_requested_during_capture = False
             self._last_stop_time = None
             self._apply_notes = tuple(log.notes)
+            self._apply_readbacks = dict(log.readbacks)
             self._message = "相機已連線。" if not failures else f"相機已連線，但部分參數寫入失敗：{'、'.join(failures)}"
         for note in log.notes:
             (LOGGER.warning if note.code else LOGGER.info)("Sapera apply %s", note.line())
@@ -423,7 +449,8 @@ class SaperaLineScanCamera(LineScanCamera):
                 applied |= self._write_line_rate(interop, device, acquisition.internal_line_rate_hz, log)
             else:
                 log.ok("Internal Line Rate", f"{trigger.mode.value} 模式不寫入")
-            applied |= self._write_exposure(interop, device, acquisition.exposure_time, log)
+            line_rate = acquisition.internal_line_rate_hz if trigger.mode == TriggerMode.CONTINUOUS else None
+            applied |= self._write_exposure(interop, device, acquisition.exposure_time, log, line_rate)
             applied |= self._write_gain(interop, device, acquisition.gain, log)
             if trigger.mode != TriggerMode.CONTINUOUS:
                 applied |= self._write_trigger_features(interop, device, trigger.mode, log)
@@ -463,10 +490,12 @@ class SaperaLineScanCamera(LineScanCamera):
                 "Internal Line Rate",
                 f"{LINE_RATE_FEATURE} 不可用（CamExpert 顯示 n/a；相機 TriggerMode 仍為 On 時會這樣）",
             )
+            log.readbacks["LR"] = "na"
             return False
         before = self._quiet(lambda: interop.get_feature_string(device, LINE_RATE_FEATURE), None)
         requested = int(line_rate_hz)
-        rate, bounds = self._clamp_to_feature_range(interop, device, LINE_RATE_FEATURE, requested)
+        rate, bounds, low, high = self._clamp_to_feature_range(interop, device, LINE_RATE_FEATURE, requested)
+        log.readbacks["LRMIN"], log.readbacks["LRMAX"] = _short_value(low), _short_value(high)
         if rate != requested:
             # Like the board's INT_LINE_TRIGGER clamp (xx_ccd ClampInternalLineRate): the camera
             # rejects out-of-range values outright (field: Linea 16K minimum 300 Hz, Recipe 30 Hz).
@@ -483,6 +512,7 @@ class SaperaLineScanCamera(LineScanCamera):
             if self._quiet(attempt):
                 readback = self._quiet(lambda: interop.get_feature_string(device, LINE_RATE_FEATURE), None)
                 log.ok("Internal Line Rate", f"{LINE_RATE_FEATURE}={rate}（{kind}）寫入前 {_fmt(before)} 讀回 {_fmt(readback)}")
+                log.readbacks["LR"] = _short_value(readback)
                 return True
         access = self._quiet(lambda: interop.feature_access_mode(device, LINE_RATE_FEATURE), None)
         log.fail(
@@ -491,23 +521,24 @@ class SaperaLineScanCamera(LineScanCamera):
             f"{LINE_RATE_FEATURE}={rate} 以 Int64／字串皆寫入失敗，寫入前 {_fmt(before)}、存取 {_fmt(access)}"
             "（要求值可能低於相機最低線速率）",
         )
+        log.readbacks["LR"] = _short_value(before)
         return False
 
-    def _clamp_to_feature_range(self, interop, device, feature: str, value: int) -> tuple[int, str]:
-        """`(value clamped to the feature's reported range, "min–max" text)`; unchanged when unknown."""
+    def _clamp_to_feature_range(self, interop, device, feature: str, value: int):
+        """`(clamped value, "min–max" text, min, max)`; the value is unchanged when the range is unknown."""
 
         probe = getattr(interop, "feature_int_range", None)
         if probe is None:
-            return value, "未知"
+            return value, "未知", None, None
         low, high = self._quiet(lambda: probe(device, feature), (None, None)) or (None, None)
         clamped = value
         if low is not None and clamped < low:
             clamped = int(low)
         if high is not None and clamped > high:
             clamped = int(high)
-        return clamped, f"{_fmt(low)}–{_fmt(high)}"
+        return clamped, f"{_fmt(low)}–{_fmt(high)}", low, high
 
-    def _write_exposure(self, interop, device, exposure_time: float, log: _ApplyLog) -> bool:
+    def _write_exposure(self, interop, device, exposure_time: float, log: _ApplyLog, line_rate_hz: int | None = None) -> bool:
         text = str(int(exposure_time))
         tried = []
         for name in EXPOSURE_FEATURES:
@@ -516,10 +547,17 @@ class SaperaLineScanCamera(LineScanCamera):
             if self._quiet(lambda: interop.set_feature_string(device, name, text)):
                 readback = self._quiet(lambda: interop.get_feature_string(device, name), None)
                 log.ok("Exposure", f"{name}={text} 讀回 {_fmt(readback)}")
+                log.readbacks["EXP"] = _short_value(readback)
                 return True
             tried.append(name)
         detail = f"可用 feature 皆寫入失敗：{'、'.join(tried)}" if tried else "找不到任何 Exposure feature"
+        if tried and line_rate_hz:
+            # Linea manual: the line period must exceed exposure + 1 us, else the write is an error.
+            limit = 1_000_000 / max(1, int(line_rate_hz)) - 1
+            detail += f"（Linea 限制：曝光須小於線週期 − 1 µs，{int(line_rate_hz)} Hz 時上限約 {limit:.0f} µs）"
         log.fail("E-0602", "Exposure", f"{text}；{detail}")
+        current = self._quiet(lambda: interop.get_feature_string(device, tried[0]), None) if tried else None
+        log.readbacks["EXP"] = _short_value(current) if tried else "na"
         return False
 
     def _write_gain(self, interop, device, gain: float, log: _ApplyLog) -> bool:
@@ -530,54 +568,132 @@ class SaperaLineScanCamera(LineScanCamera):
         if self._quiet(lambda: interop.set_feature_string(device, GAIN_FEATURE, text)):
             readback = self._quiet(lambda: interop.get_feature_string(device, GAIN_FEATURE), None)
             log.ok("Gain", f"{GAIN_FEATURE}={text} 讀回 {_fmt(readback)}")
+            log.readbacks["GAIN"] = _short_value(readback)
             return True
         log.fail("E-0603", "Gain", f"{GAIN_FEATURE}={text} 寫入失敗")
+        log.readbacks["GAIN"] = _short_value(self._quiet(lambda: interop.get_feature_string(device, GAIN_FEATURE), None))
         return False
 
     def _write_trigger_features(self, interop, device, mode: TriggerMode, log: _ApplyLog) -> bool:
+        """Camera-side trigger mode, judged by reading TriggerMode back.
+
+        Linea Camera Link manual (03-032-20206): `Trigger Selector` and `Trigger Source` are
+        read-only; `Trigger Mode` is Off (internal free-run, AcquisitionLineRate available) or On
+        (external line trigger on CC1). Success used to require writing the selector first, behind
+        xx_ccd's strict access-mode gate, so the field saw `060609` whether the camera was already
+        Off or still On. The writes now follow the field-confirmed Exposure/Gain path (feature
+        present, write attempted, rejection tolerated) and the readback decides.
+        """
+
         if mode == TriggerMode.CONTINUOUS:
-            applied, details = self._write_selectors(interop, device, CONTINUOUS_TRIGGER_SELECTORS, False, ())
-        else:
-            disabled, first = self._write_selectors(interop, device, EXTERNAL_DISABLED_SELECTORS, False, ())
-            enabled, second = self._write_selectors(
-                interop, device, EXTERNAL_LINE_SELECTORS, True, EXTERNAL_LINE_SOURCES
+            return self._set_camera_trigger_mode(
+                interop, device, log, DEVICE_TRIGGER_MODE_OFF, CONTINUOUS_TRIGGER_SELECTORS, (), "free-run"
             )
-            applied, details = disabled or enabled, first + second
-        readback = self._quiet(lambda: interop.get_feature_string(device, DEVICE_TRIGGER_MODE_FEATURE), None)
-        detail = f"{mode.value}：{'；'.join(details)}；TriggerMode 讀回 {_fmt(readback)}"
-        if mode == TriggerMode.CONTINUOUS and not applied:
-            # Free-run needs the camera's TriggerMode Off: while it stays On the camera waits for CC1
-            # pulses (field `070702`) and hides AcquisitionLineRate (field `060601`).
-            log.fail("E-0609", "相機 TriggerMode", detail)
-            return applied
-        # Camera-side trigger selectors are advisory in external modes, as in xx_ccd; the board
-        # parameters decide arming there.
-        log.ok("相機 TriggerMode", detail)
+        # Frame-level selectors Off only where the camera lets them be selected; on a camera whose
+        # selector is read-only this would just toggle the one line trigger it has.
+        disabled = []
+        if self._selector_writable(interop, device):
+            for selector in EXTERNAL_DISABLED_SELECTORS:
+                if self._select(interop, device, selector):
+                    written = self._quiet(
+                        lambda: interop.set_feature_string(device, DEVICE_TRIGGER_MODE_FEATURE, DEVICE_TRIGGER_MODE_OFF)
+                    )
+                    disabled.append(f"{selector} Off{'' if written else '（寫入被拒）'}")
+        applied = self._set_camera_trigger_mode(
+            interop, device, log, DEVICE_TRIGGER_MODE_ON, EXTERNAL_LINE_SELECTORS, EXTERNAL_LINE_SOURCES, "外部線觸發",
+            extra=disabled,
+        )
         return applied
 
-    def _write_selectors(self, interop, device, selectors, enabled: bool, sources) -> tuple[bool, list[str]]:
-        applied = False
-        details = []
-        mode_value = DEVICE_TRIGGER_MODE_ON if enabled else DEVICE_TRIGGER_MODE_OFF
-        for selector in selectors:
-            selector_ok = self._write_enum(interop, device, DEVICE_TRIGGER_SELECTOR_FEATURE, (selector,))
-            mode_ok = self._write_enum(interop, device, DEVICE_TRIGGER_MODE_FEATURE, (mode_value,))
-            source_ok = (not enabled) or self._write_enum(
-                interop, device, DEVICE_TRIGGER_SOURCE_FEATURE, sources
+    def _set_camera_trigger_mode(
+        self, interop, device, log: _ApplyLog, target: str, selectors, sources, label: str, extra=()
+    ) -> bool:
+        """Write `target` to TriggerMode for each selectable selector (or the current one), verify by
+        readback: `E-0609` when TriggerMode reads other than `target`, `E-0610` when it can be
+        neither written nor read. Returns whether any TriggerMode write was accepted."""
+
+        if not self._quiet(lambda: interop.feature_available(device, DEVICE_TRIGGER_MODE_FEATURE)):
+            if target == DEVICE_TRIGGER_MODE_OFF:
+                log.ok("相機 TriggerMode", "相機沒有 TriggerMode feature，固定 free-run")
+            else:
+                log.fail("E-0610", "相機 TriggerMode", "相機沒有 TriggerMode feature，無法切到外部線觸發")
+            log.readbacks["TM"] = "na"
+            return False
+        has_selector = bool(self._quiet(lambda: interop.feature_available(device, DEVICE_TRIGGER_SELECTOR_FEATURE)))
+        results: list[tuple[str, str | None, bool, str | None]] = []
+        skipped: list[str] = []
+        for selector in selectors if has_selector else ():
+            if not self._select(interop, device, selector):
+                skipped.append(selector)
+                continue
+            results.append((selector, *self._write_trigger_mode(interop, device, target, sources)))
+        if not results:
+            # Read-only TriggerSelector (Linea CL), none at all, or none of the SFNC names.
+            results.append(("（目前 selector）", *self._write_trigger_mode(interop, device, target, sources)))
+
+        wrote = any(written for _selector, _before, written, _after in results)
+        if wrote and any(self._reads_other(after, target) for *_rest, after in results):
+            # A device in manual update mode may only apply the writes on UpdateFeaturesToDevice();
+            # commit, then read those selectors again before calling it a failure.
+            self._quiet(lambda: interop.update_features(device))
+            results = [self._reread(interop, device, entry, target, selectors, has_selector) for entry in results]
+        log.readbacks["TM"] = _short_value(results[-1][3])
+        mismatched = [entry for entry in results if self._reads_other(entry[3], target)]
+        unknown = all(entry[3] is None for entry in results)
+        parts = list(extra) + [
+            f"{selector}：{_fmt(before)}→{_fmt(after)}（{'已寫入' if written else '寫入被拒'}）"
+            for selector, before, written, after in results
+        ]
+        if skipped:
+            parts.append(f"唯讀或不支援的 selector：{'、'.join(skipped)}")
+        detail = f"要求 TriggerMode {target}；" + "；".join(parts)
+        if mismatched:
+            # Continuous: while TriggerMode stays On the camera waits for CC1 pulses (field `070702`)
+            # and hides AcquisitionLineRate (field `060601`). External: the camera ignores CC1.
+            log.fail("E-0609", "相機 TriggerMode", detail)
+        elif unknown and not wrote:
+            log.fail("E-0610", "相機 TriggerMode", detail)
+        else:
+            log.ok("相機 TriggerMode", f"{label}：{detail}")
+        return wrote
+
+    def _selector_writable(self, interop, device) -> bool:
+        if not self._quiet(lambda: interop.feature_available(device, DEVICE_TRIGGER_SELECTOR_FEATURE)):
+            return False
+        current = self._quiet(lambda: interop.get_feature_string(device, DEVICE_TRIGGER_SELECTOR_FEATURE), None)
+        return bool(current) and self._select(interop, device, str(current))
+
+    def _select(self, interop, device, selector: str) -> bool:
+        return bool(self._quiet(lambda: interop.set_feature_string(device, DEVICE_TRIGGER_SELECTOR_FEATURE, selector)))
+
+    @staticmethod
+    def _reads_other(value: str | None, target: str) -> bool:
+        """A readback that proves TriggerMode is not `target` (an unreadable value proves nothing)."""
+
+        return value is not None and value.strip().lower() != target.lower()
+
+    def _reread(self, interop, device, entry, target: str, selectors, has_selector: bool):
+        selector, before, written, after = entry
+        if not self._reads_other(after, target):
+            return entry
+        if has_selector and selector in selectors:
+            self._select(interop, device, selector)
+        return selector, before, written, self._read_trigger_mode(interop, device)
+
+    def _write_trigger_mode(self, interop, device, target: str, sources) -> tuple[str | None, bool, str | None]:
+        before = self._read_trigger_mode(interop, device)
+        written = bool(self._quiet(lambda: interop.set_feature_string(device, DEVICE_TRIGGER_MODE_FEATURE, target)))
+        if written and sources and self._quiet(lambda: interop.feature_available(device, DEVICE_TRIGGER_SOURCE_FEATURE)):
+            # Read-only on Linea CL (CC1 is fixed); a rejected source is not a trigger-mode failure.
+            any(
+                self._quiet(lambda source=source: interop.set_feature_string(device, DEVICE_TRIGGER_SOURCE_FEATURE, source))
+                for source in sources
             )
-            details.append(f"{selector}:{'ok' if selector_ok and mode_ok and source_ok else 'skip'}")
-            applied = applied or (selector_ok and mode_ok and source_ok)
-        return applied, details
+        return before, written, self._read_trigger_mode(interop, device)
 
-    def _write_enum(self, interop, device, feature: str, values) -> bool:
-        """xx_ccd TrySetNotebookEnumFeatureValue: only features whose access mode includes Write."""
-
-        if not self._quiet(lambda: interop.feature_available(device, feature)):
-            return False
-        access = self._quiet(lambda: interop.feature_access_mode(device, feature), None)
-        if access is None or "write" not in access.lower():
-            return False
-        return any(self._quiet(lambda value=value: interop.set_feature_string(device, feature, value)) for value in values)
+    def _read_trigger_mode(self, interop, device) -> str | None:
+        value = self._quiet(lambda: interop.get_feature_string(device, DEVICE_TRIGGER_MODE_FEATURE), None)
+        return None if value is None else str(value)
 
     def _require_capture_resource(self, interop, connection: CameraConnectionSettings) -> None:
         """Refuse a server with no Acq resource before touching hardware.
@@ -654,6 +770,7 @@ class SaperaLineScanCamera(LineScanCamera):
                 f"PIXEL_DEPTH={fmt.pixel_depth}、{fmt.width}×{fmt.height}、PITCH={fmt.pitch}；只支援 8-bit 單色",
             )
         log.ok("影像格式", f"{fmt.width}×{fmt.height}、8-bit、PITCH={fmt.pitch}、{self._memory_type}")
+        log.readbacks["W"], log.readbacks["H"] = str(fmt.width), str(fmt.height)
         with self._state_lock:
             self._format = fmt
             self._has_signal = True
@@ -692,6 +809,7 @@ class SaperaLineScanCamera(LineScanCamera):
         enabled = self._set_int(interop, acq, "INT_LINE_TRIGGER_ENABLE", 1)
         freq_ok = self._set_int(interop, acq, "INT_LINE_TRIGGER_FREQ", clamped)
         readback = self._get_int(interop, acq, "INT_LINE_TRIGGER_FREQ")
+        log.readbacks["BLR"] = _short_value(readback)
         detail = f"要求 {rate}、限制後 {clamped}、讀回 {_fmt(readback)}"
         if enabled and freq_ok:
             log.ok("板卡 Internal Line Trigger", detail)

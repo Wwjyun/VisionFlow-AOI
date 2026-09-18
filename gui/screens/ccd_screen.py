@@ -799,6 +799,10 @@ class CcdScreen(QWidget):
         if numeric:
             # The digits are what the field writes down; the prose lines stay for reading.
             display.append("數字短碼（優先抄這組）：" + " ".join(numeric))
+        readback = str(getattr(report, "readback_text", "") or "")
+        if readback:
+            # Values read back from the camera; copied with the digits so one trip is conclusive.
+            display.append("讀回值（一併抄回）：" + readback)
         display.extend(lines)
         failures = [
             str(getattr(step, "code", "")) for step in getattr(report, "steps", ()) or ()

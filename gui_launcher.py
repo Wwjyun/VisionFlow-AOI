@@ -381,7 +381,12 @@ def sapera_diagnose_text(report) -> str:
     lines = [report.summary(), ""]
     numeric = getattr(report, "numeric_line", None)
     if callable(numeric):
-        lines.extend([f"數字短碼（優先抄這組）：{numeric()}", ""])
+        lines.append(f"數字短碼（優先抄這組）：{numeric()}")
+    readback = str(getattr(report, "readback_text", "") or "")
+    if readback:
+        lines.append(f"讀回值（一併抄回）：{readback}")
+    if callable(numeric) or readback:
+        lines.append("")
     lines.extend(report.lines())
     lines.extend(["", f"完整報告：{report.report_path}", f"機器可讀報告：{report.log_path}"])
     return "\n".join(lines)

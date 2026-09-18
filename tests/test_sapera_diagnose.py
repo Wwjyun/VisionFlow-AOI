@@ -429,6 +429,29 @@ class AllStepsPassTests(DiagnoseHarness):
         self.assertEqual(payload["summary"], report.summary())
         self.assertTrue(payload["passed"])
 
+    def test_readback_row_carries_the_hardware_values_in_a_fixed_ascii_order(self):
+        """One copyable row per trip: the field cannot bring the report file back."""
+
+        report = self.run_diagnose()
+
+        self.assertEqual(
+            report.readback_text,
+            "TM=Off LR=5000 LRMIN=? LRMAX=? BLR=5000 EXP=1200 GAIN=1 W=8 H=4 IMG=8x4 MEAN=14.0",
+        )
+        self.assertTrue(report.readback_text.isascii())
+        text = Path(report.report_path).read_text(encoding="utf-8")
+        self.assertIn("== 讀回值（一併抄回） ==", text)
+        self.assertIn(report.readback_text, text)
+        payload = json.loads(Path(report.log_path).read_text(encoding="utf-8"))
+        self.assertEqual(payload["readbacks"], report.readback_text)
+
+    def test_readback_row_survives_a_failed_s6_write(self):
+        self.interop.features.pop("AcquisitionLineRate")
+        report = self.run_diagnose()
+
+        self.assertIn("LR=na", report.readback_text)
+        self.assertIn("TM=Off", report.readback_text)
+
     def test_s5_creates_and_releases_every_object_the_camera_uses(self):
         self.run_diagnose()
 

@@ -37,7 +37,7 @@ from devices.sapera_api import (
     locate_assembly,
     translate_exception,
 )
-from devices.sapera_camera import BUFFER_COUNT, SaperaLineScanCamera
+from devices.sapera_camera import BUFFER_COUNT, READBACK_KEYS, SaperaLineScanCamera
 
 # ============================================================
 # Field diagnosis for Sapera LT (Todo.md P11).
@@ -148,6 +148,9 @@ class DiagnoseReport:
     log_path: str
     summary_text: str = ""
     sapera_calls: tuple[str, ...] = ()
+    # One ASCII row of values read back from the hardware (`TM=Off LR=300 ... W=16384 MEAN=12.3`);
+    # the offline field copies it together with the numeric row, so a report is conclusive.
+    readback_text: str = ""
 
     def lines(self) -> tuple[str, ...]:
         return tuple(step.line() for step in self.steps)
@@ -225,6 +228,24 @@ def numeric_codes(step: DiagnoseStep) -> tuple[str, ...]:
         seen.add(match.group(1))
         extra.append(f"{step_part}{match.group(1)}")
     return (primary, *extra[:_MAX_EXTRA_NUMERIC])
+
+
+# READBACK_KEYS (owned by the camera) orders the row, then S7 adds the frame it received.
+READBACK_ROW_KEYS = READBACK_KEYS + ("IMG", "MEAN")
+
+
+def readback_row(readbacks: Mapping[str, str]) -> str:
+    """`TM=Off LR=300 ...` in a fixed order; keys that were never read are omitted."""
+
+    return " ".join(f"{key}={readbacks[key]}" for key in READBACK_ROW_KEYS if readbacks.get(key))
+
+
+def _camera_readbacks(camera) -> dict[str, str]:
+    getter = getattr(camera, "apply_readbacks", None)
+    try:
+        return dict(getter()) if callable(getter) else {}
+    except Exception:  # noqa: BLE001 - readbacks are advisory; the step result stands on its own
+        return {}
 
 
 def numeric_legend() -> dict[str, str]:
@@ -445,6 +466,7 @@ class _Context:
         self.lines: list[str] = []
         self.calls: list[str] = []
         self.notes: list[DiagnoseNote] = []
+        self.readbacks: dict[str, str] = {}
 
     def add(self, text: str) -> None:
         """One detail line that carries no error code."""
@@ -734,11 +756,13 @@ def _step_s6(
     try:
         status = camera.connect(connection, acquisition, trigger)
     except (SaperaError, DeviceError) as exc:
+        context.readbacks.update(_camera_readbacks(camera))
         code = getattr(exc, "code", "") or "E-0901"
         context.add_note(code, str(exc))
         return "FAIL", _failure_detail(exc if isinstance(exc, SaperaError) else SaperaError(code, str(exc)))
 
     notes = tuple(camera.apply_notes())
+    context.readbacks.update(_camera_readbacks(camera))
     context.add(f"連線狀態：{status.state.value}、{status.frame_width}×{status.frame_height}、訊號 {'有' if status.has_signal else '無'}")
     for note in notes:
         if note.code:
@@ -789,10 +813,12 @@ def _step_s7(
         return "FAIL", _badge("E-0703")
 
     height, width = int(frame.shape[0]), int(frame.shape[1])
+    context.readbacks["IMG"] = f"{width}x{height}"
     values = frame.astype(np.float64)
     minimum, maximum, mean = float(values.min()), float(values.max()), float(values.mean())
     context.add(f"影像：{width}×{height}、dtype {frame.dtype}")
     context.add(f"灰階統計：min {minimum:.0f}、max {maximum:.0f}、mean {mean:.2f}")
+    context.readbacks["MEAN"] = f"{mean:.1f}"
     if int(frame.dtype.itemsize) != 1:
         context.add_note("E-0704", f"像素格式 {frame.dtype} 非 8-bit 單色")
     return "PASS", f"{width}×{height} min{minimum:.0f} max{maximum:.0f} mean{mean:.1f}"
@@ -880,6 +906,8 @@ def _text_report(step_payload: list[dict], context: _Context, versions: SaperaVe
         "== 數字短碼（優先抄這一組） ==",
         "  格式：<步驟 2 位><原因 4 位>；原因＝錯誤碼去掉 E-（0000 PASS、9999 SKIP、9998 FAIL 無碼）",
         "  " + " ".join(entry.get("numeric", "") for entry in step_payload),
+        "== 讀回值（一併抄回） ==",
+        "  " + (readback_row(context.readbacks) or "（無）"),
     ]
     lines.extend(f"  第 {entry['code']} 步：{entry.get('numeric', '')}" for entry in step_payload)
     lines.append("")
@@ -1061,6 +1089,7 @@ def run_sapera_diagnose(
         "timestamp": stamp,
         "summary": summary,
         "numeric": " ".join(group for step in steps for group in numeric_codes(step)),
+        "readbacks": readback_row(context.readbacks),
         "passed": bool(steps) and all(step.status == "PASS" for step in steps),
         "versions": {
             "assembly_path": versions.assembly_path,
@@ -1078,7 +1107,9 @@ def run_sapera_diagnose(
     )
     if problem:
         context.add_note("E-0901", problem)
-    return DiagnoseReport(steps, report_path, log_path, summary, tuple(context.calls))
+    return DiagnoseReport(
+        steps, report_path, log_path, summary, tuple(context.calls), readback_row(context.readbacks)
+    )
 
 
 def run_machine_sapera_diagnose(store: CcdMachineSettingsStore | None = None, **kwargs) -> DiagnoseReport:

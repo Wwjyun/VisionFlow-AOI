@@ -71,6 +71,26 @@ S8 PASS 已斷線並清理完整報告：outputs\logs\camera\sapera-diagnose-202
 010000 020000 030000 040000 050000 060602 079999 089999
 ```
 
+### 讀回值（數字短碼下面那一行，一併抄回）
+
+S6／S7 會把硬體實際讀回的值列成一行英數字，例如：
+
+```text
+TM=Off LR=300 LRMIN=300 LRMAX=48000 BLR=300 EXP=100 GAIN=1 W=16384 H=720 IMG=16384x720 MEAN=87.4
+```
+
+| 欄位 | 意義 |
+| --- | --- |
+| `TM` | 相機 Trigger Mode 讀回（連續模式應為 Off，外部觸發應為 On；`na`＝相機沒有這個 feature） |
+| `LR` | 相機 `AcquisitionLineRate` 讀回（Hz；`na`＝目前不可用，通常是 Trigger Mode 仍為 On） |
+| `LRMIN`／`LRMAX` | 相機回報的線速率範圍（`?`＝這台 Sapera 讀不到範圍） |
+| `BLR` | 板卡 `INT_LINE_TRIGGER_FREQ` 讀回（Hz） |
+| `EXP`／`GAIN` | 曝光（µs）與增益讀回；寫入失敗時是相機目前的值 |
+| `W`／`H` | 依 CCF 建立的 buffer 寬高（應為 16384 × Length） |
+| `IMG`／`MEAN` | S7 實際收到的影像尺寸與平均灰階（全黑約 0、過曝接近 255） |
+
+沒有讀到的欄位會省略；`?` 代表無法讀取。
+
 抄寫表（現場填寫後整列回報即可）：
 
 | 步驟 | 數字短碼 |
@@ -96,7 +116,7 @@ S8 PASS 已斷線並清理完整報告：outputs\logs\camera\sapera-diagnose-202
 | S3 | Sapera API 自檢 | 相機程式用到的每個 .NET 成員都在這台機器的 DLL 裡（反射檢查，尚未碰硬體） | `S3 PASS`，或 `E-0301` 加上缺少的成員名稱，或 `E-0506`（沒有可用的 buffer 建構子） |
 | S4 | 列舉 server／resource／CCF | 擷取卡 server、Acq／AcqDevice 數量與名稱、`CamFiles\User` 內的 CCF 檔數量 | `S4 PASS n 個 server、CCF m 個（檔名）`，或 `E-0401`／`E-0402`／`E-0403` |
 | S5 | 建立並釋放 Sapera 物件 | `SapAcqDevice`、`SapAcquisition`、`SapBufferWithTrash`、`SapAcqToBuf` 依相機順序建立後再完整釋放 | `S5 PASS 建立並釋放 n 個物件`，或 `E-0404`、`E-0502`～`E-0504`、`E-0801` |
-| S6 | 連線並寫入參數後讀回 | 真正用 `SaperaLineScanCamera` 連線、寫入 Exposure／Gain／Length／Line Rate／觸發並讀回 | `S6 PASS 參數寫入並讀回 n 項`，或 `E-0402`～`E-0404`／`E-0502`～`E-0505`／`E-0601`～`E-0609`／`E-0704` |
+| S6 | 連線並寫入參數後讀回 | 真正用 `SaperaLineScanCamera` 連線、寫入 Exposure／Gain／Length／Line Rate／觸發並讀回 | `S6 PASS 參數寫入並讀回 n 項`，或 `E-0402`～`E-0404`／`E-0502`～`E-0505`／`E-0601`～`E-0610`／`E-0704` |
 | S7 | Snap 一張並檢查影像 | Snap 一張，檢查影像尺寸與灰階統計（min／max／mean） | `S7 PASS 寬×高 min.. max.. mean..`，或 `E-0701`～`E-0705` |
 | S8 | 斷線與清理 | 斷線並釋放所有 Sapera 物件，失敗會單獨回報 | `S8 PASS 已斷線並清理`，或 `E-0801` |
 
@@ -143,7 +163,8 @@ S8 PASS 已斷線並清理完整報告：outputs\logs\camera\sapera-diagnose-202
 | E-0606 | One Frame（`EXT_FRAME_TRIGGER_ENABLE`）寫入失敗 | 板卡不支援單張模式 | 確認觸發模式；必要時改用連續模式測試 |
 | E-0607 | 外部觸發未 arm | 外部線觸發沒有真的開啟 | 確認米輪有在轉、編碼器脈衝有進來後重新連線 |
 | E-0608 | 板卡內部線觸發（`INT_LINE_TRIGGER`）寫入失敗 | 板卡的 `INT_LINE_TRIGGER_ENABLE`／`FREQ` 寫不進去（連續模式） | 報告檔列出要求值、限制後的值與讀回值；用 CamExpert 確認板卡 Internal Line Trigger 設定 |
-| E-0609 | 相機 TriggerMode 無法切回 Off（連續模式） | 相機停在外部觸發（TriggerMode=On），會一直等 CC1 脈衝、線速率顯示 n/a | 在 CamExpert 的 attached camera → I/O controls 把 Trigger mode 設為 Off，板卡 Line Sync Source 設為 None；報告會列出 TriggerMode 讀回值 |
+| E-0609 | 相機 TriggerMode 讀回與要求不符（連續要 Off、外部要 On） | 寫入 TriggerMode 被相機拒絕，讀回仍是另一個值；連續模式時相機會一直等 CC1、線速率顯示 n/a，外部模式時相機不理 CC1 | 報告列出每個 selector 的「寫入前→讀回」；在 CamExpert 的 attached camera → I/O controls 手動切 Trigger Mode 並確認可寫 |
+| E-0610 | 相機 TriggerMode 無法寫入也無法讀回 | 相機沒有 TriggerMode feature（外部模式），或寫入與讀回都失敗 | 用 CamExpert 確認 I/O controls 內有 Trigger Mode |
 | E-0701 | Snap 啟動失敗 | `SapAcqToBuf.Snap()` 被拒、前一次取像尚未結束 | 停止預覽後再試；必要時重新連線 |
 | E-0702 | 等待影像逾時 | 沒有觸發（相機仍在 TriggerMode=On 或外部觸發未 arm）、線速率太低使一張影像超過等待上限、相機沒送圖 | 連續模式先確認 S6 沒有 `0609`；把 Recipe 的線速率調到實際值（30 Hz 掃 720 線要 24 秒）；外部模式確認米輪脈衝 |
 | E-0703 | 影像複製失敗 | `ReadRect` 失敗、buffer 尚未建立 | 重新連線後再試；持續失敗通常是驅動或記憶體問題 |
@@ -152,7 +173,7 @@ S8 PASS 已斷線並清理完整報告：outputs\logs\camera\sapera-diagnose-202
 | E-0801 | Sapera 物件清理失敗 | Destroy／Dispose 卡住、驅動已異常 | 重新連線；若持續出現請重開機並記錄當時的 S6 結果 |
 | E-0901 | Sapera 呼叫發生未預期錯誤 | 上述分類以外的例外 | 把整行短碼抄回，並記下當時操作步驟 |
 
-> 交叉檢查結果：`ERROR_MESSAGES` 目前有 **34** 個錯誤碼，本表逐一列出 34 個，沒有缺漏、
+> 交叉檢查結果：`ERROR_MESSAGES` 目前有 **35** 個錯誤碼，本表逐一列出 35 個，沒有缺漏、
 > 也沒有文件裡多出來的字號。每個字號都能寫出上表那一欄「機台上怎麼處理」的具體動作；
 > 其中 `E-0203` 是提醒而非中斷（版本不符仍會繼續嘗試），`E-0401`／`E-0402` 的現場
 > 動作相近（都是驅動與硬體檢查），回報時請一併抄回 S4 那一行以便區分。
@@ -190,7 +211,9 @@ S8 PASS 已斷線並清理完整報告：outputs\logs\camera\sapera-diagnose-202
 | 相機 | Teledyne DALSA Linea Mono 16K（`LA-HM-16K05A-00-R`），Camera Link，Sapera `AcqDevice` resource |
 | 影像 | 16384 × `CROP_HEIGHT`、8-bit 單色（CCF 需設為 Mono8） |
 | 線速率 | 300–48000 Hz（現場 CamExpert 確認相機最低 300 Hz；程式會讀相機回報的範圍並夾住，板卡另依 `INT_LINE_TRIGGER_FREQ_MIN/MAX` 限制） |
-| 外部觸發 | 米輪編碼器脈衝進 CC1，`LINE_INTEGRATE_METHOD_3`、`EXT_LINE_TRIGGER_ENABLE=1` |
+| 外部觸發 | 米輪編碼器脈衝進 CC1，`LINE_INTEGRATE_METHOD_3`、`EXT_LINE_TRIGGER_ENABLE=1`；相機 Trigger Mode = On |
+| 相機觸發 feature（Linea Camera Link 手冊 03-032-20206） | `Trigger Selector`、`Trigger Source` 為唯讀，只有 `Trigger Mode`（Off＝內部 free-run、On＝外部 CC1）可寫；程式以讀回 Trigger Mode 判斷成功 |
+| 線速率與曝光 | `AcquisitionLineRate` 只在 Trigger Mode Off 時可用；線週期必須大於曝光 + 1 µs（例如曝光 1200 µs 時線速率上限約 830 Hz，5000 Hz 時曝光上限約 199 µs） |
 
 診斷跑完時，短碼應該長得像（數值依現場設定）：
 

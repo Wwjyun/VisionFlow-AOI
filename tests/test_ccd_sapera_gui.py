@@ -5,7 +5,7 @@ import tempfile
 import threading
 import time
 import unittest
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from unittest.mock import patch
 
@@ -588,6 +588,19 @@ class SaperaGuiTests(unittest.TestCase):
 
         text = screen.sapera_diagnose_result_label.text()
         self.assertIn("數字短碼（優先抄這組）：010000 020000 030000 040000 050000 060601 060602 070000 080000", text)
+        self.assertNotIn("讀回值", text, "no readback row is shown when the report has none")
+
+    def test_panel_shows_the_readback_row_under_the_digits(self):
+        camera = FakeSaperaCamera(versions=SaperaVersions(assembly_file_version="8.60.0.0"))
+        screen, _controller = self._screen(camera)
+        screen.set_mode("admin")
+        report = _report(self._diagnose_steps())
+        row = "TM=Off LR=300 LRMIN=300 LRMAX=48000 EXP=100 GAIN=1 W=16384 H=720 IMG=16384x720 MEAN=12.5"
+        screen.set_sapera_diagnose_report(replace(report, readback_text=row))
+
+        lines = screen.sapera_diagnose_result_label.text().splitlines()
+        digits = next(index for index, line in enumerate(lines) if line.startswith("數字短碼"))
+        self.assertEqual(lines[digits + 1], f"讀回值（一併抄回）：{row}")
 
     def test_failing_report_keeps_the_failing_short_code_visible(self):
         camera = FakeSaperaCamera(versions=SaperaVersions(assembly_file_version="8.60.0.0"))

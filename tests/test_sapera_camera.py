@@ -17,7 +17,7 @@ from devices.ccd_models import (
     TriggerSettings,
 )
 from devices.sapera_api import ACQ_CAPABILITIES, ACQ_PARAMETERS, ACQ_VALUES, BufferFormat, SaperaError
-from devices.sapera_camera import EXPOSURE_FEATURES, STOP_COOLDOWN_SEC, SaperaLineScanCamera
+from devices.sapera_camera import EXPOSURE_FEATURES, READBACK_KEYS, STOP_COOLDOWN_SEC, SaperaLineScanCamera
 
 SERVER = "Xtium-CL_MX4_1"
 
@@ -426,7 +426,92 @@ class ConnectSequenceTests(SaperaCameraTestBase):
         self.assertEqual(status.state, CameraState.IDLE)
         failed = {note.code: note for note in self.camera.apply_notes() if note.code}
         self.assertIn("E-0609", failed)
-        self.assertIn("TriggerMode 讀回 On", failed["E-0609"].detail)
+        self.assertIn("LineStart：On→On（寫入被拒）", failed["E-0609"].detail)
+
+    def free_run_note(self):
+        return next(note for note in self.camera.apply_notes() if note.item == "相機 TriggerMode")
+
+    def test_access_mode_text_without_write_no_longer_blocks_trigger_mode_off(self):
+        """Field `060609` with TriggerMode On: xx_ccd's strict "Write" access gate blocked every write.
+
+        The Exposure/Gain path the field confirmed never used that gate; the Sapera enum text is not
+        guaranteed to spell "Write" (e.g. "RW").
+        """
+
+        self.interop.features["TriggerMode"] = "On"
+        self.interop.feature_access_mode = lambda device, name: "RW" if name in self.interop.features else None
+        self.connect()
+
+        self.assertEqual(self.interop.features["TriggerMode"], "Off")
+        self.assertEqual([note.code for note in self.camera.apply_notes() if note.code], [])
+        self.assertIn("On→Off（已寫入）", self.free_run_note().detail)
+
+    def test_trigger_mode_already_off_is_not_a_failure_even_when_writes_are_rejected(self):
+        """Field `060609` after the operator set TriggerMode Off in CamExpert: the readback decides."""
+
+        self.interop.features["TriggerMode"] = "Off"
+        self.interop.read_only_features.add("TriggerMode")
+        self.connect()
+
+        self.assertEqual([note.code for note in self.camera.apply_notes() if note.code], [])
+        self.assertIn("Off→Off（寫入被拒）", self.free_run_note().detail)
+
+    def test_camera_without_trigger_selector_writes_trigger_mode_directly(self):
+        del self.interop.features["TriggerSelector"]
+        self.interop.features["TriggerMode"] = "On"
+        self.connect()
+
+        self.assertEqual(self.interop.features["TriggerMode"], "Off")
+        self.assertEqual([note.code for note in self.camera.apply_notes() if note.code], [])
+        self.assertIn("（目前 selector）：On→Off", self.free_run_note().detail)
+
+    def test_unsupported_selector_names_fall_back_to_the_current_selector(self):
+        self.interop.features["TriggerMode"] = "On"
+        base = self.interop.set_feature_string
+
+        def reject_selectors(device, name, value):
+            if name == "TriggerSelector":
+                self.interop._record("set_feature_string", name, value)
+                return False
+            return base(device, name, value)
+
+        self.interop.set_feature_string = reject_selectors
+        self.connect()
+
+        self.assertEqual(self.interop.features["TriggerMode"], "Off")
+        self.assertIn("不支援的 selector：FrameStart、LineStart、AcquisitionStart、ExposureStart", self.free_run_note().detail)
+
+    def test_manual_update_mode_is_committed_before_the_readback_is_judged(self):
+        io = self.interop
+        io.features["TriggerMode"] = "On"
+        pending: dict[str, str] = {}
+        base_set, base_get, base_update = io.set_feature_string, io.get_feature_string, io.update_features
+
+        def cached_set(device, name, value):
+            if name == "TriggerMode":
+                io._record("set_feature_string", name, value)
+                pending[name] = value
+                return True
+            return base_set(device, name, value)
+
+        def committed_update(device):
+            io.features.update(pending)
+            return base_update(device)
+
+        io.set_feature_string, io.update_features = cached_set, committed_update
+        io.get_feature_string = base_get
+        self.connect()
+
+        self.assertEqual(io.features["TriggerMode"], "Off")
+        self.assertNotIn("E-0609", [note.code for note in self.camera.apply_notes()])
+
+    def test_trigger_mode_that_can_be_neither_written_nor_read_is_e0610(self):
+        self.interop.read_only_features.add("TriggerMode")
+        base_get = self.interop.get_feature_string
+        self.interop.get_feature_string = lambda device, name: None if name == "TriggerMode" else base_get(device, name)
+        self.connect()
+
+        self.assertIn("E-0610", [note.code for note in self.camera.apply_notes()])
 
     def test_line_rate_hidden_by_trigger_mode_on_is_written_after_free_run_is_committed(self):
         """Models the field camera: AcquisitionLineRate is n/a until TriggerMode=Off reaches the device."""
@@ -477,11 +562,64 @@ class ConnectSequenceTests(SaperaCameraTestBase):
         self.assertIn(("set_feature_int64", "AcquisitionLineRate", 30), self.interop.calls)
         self.assertNotIn("Internal Line Rate 範圍", [note.item for note in self.camera.apply_notes()])
 
-    def test_external_trigger_mode_does_not_report_e0609(self):
+    def make_linea_selectors_read_only(self):
+        """Linea CL manual: Trigger Selector and Trigger Source are RO; only Trigger Mode is writable."""
+
+        self.interop.features.update(TriggerSelector="LineStart", TriggerSource="CC1")
+        self.interop.read_only_features.update({"TriggerSelector", "TriggerSource"})
+
+    def test_linea_read_only_selector_still_reaches_free_run(self):
+        """Field `060609`: the selector write always failed, so TriggerMode was never judged."""
+
+        self.make_linea_selectors_read_only()
+        self.interop.features["TriggerMode"] = "On"
+        self.connect()
+
+        self.assertEqual(self.interop.features["TriggerMode"], "Off")
+        self.assertEqual([note.code for note in self.camera.apply_notes() if note.code], [])
+        self.assertIn("唯讀或不支援的 selector", self.free_run_note().detail)
+
+    def test_linea_external_trigger_turns_trigger_mode_on_despite_read_only_selector_and_source(self):
+        self.make_linea_selectors_read_only()
+        self.interop.features["TriggerMode"] = "Off"
+        self.connect(mode=TriggerMode.EXTERNAL)
+
+        self.assertEqual(self.interop.features["TriggerMode"], "On")
+        self.assertEqual(self.interop.features["TriggerSource"], "CC1", "a read-only source stays CC1")
+        self.assertNotIn("E-0609", [note.code for note in self.camera.apply_notes()])
+        # The frame-level selectors are not toggled on a camera whose selector cannot be changed.
+        self.assertNotIn(("set_feature_string", "TriggerMode", "Off"), self.interop.calls)
+
+    def test_rejected_exposure_names_the_linea_line_period_limit(self):
+        """Linea manual: line period must exceed exposure + 1 us; 1200 us cannot run at 5000 Hz."""
+
+        self.interop.read_only_features.add("ExposureTime")
+        self.connect(internal_line_rate_hz=5000, exposure_time=1200)
+
+        failed = {note.code: note for note in self.camera.apply_notes() if note.code}
+        self.assertIn("E-0602", failed)
+        self.assertIn("5000 Hz 時上限約 199 µs", failed["E-0602"].detail)
+
+    def test_apply_readbacks_report_what_the_hardware_holds_after_connect(self):
+        self.make_linea_selectors_read_only()
+        self.interop.features["TriggerMode"] = "On"
+        self.interop.feature_int_range = lambda device, name: (300, 48000) if name == "AcquisitionLineRate" else (None, None)
+        self.connect(internal_line_rate_hz=30, exposure_time=1200, gain=1)
+
+        readbacks = self.camera.apply_readbacks()
+        self.assertEqual(readbacks["TM"], "Off")
+        self.assertEqual((readbacks["LR"], readbacks["LRMIN"], readbacks["LRMAX"]), ("300", "300", "48000"))
+        self.assertEqual((readbacks["EXP"], readbacks["GAIN"]), ("1200", "1"))
+        self.assertEqual((readbacks["W"], readbacks["H"]), ("8", "4"))
+
+    def test_external_trigger_mode_that_stays_off_is_e0609(self):
+        self.interop.features["TriggerMode"] = "Off"
         self.interop.read_only_features.add("TriggerMode")
         self.connect(mode=TriggerMode.EXTERNAL)
 
-        self.assertNotIn("E-0609", [note.code for note in self.camera.apply_notes()])
+        failed = {note.code: note for note in self.camera.apply_notes() if note.code}
+        self.assertIn("E-0609", failed)
+        self.assertIn("要求 TriggerMode On", failed["E-0609"].detail)
 
     def test_board_internal_line_trigger_failure_has_its_own_code(self):
         original = self.interop.acq_set_int
@@ -803,6 +941,7 @@ class RuntimeAvailabilityTests(unittest.TestCase):
         source = Path("devices/sapera_camera.py").read_text(encoding="utf-8")
         used = set(re.findall(r'"([A-Z][A-Z0-9_]{3,})"', source))
         declared = set(ACQ_PARAMETERS) | set(ACQ_VALUES) | set(ACQ_CAPABILITIES)
+        declared |= set(READBACK_KEYS)  # report keys for the field row, not Sapera names
         self.assertTrue(used, "expected quoted Sapera parameter names")
         self.assertEqual(used - declared, set())
 
