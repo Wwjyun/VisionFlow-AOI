@@ -1,7 +1,9 @@
 from __future__ import annotations
 
-from PySide6.QtCore import QLineF, QPointF, QRectF, Qt, QTimer, Signal
-from PySide6.QtGui import QBrush, QColor, QImage, QPainter, QPen, QPixmap, QWheelEvent
+import math
+
+from PySide6.QtCore import QLineF, QPointF, QRect, QRectF, QSize, Qt, QTimer, Signal
+from PySide6.QtGui import QBrush, QColor, QImage, QPainter, QPen, QPixmap, QTransform, QWheelEvent
 from PySide6.QtWidgets import (
     QFrame,
     QGraphicsLineItem,
@@ -20,6 +22,12 @@ from PySide6.QtWidgets import (
 
 from core.performance import PipelineProfiler
 from gui import icons
+from gui.image_pyramid import (
+    PREVIEW_LOD_MIN_SIDE,
+    PREVIEW_OVERVIEW_MAX_SIDE,
+    PreviewImage,
+    build_preview_levels,
+)
 from gui.theme import COLORS, DEFECT_COLOR_FALLBACK, DEFECT_COLORS, R_LG
 from gui.widgets.common import EmptyState, IconButton
 
@@ -29,6 +37,9 @@ from gui.widgets.common import EmptyState, IconButton
 
 ZOOM_MIN = 0.05
 ZOOM_MAX = 8.0
+# Extra scene area, per side as a fraction of the visible size, converted with each
+# detail update so small pans do not rebuild the detail pixmap.
+LOD_DETAIL_MARGIN = 0.125
 
 
 class _DefectItem(QGraphicsRectItem):
@@ -126,7 +137,7 @@ class _GraphicsView(QGraphicsView):
 
     def wheelEvent(self, event: QWheelEvent) -> None:
         viewer: ImageViewer = self.parent_viewer
-        if viewer.pixmap_item.pixmap().isNull():
+        if not viewer.has_image():
             super().wheelEvent(event)
             return
         factor = 1.12 if event.angleDelta().y() > 0 else 1 / 1.12
@@ -154,6 +165,12 @@ class ImageViewer(QWidget):
         self._show_overlay = True
         self._selected_defect_id = None
         self._image_name = ""
+        self.lod_min_side = PREVIEW_LOD_MIN_SIDE
+        self.overview_max_side = PREVIEW_OVERVIEW_MAX_SIDE
+        self._levels: tuple[QImage, ...] = ()
+        self._image_size = QSize()
+        self._detail_level: int | None = None
+        self._detail_scene_rect = QRectF()
 
         outer = QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
@@ -214,6 +231,11 @@ class ImageViewer(QWidget):
         self.pixmap_item = QGraphicsPixmapItem()
         self.pixmap_item.setZValue(0)
         self._scene.addItem(self.pixmap_item)
+        # Visible-region pixels from the pyramid level matching the zoom (large images only).
+        self.detail_item = QGraphicsPixmapItem()
+        self.detail_item.setZValue(1)
+        self.detail_item.setVisible(False)
+        self._scene.addItem(self.detail_item)
 
         self._scan_line = QGraphicsLineItem()
         pen = QPen(QColor(COLORS["accent"]), 2)
@@ -226,6 +248,12 @@ class ImageViewer(QWidget):
         self.view = _GraphicsView(self._scene)
         self.view.parent_viewer = self
         self.view.cursor_moved.connect(self._on_cursor_moved)
+        self._detail_timer = QTimer(self)
+        self._detail_timer.setSingleShot(True)
+        self._detail_timer.setInterval(0)
+        self._detail_timer.timeout.connect(self.update_detail_now)
+        self.view.horizontalScrollBar().valueChanged.connect(self._schedule_detail_update)
+        self.view.verticalScrollBar().valueChanged.connect(self._schedule_detail_update)
 
         self.empty_state = EmptyState(
             "image",
@@ -295,22 +323,46 @@ class ImageViewer(QWidget):
     # ------------------------------------------------------------------
     # image loading
     # ------------------------------------------------------------------
-    def set_qimage(self, image: QImage, name: str = "") -> dict:
+    def set_qimage(self, image: QImage | PreviewImage, name: str = "") -> dict:
+        """Show an image; large images display through a level-of-detail pyramid.
+
+        Only the coarsest level becomes a whole-image pixmap. When the zoom needs more detail,
+        the visible region of the matching level is converted on demand, so a 16384x13000
+        image never holds a full-resolution QPixmap. Scene coordinates stay in original pixels.
+        """
         profiler = PipelineProfiler()
+        if isinstance(image, PreviewImage):
+            levels = image.levels
+        else:
+            with profiler.measure("preview_pyramid"):
+                levels = build_preview_levels(image, self.lod_min_side, self.overview_max_side)
         with profiler.measure("qpixmap_conversion"):
-            pixmap = QPixmap.fromImage(image)
+            pixmap = QPixmap.fromImage(levels[-1])
         if pixmap.isNull():
             self.last_error = "無法建立圖片預覽。"
             self.last_display_performance = profiler.snapshot()
             return self.last_display_performance
         self.last_error = ""
+        full = levels[0]
         with profiler.measure("scene_update"):
             if name:
                 self._image_name = name
                 self.name_label.setText(name)
+            self._levels = tuple(levels)
+            self._image_size = QSize(full.width(), full.height())
+            self._clear_detail()
             self.pixmap_item.setPixmap(pixmap)
-            self._scene.setSceneRect(pixmap.rect())
-            self.size_label.setText(f"{pixmap.width()} × {pixmap.height()} px")
+            overview = len(self._levels) > 1
+            self.pixmap_item.setTransform(
+                QTransform.fromScale(full.width() / pixmap.width(), full.height() / pixmap.height())
+            )
+            # The overview is pre-filtered with INTER_AREA; smooth scaling avoids blocky
+            # upscaling while detail loads. Full-resolution images keep crisp pixels.
+            self.pixmap_item.setTransformationMode(
+                Qt.TransformationMode.SmoothTransformation if overview else Qt.TransformationMode.FastTransformation
+            )
+            self._scene.setSceneRect(QRectF(0, 0, full.width(), full.height()))
+            self.size_label.setText(f"{full.width()} × {full.height()} px")
         with profiler.measure("fit_to_view"):
             self.fit_to_view()
         with profiler.measure("visibility_update"):
@@ -318,9 +370,95 @@ class ImageViewer(QWidget):
         self.last_display_performance = profiler.snapshot()
         return self.last_display_performance
 
+    def has_image(self) -> bool:
+        return not self.pixmap_item.pixmap().isNull()
+
+    def image_size(self) -> QSize:
+        return QSize(self._image_size)
+
+    # ------------------------------------------------------------------
+    # level-of-detail display
+    # ------------------------------------------------------------------
+    def _level_for_zoom(self, zoom: float) -> int:
+        """Coarsest level that still has at least one source pixel per screen pixel."""
+        full_width = max(1, self._image_size.width())
+        for index in range(len(self._levels) - 1, 0, -1):
+            if self._levels[index].width() / full_width >= zoom * (1.0 - 1e-6):
+                return index
+        return 0
+
+    def detail_level(self) -> int | None:
+        """Pyramid level currently shown for the visible region, or ``None`` for the overview."""
+        return self._detail_level if self.detail_item.isVisible() else None
+
+    def _schedule_detail_update(self) -> None:
+        if len(self._levels) > 1:
+            self._detail_timer.start()
+
+    def update_detail_now(self) -> None:
+        self._detail_timer.stop()
+        if len(self._levels) <= 1 or not self.has_image():
+            self._clear_detail()
+            return
+        level_index = self._level_for_zoom(self._zoom)
+        if level_index == len(self._levels) - 1:
+            self._clear_detail()
+            return
+        image_rect = QRectF(0, 0, self._image_size.width(), self._image_size.height())
+        visible = self.view.mapToScene(self.view.viewport().rect()).boundingRect().intersected(image_rect)
+        if visible.isEmpty():
+            self._clear_detail()
+            return
+        if (
+            self.detail_item.isVisible()
+            and self._detail_level == level_index
+            and self._detail_scene_rect.contains(visible)
+        ):
+            return
+        margin_x = visible.width() * LOD_DETAIL_MARGIN
+        margin_y = visible.height() * LOD_DETAIL_MARGIN
+        wanted = visible.adjusted(-margin_x, -margin_y, margin_x, margin_y).intersected(image_rect)
+        level = self._levels[level_index]
+        scale_x = level.width() / self._image_size.width()
+        scale_y = level.height() / self._image_size.height()
+        left = max(0, math.floor(wanted.left() * scale_x))
+        top = max(0, math.floor(wanted.top() * scale_y))
+        right = min(level.width(), math.ceil(wanted.right() * scale_x))
+        bottom = min(level.height(), math.ceil(wanted.bottom() * scale_y))
+        if right <= left or bottom <= top:
+            self._clear_detail()
+            return
+        source = QRect(left, top, right - left, bottom - top)
+        pixmap = QPixmap.fromImage(level.copy(source))
+        if pixmap.isNull():
+            self._clear_detail()
+            return
+        self.detail_item.setPixmap(pixmap)
+        self.detail_item.setTransform(QTransform.fromScale(1.0 / scale_x, 1.0 / scale_y))
+        self.detail_item.setPos(left / scale_x, top / scale_y)
+        # Downscaled levels are filtered smoothly; magnified originals keep crisp pixels.
+        self.detail_item.setTransformationMode(
+            Qt.TransformationMode.FastTransformation
+            if level_index == 0 and self._zoom >= 1.0
+            else Qt.TransformationMode.SmoothTransformation
+        )
+        self._detail_level = level_index
+        self._detail_scene_rect = QRectF(
+            left / scale_x, top / scale_y, source.width() / scale_x, source.height() / scale_y
+        )
+        self.detail_item.setVisible(True)
+
+    def _clear_detail(self) -> None:
+        self._detail_timer.stop()
+        self.detail_item.setVisible(False)
+        if not self.detail_item.pixmap().isNull():
+            self.detail_item.setPixmap(QPixmap())
+        self._detail_level = None
+        self._detail_scene_rect = QRectF()
+
     def set_image_name(self, name: str) -> None:
         self._image_name = name
-        if not self.pixmap_item.pixmap().isNull():
+        if self.has_image():
             self.name_label.setText(name)
 
     def set_backend_status(self, status: dict) -> None:
@@ -351,6 +489,10 @@ class ImageViewer(QWidget):
 
     def clear(self) -> None:
         self.pixmap_item.setPixmap(QPixmap())
+        self.pixmap_item.setTransform(QTransform())
+        self._levels = ()
+        self._image_size = QSize()
+        self._clear_detail()
         self._clear_defects()
         self.name_label.setText("尚未載入影像")
         self.size_label.setText("— × — px")
@@ -358,7 +500,7 @@ class ImageViewer(QWidget):
         self._update_empty_state()
 
     def _update_empty_state(self) -> None:
-        has_image = not self.pixmap_item.pixmap().isNull()
+        has_image = self.has_image()
         self.empty_state.setVisible(not has_image)
         self.view.setVisible(has_image)
 
@@ -366,14 +508,18 @@ class ImageViewer(QWidget):
     # zoom / fit
     # ------------------------------------------------------------------
     def fit_to_view(self) -> None:
-        if self.pixmap_item.pixmap().isNull():
+        if not self.has_image():
             return
-        self.view.fitInView(self.pixmap_item, Qt.AspectRatioMode.KeepAspectRatio)
+        self.view.fitInView(
+            QRectF(0, 0, self._image_size.width(), self._image_size.height()),
+            Qt.AspectRatioMode.KeepAspectRatio,
+        )
         self._zoom = self.view.transform().m11()
         self._update_zoom_label()
+        self._schedule_detail_update()
 
     def _zoom_by(self, factor: float) -> None:
-        if self.pixmap_item.pixmap().isNull():
+        if not self.has_image():
             return
         new_zoom = self._zoom * factor
         if new_zoom < ZOOM_MIN or new_zoom > ZOOM_MAX:
@@ -381,6 +527,7 @@ class ImageViewer(QWidget):
         self.view.scale(factor, factor)
         self._zoom = new_zoom
         self._update_zoom_label()
+        self._schedule_detail_update()
 
     def _update_zoom_label(self) -> None:
         self.zoom_label.setText(f"zoom {round(self._zoom * 100)}%")
@@ -389,6 +536,7 @@ class ImageViewer(QWidget):
         super().resizeEvent(event)
         self._position_running_label()
         self.view.viewport().update()
+        self._schedule_detail_update()
 
     def _position_running_label(self) -> None:
         if self.running_label.parentWidget() is None:
@@ -446,19 +594,21 @@ class ImageViewer(QWidget):
         self._zoom = self.view.transform().m11()
         self._update_zoom_label()
         self.view.centerOn(item)
+        self._schedule_detail_update()
         return True
 
     def zoom_scale(self) -> float:
         return float(self._zoom)
 
     def set_zoom_scale(self, zoom: float) -> None:
-        if self.pixmap_item.pixmap().isNull():
+        if not self.has_image():
             return
         zoom = max(ZOOM_MIN, min(ZOOM_MAX, float(zoom)))
         self.view.resetTransform()
         self.view.scale(zoom, zoom)
         self._zoom = zoom
         self._update_zoom_label()
+        self._schedule_detail_update()
 
     def _on_defect_clicked(self, defect_id) -> None:
         new_id = None if self._selected_defect_id == defect_id else defect_id
@@ -497,10 +647,10 @@ class ImageViewer(QWidget):
     # cursor / status
     # ------------------------------------------------------------------
     def _on_cursor_moved(self, scene_pos) -> None:
-        if scene_pos is None or self.pixmap_item.pixmap().isNull():
+        if scene_pos is None or not self.has_image():
             self.cursor_label.setText("x —  y —")
             return
-        rect = self.pixmap_item.pixmap().rect()
+        rect = self._image_size
         x, y = scene_pos.x(), scene_pos.y()
         if 0 <= x <= rect.width() and 0 <= y <= rect.height():
             self.cursor_label.setText(f"x {int(x)}  y {int(y)}")
@@ -514,7 +664,7 @@ class ImageViewer(QWidget):
         self.running_label.setText(f"檢測中 {pct}%")
         self.running_label.setVisible(running)
         self._position_running_label()
-        if running and not self.pixmap_item.pixmap().isNull():
+        if running and self.has_image():
             if not self._scan_timer.isActive():
                 self._scan_progress = 0.0
                 self._scan_timer.start()
@@ -524,7 +674,7 @@ class ImageViewer(QWidget):
             self._scan_line.setVisible(False)
 
     def _advance_scan_line(self) -> None:
-        rect = self.pixmap_item.pixmap().rect()
+        rect = self._image_size
         if rect.isEmpty():
             return
         self._scan_progress = (self._scan_progress + 0.012) % 1.0

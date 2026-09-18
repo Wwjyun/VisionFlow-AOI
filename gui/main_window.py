@@ -35,6 +35,7 @@ from devices.ccd_settings_store import CcdMachineSettingsStore
 from devices.factory import CcdDevices, create_ccd_devices
 from gui import theme
 from gui.ccd_controller import CcdController
+from gui.image_pyramid import PreviewImage
 from gui.permission_manager import MODE_LABELS, ModePasswordPrompt, PermissionManager
 from gui.preferences import GuiPreferences
 from gui.screens.batch_dashboard_screen import BatchDashboardScreen
@@ -1025,8 +1026,10 @@ class MainWindow(QMainWindow, LogMixin):
             on_thread_finished=self._on_preview_thread_finished,
         )
 
-    def _on_preview_loaded(self, path: Path, image, backend_status: dict) -> None:
-        viewer_performance = self.run_screen.image_viewer.set_qimage(image, name=Path(path).name)
+    def _on_preview_loaded(self, path: Path, preview, backend_status: dict) -> None:
+        viewer_performance = self.run_screen.image_viewer.set_qimage(preview, name=Path(path).name)
+        # Results thumbnails crop defects from the full-resolution image, not the display pyramid.
+        image = preview.image if isinstance(preview, PreviewImage) else preview
         display_performance = backend_status.setdefault("display_performance", {})
         display_performance["viewer"] = viewer_performance
         if self._preview_started_at is not None:
@@ -1050,6 +1053,10 @@ class MainWindow(QMainWindow, LogMixin):
             if self._restored_viewer_zoom > 0:
                 self.run_screen.image_viewer.set_zoom_scale(self._restored_viewer_zoom)
                 self._restored_viewer_zoom = 0.0
+        elif self.image_path is not None and Path(path) == self.image_path:
+            # A Recipe reload re-decoded the current file; share the viewer's copy instead of
+            # keeping a second full-resolution image alive.
+            self._current_image = image
         self.statusBar().showMessage(f"影像已載入：{path}")
         self._update_run_ready()
 

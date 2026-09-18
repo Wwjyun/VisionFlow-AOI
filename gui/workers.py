@@ -22,6 +22,12 @@ from core.performance import PipelineProfiler
 from core.pipeline import AOIPipeline
 from core.recipe_manager import RecipeManager
 from core.tiler import create_tiler
+from gui.image_pyramid import (
+    PREVIEW_LOD_MIN_SIDE,
+    PREVIEW_OVERVIEW_MAX_SIDE,
+    preview_image,
+    rgb_qimage_from_bgr,
+)
 
 
 # Worker results cross threads as `Signal(object)`: a `dict` signature makes PySide convert the whole
@@ -45,11 +51,19 @@ class ImagePreviewWorker(QObject, LogMixin):
     failed = Signal(Path, str)
     progress = Signal(int, str)
 
-    def __init__(self, path: Path, gpu_config: dict | None = None):
+    def __init__(
+        self,
+        path: Path,
+        gpu_config: dict | None = None,
+        lod_min_side: int = PREVIEW_LOD_MIN_SIDE,
+        overview_max_side: int = PREVIEW_OVERVIEW_MAX_SIDE,
+    ):
         super().__init__()
         self.path = Path(path)
         self.image_loader = ImageLoader()
         self.gpu_config = dict(gpu_config or {})
+        self.lod_min_side = int(lod_min_side)
+        self.overview_max_side = int(overview_max_side)
 
     @Slot()
     def run(self) -> None:
@@ -64,20 +78,17 @@ class ImagePreviewWorker(QObject, LogMixin):
             # 16384x13000: cv2.cvtColor 110 ms against 310 ms for vf_bgr_to_rgb_u8 on a warm runtime,
             # because the whole image crosses PCIe twice; the pixels are identical. The legacy
             # ``gpu.display`` Recipe value is still accepted and reported, but has no effect.
+            # The conversion writes straight into the QImage buffer, so no RGB array or QImage
+            # copy is held next to the decoded image.
             with profiler.measure("color_conversion"):
-                image = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+                qimage = rgb_qimage_from_bgr(bgr)
+            height, width = bgr.shape[:2]
+            del bgr
             backend_status = {"requested": False, "active": False, "backend": "cpu"}
             if RecipeManager().gpu_feature_requested(self.gpu_config, "display"):
                 backend_status["display_gpu_note"] = PREVIEW_DISPLAY_GPU_NOTE
-            height, width, channels = image.shape
-            with profiler.measure("qimage_copy"):
-                qimage = QImage(
-                    image.data,
-                    width,
-                    height,
-                    channels * width,
-                    QImage.Format.Format_RGB888,
-                ).copy()
+            with profiler.measure("preview_pyramid"):
+                preview = preview_image(qimage, self.lod_min_side, self.overview_max_side)
             backend_status["display_performance"] = {"worker": profiler.snapshot()}
         except Exception as exc:
             self.logger.exception("Preview load failed: image=%s", self.path)
@@ -92,7 +103,7 @@ class ImagePreviewWorker(QObject, LogMixin):
             height,
             backend_status["display_performance"]["worker"],
         )
-        self.loaded.emit(self.path, qimage, backend_status)
+        self.loaded.emit(self.path, preview, backend_status)
 
 
 class InspectionWorker(QObject, LogMixin):
