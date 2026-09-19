@@ -19,7 +19,7 @@ permissions:
 
 jobs:
   cuda-runtime:
-    if: github.repository == 'wjcudalearning/VisionFlow'
+    if: github.repository == 'Wwjyun/VisionFlow-AOI' || github.repository == 'wjcudalearning/VisionFlow'
     runs-on: [self-hosted, Windows, X64, gpu, rtx3090]
     timeout-minutes: 120
     env:
