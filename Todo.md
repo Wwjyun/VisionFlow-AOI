@@ -653,7 +653,7 @@ vs 原本 `[255,255,20,20]`）。因此「標籤編號順序」對 202 的最終
 - [x] workflow 明確加入 `gpu/include/`，上傳 DLL、LIB、test EXE 與 build log artifacts。
 - [x] CUDA runtime、CPU/GPU 等價、VRAM leak 與 benchmark 只在 GPU self-hosted runner 執行。
 - [x] self-hosted runner 使用 `self-hosted`、`Windows`、`X64`、`gpu`、`rtx3090` labels。
-- [ ] 在目前 `wjcudalearning/VisionFlow` repository 註冊或授權具有上述 labels 的 RTX self-hosted runner；2026-07-31 GitHub API 回報可用 runner 數量為 0。
+- [ ] 在目前 `Wwjyun/VisionFlow-AOI` repository 註冊或授權具有上述 labels 的 RTX self-hosted runner；2026-09-19 已將 RTX guard 改為同時接受主帳號與另一帳號過渡，runner 重新註冊到主帳號後即可移除舊帳號 slug（舊帳號預計刪除）。2026-07-31 GitHub API 回報可用 runner 數量為 0。
 - [x] 不允許不受信任的 fork PR 直接在可接觸本機資料的 self-hosted runner 執行。
 - [x] GPU job 支援手動與 nightly；PR 至少完成 compile/static checks。
 - [ ] 保存 benchmark JSON、Nsight report、Driver/Toolkit/GPU 與 commit hash，支援 commit 間比較。（JSON、環境與 commit 已完成；workflow 已加入可用時執行 nsys smoke capture 並記錄 skip/status，report 待 RTX runner）
@@ -1008,6 +1008,8 @@ vs 原本 `[255,255,20,20]`）。因此「標籤編號順序」對 202 的最終
 - [ ] 加速不得犧牲 GUI 回應、打包啟動、結果追溯、錯誤訊息或 CPU fallback。
 
 ## 完成紀錄
+
+- [x] 2026-09-19：依使用者指定，只把 `v1.6.3` 一個 GitHub Release 搬移到主帳號 `Wwjyun/VisionFlow-AOI`（其餘 12 個 `v1.6.0`～`v1.7.8`、`utility-tools-v1.1.0` 的預編二進位檔不在保留範圍；所有版本的原始碼、tag 與 release notes 都已在主 repo，日後仍可從 tag 重建）。搬移方式：以 32 條並行 HTTP range 下載（此網路單線被限速約 70 KB/s，並行可達約 2 MB/s）、逐檔比對來源 asset digest、以相同 title／notes／prerelease 狀態建立 draft 後上傳並再次核對 digest，全部通過才發布；發布後自主帳號重新下載驗證：`VisionFlow-AOI-v1.6.3-windows-x64.zip` 119,695,238 bytes、SHA-256 `aeb21e5508155f6b2652c561b44387385a316a40fc008417c27faca28093bd5a`（與來源及 GitHub digest 相同），ZIP 結構 348 entries、7 份 bundled Recipes 加 1 份 example、1 個 `gpu/visionflow_cuda.dll`。另記：GitHub 以 annotated tag 的 tagger 日期作為 release 的 `created_at`，故搬移後 `created_at`（2026-09-18T03:33:01Z）與來源完全相同，只有 `published_at` 是本次時間；`v1.6.3` 成為主帳號目前最新的 Release。同時把 `README.md` 的「最新發行版」連結與 Todo P7 的 runner 待辦改指向主帳號（歷史紀錄的舊網址依使用者指示保留不動）；主帳號的 `v1.7.8` 目前只有 tag 沒有 release 資產，`/releases/tag/v1.7.8` 仍可正常開啟。
 
 - [x] 2026-09-19：將另一帳號 `wjcudalearning/VisionFlow` 的 184 個 commits（`v1.6.0`～`v1.7.8`、Sapera LT 線掃相機綁定、resident ROI GPU 工作、packaging 重組、Utility Tools `v1.1.0`、至 2026-09-16 的 weekly reports）以 merge commit `9d41431` 併入主帳號 `Wwjyun/VisionFlow-AOI` 的 `main`，未改寫已公開歷史，本機工作區一併更新至最新；`Todo.md` 衝突同時保留主帳號 2026-08-29 的改名紀錄（置於 2026-08-06 之後）與另一帳號較新的條目。推送更新後的 `main` 與 `v1.6.0`～`v1.7.8`、`utility-tools-v1.1.0` 共 13 個 annotated tags（GitHub Releases 資產未搬移，仍留在原帳號）。順手修正兩處仍指向舊位置的設定：`.claude/skills/aoi-release/SKILL.md` 的發布目標由舊名 `Wwjyun/AOI_CVBased` 改為 `Wwjyun/VisionFlow-AOI`（與 `codex-skills` 副本一致），`rtx3090-validation.yml` 的 RTX guard 改為同時接受兩個 repository（主 repo 尚無 self-hosted RTX runner，註冊前排程工作只會排隊，不會執行）。驗證：合併後完整 903 tests OK、compileall exit 0、CUDA preflight exit 0、GUI offscreen smoke exit 0、`git diff --check` 通過；本機 venv 缺少而依 `requirements.txt` 補裝 `plotly==7.0.0` 與 `pythonnet==3.1.0`。本機環境另記：使用者路徑含中文，測試以 `cv2.imwrite` 寫入 `%TEMP%` 會失敗並連帶出現 `Image does not exist`，把暫存目錄指向 ASCII 路徑後 903 tests 全數通過，屬環境限制而非程式問題。
 
