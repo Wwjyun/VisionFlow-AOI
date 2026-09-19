@@ -30,3 +30,17 @@ dist/
 .coverage
 htmlcov/
 .claude/scheduled_tasks.lock
+
+# Personal documents must never enter this public repository.
+# The resume carries a phone number and email address; keep it gitignored even
+# though it lives outside the tracked tree, as a guard against `git add .`.
+Wang_WeiJyun_*.html
+Wang_WeiJyun_*.pdf
+*Resume*.html
+*Resume*.pdf
+*履歷*.pdf
+*履歷*.html
+
+# Hypothesis cache and ad-hoc test output redirects.
+.hypothesis/
+tmp_*.txt

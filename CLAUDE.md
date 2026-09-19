@@ -32,6 +32,8 @@ Project skills live in `.claude/skills/` and are Claude Code copies of the Git-t
 
 `archify` (`.claude/skills/archify/`) is the exception to the mirroring rule above: it is vendored third-party tooling (MIT, `tt-a1i/archify`) used to render the `架構圖/` diagram set, and it has **no** `codex-skills/` counterpart. Do not mirror or reformat it; update it by re-vendoring upstream. Render through `node .claude/skills/archify/bin/archify.mjs`, pass `--repo-root .` whenever a spec declares `sources` evidence, and finish with `validate` → `deliver` → `visual-check` at `--quality showcase`. Diagram outputs stay untracked under `架構圖/` per `ARTIFACTS.md`.
 
+Deliberate trim of the vendored copy (2026-09-19): `examples/*.html` (5 rendered showcases, 3.95 MB) and `test/` (132 fixtures, 1.74 MB) are **not** vendored. They are regenerable artifacts — `node scripts/render-examples.mjs` rebuilds the showcases — and together they were 64% of tracked bytes, which made GitHub report this repository as an HTML project instead of Python. The 14 `examples/*.json` authoring specs, `bin/`, `scripts/`, `renderers/`, `schemas/`, `assets/` and `references/` are all kept, so the `SKILL.md` authoring loop (`validate` → `deliver` → `visual-check`) and `archify.mjs demo`/`doctor` work unchanged. The `test` npm script inside the skill no longer runs; do not re-add `test/` when re-vendoring upstream.
+
 ## Delegating coding to the `aoi-coder` subagent
 
 `.claude/agents/aoi-coder.md` defines a coding subagent for well-scoped implementation work.
