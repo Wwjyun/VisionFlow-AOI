@@ -14,9 +14,15 @@ import yaml
 from core.detector_manager import DetectorManager
 from core.parameter_schema import ParameterSpec
 from core.pipeline import AOIPipeline
-from core.provenance import canonical_sha256, inspection_provenance, sha256_bytes
+from core.provenance import (
+    _cached_build_provenance,
+    build_provenance,
+    canonical_sha256,
+    inspection_provenance,
+    sha256_bytes,
+)
 from core.recipe_manager import RecipeError, RecipeManager
-from core.report_artifacts import CsvExporter
+from core.report_artifacts import CsvExporter, MatrixCsvExporter
 from gpu.benchmark_gate import compare_p95
 
 
@@ -116,6 +122,7 @@ class StrictRecipeContractTests(unittest.TestCase):
                 "inner_target_height", "inner_height_tolerance",
                 "max_edge_gap", "roi_inset_px",
             },
+            "999-FLOW-TEST": {"defect_width", "defect_height"},
             "yolox": {"min_box_area_px"},
         }
         expected_inner = {
@@ -180,6 +187,7 @@ class StrictRecipeContractTests(unittest.TestCase):
                 "outer_contour_mode", "inner_adaptive_block_size",
                 "inner_adaptive_c", "inner_invert", "inner_contour_mode",
             },
+            "999-FLOW-TEST": {"mode", "defect_x", "defect_y"},
             "yolox": {
                 "model_id", "confidence_threshold", "nms_iou_threshold",
                 "target_class_ids", "max_detections", "inference_backend",
@@ -339,6 +347,46 @@ class ReporterAreaCalibrationTests(unittest.TestCase):
         self.assertEqual(row["area_unit"], "px^2")
 
 
+
+class MatrixCsvDefectTypeTests(unittest.TestCase):
+    @staticmethod
+    def _tile(row, col, result, detectors):
+        return {"tile": {"tile_id": f"r{row}c{col}", "row": row, "col": col}, "result": result, "detectors": detectors}
+
+    def test_ng_cells_list_distinct_defect_types_and_pass_cells_stay_empty(self):
+        cnr = {"type": "202-1_auto_cnr_ng"}
+        circle = {"type": "401_1_circle_detected_ng"}
+        result = {
+            "image_name": "IMG.bmp",
+            "tiles": [
+                self._tile(0, 0, "PASS", [{"detector_id": "202-1", "pass": True, "defects": []}]),
+                self._tile(0, 1, "NG", [
+                    {"detector_id": "202-1", "pass": False, "defects": [cnr, dict(cnr), dict(cnr)]},
+                    {"detector_id": "401-1", "pass": False, "defects": [circle]},
+                ]),
+                self._tile(1, 0, "NG", [{"detector_id": "401-1", "pass": False, "defects": [circle]}]),
+                # Detector NG without defect entries still marks the cell with the NG detector.
+                self._tile(1, 1, "NG", [
+                    {"detector_id": "202-1", "pass": True, "defects": []},
+                    {"detector_id": "900-DOMAIN", "pass": False, "defects": []},
+                ]),
+            ],
+        }
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "IMG_matrix.csv"
+            MatrixCsvExporter.write_matrix_csv(path, result)
+            with path.open(encoding="utf-8-sig", newline="") as handle:
+                rows = list(csv.DictReader(handle))
+
+        self.assertEqual(
+            rows,
+            [
+                {"id": "IMG-2", "c1": "", "c2": "202-1_auto_cnr_ng; 401_1_circle_detected_ng"},
+                {"id": "IMG-1", "c1": "401_1_circle_detected_ng", "c2": "900-DOMAIN"},
+            ],
+        )
+
+
 class ContinuousValidationContractTests(unittest.TestCase):
     def test_benchmark_gate_rejects_p95_regression_above_fifteen_percent(self):
         baseline = {"benchmark": {"measurements": [{
@@ -364,6 +412,26 @@ class ContinuousValidationContractTests(unittest.TestCase):
 
 
 class ProvenanceAndDatasetTests(unittest.TestCase):
+    def test_build_provenance_is_cached_but_callers_receive_independent_dicts(self):
+        from unittest.mock import patch
+
+        _cached_build_provenance.cache_clear()
+        try:
+            with patch("core.provenance._read_packaged_provenance", return_value=None), patch(
+                "core.provenance._git",
+                return_value="# branch.oid abc123\n# branch.head main\n1 .M N... core/pipeline.py",
+            ) as git:
+                first = build_provenance()
+                first["commit"] = "mutated"
+                second = build_provenance()
+
+            git.assert_called_once_with(
+                "status", "--porcelain=v2", "--branch", "--untracked-files=no"
+            )
+            self.assertEqual(second, {"commit": "abc123", "dirty": True, "source": "git"})
+        finally:
+            _cached_build_provenance.cache_clear()
+
     def test_source_and_effective_recipe_hashes_are_distinct_and_deterministic(self):
         path = ROOT / "recipes/PRODUCT_A_NEGATIVE_401_AOI_01.yaml"
         recipe = RecipeManager().load(path)

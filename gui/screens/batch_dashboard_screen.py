@@ -24,7 +24,7 @@ from gui.theme import COLORS
 from gui.widgets.common import EmptyState, Segmented
 from gui.widgets.panel import Panel
 from gui.widgets.scatter_chart import ImageScatterChart, RESULT_COLORS
-from gui.table_models import RowTableModel, StatusFilterProxyModel, TableColumn
+from gui.table_models import RowTableModel, StatusFilterProxyModel, TableColumn, fit_columns_to_sample
 
 
 def _format_duration(value: object) -> str:
@@ -328,7 +328,7 @@ class BatchDashboardScreen(QWidget):
 
     def _populate_table(self, rows: list[dict]) -> None:
         self.table_model.set_rows(rows)
-        self.table.resizeColumnsToContents()
+        fit_columns_to_sample(self.table)
         self.table.horizontalHeader().setStretchLastSection(True)
         self.table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
 

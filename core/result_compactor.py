@@ -12,6 +12,7 @@ TOP_LEVEL_KEYS = (
     "outputs",
     "duration_sec",
     "execution",
+    "source",
 )
 
 TILE_KEYS = ("tile_id", "x", "y", "width", "height", "row", "col")

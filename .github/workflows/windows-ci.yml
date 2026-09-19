@@ -36,6 +36,7 @@ jobs:
           tools
           core
           detectors
+          devices
           gui
           gpu
       - name: Validate CUDA headers and source contract

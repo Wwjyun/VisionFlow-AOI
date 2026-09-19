@@ -21,6 +21,7 @@ from PySide6.QtWidgets import (
 )
 
 from gui import icons
+from gui.performance_summary import performance_summary
 from gui.theme import COLORS, DEFECT_COLOR_FALLBACK, DEFECT_COLORS, DEFECT_TYPE_LABELS, R_MD
 from gui.widgets.common import EmptyState, Segmented
 from gui.widgets.panel import Panel
@@ -351,6 +352,23 @@ class ResultsScreen(QWidget):
         self.outputs_panel = Panel(title="輸出檔案", flush=True)
         layout.addWidget(self.outputs_panel)
 
+        # Read-only view of this run's execution metadata; never derived from the Recipe. Collapsed by
+        # default and height-bounded so it never squeezes the NG thumbnails.
+        self.performance_toggle = QPushButton("展開")
+        self.performance_toggle.setProperty("variant", "ghost")
+        self.performance_toggle.setProperty("size", "sm")
+        self.performance_toggle.setCheckable(True)
+        self.performance_toggle.setAccessibleName("展開或收合效能分析")
+        self.performance_panel = Panel(title="效能分析", actions=self.performance_toggle)
+        self.performance_scroll = QScrollArea()
+        self.performance_scroll.setWidgetResizable(True)
+        self.performance_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        self.performance_scroll.setMaximumHeight(320)
+        self.performance_scroll.setVisible(False)
+        self.performance_panel.add_widget(self.performance_scroll)
+        self.performance_toggle.toggled.connect(self._set_performance_expanded)
+        layout.addWidget(self.performance_panel)
+
         return column
 
     # ------------------------------------------------------------------
@@ -413,6 +431,7 @@ class ResultsScreen(QWidget):
         self._populate_table()
         self._populate_thumbnails()
         self._populate_outputs()
+        self._populate_performance()
         self._update_navigation_state()
         self._content_dirty = False
 
@@ -588,6 +607,78 @@ class ResultsScreen(QWidget):
 
             row_layout.addWidget(Badge(OUTPUT_LABELS.get(key, key), kind="neutral"))
             self.outputs_panel.add_widget(row)
+
+
+    def _set_performance_expanded(self, expanded: bool) -> None:
+        self.performance_scroll.setVisible(bool(expanded))
+        self.performance_toggle.setText("收合" if expanded else "展開")
+
+    def _populate_performance(self) -> None:
+        summary = performance_summary(self._result)
+        self.performance_summary = summary
+        grid_widget = QWidget()
+        grid = QGridLayout(grid_widget)
+        grid.setContentsMargins(0, 0, 0, 0)
+        grid.setHorizontalSpacing(12)
+        grid.setVerticalSpacing(4)
+        grid.setColumnStretch(1, 1)
+        row = 0
+
+        def section(title: str) -> None:
+            nonlocal row
+            label = QLabel(title)
+            label.setProperty("role", "form-label")
+            grid.addWidget(label, row, 0, 1, 2)
+            row += 1
+
+        def line(name: str, value: str) -> None:
+            nonlocal row
+            name_label = QLabel(name)
+            name_label.setStyleSheet(f"color: {COLORS['text_3']}; font-size: 12px;")
+            value_label = QLabel(value)
+            value_label.setProperty("mono", "true")
+            value_label.setWordWrap(True)
+            value_label.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+            grid.addWidget(name_label, row, 0)
+            grid.addWidget(value_label, row, 1)
+            row += 1
+
+        line("實際後端", summary["backend"])
+        if summary["backend_reason"]:
+            line("fallback 原因", summary["backend_reason"])
+        line("總耗時", summary["total"])
+        if summary["stages"]:
+            section("各階段")
+            for name, value in summary["stages"]:
+                line(name, value)
+        if summary["detector_stages"]:
+            section("Detector 子階段")
+            for name, value in summary["detector_stages"]:
+                line(name, value)
+        if summary["split"]:
+            section("GPU／CPU 分工")
+            for name, value in summary["split"]:
+                line(name, value)
+        if summary["transfer"]:
+            section("傳輸與記憶體")
+            for name, value in summary["transfer"]:
+                line(name, value)
+        for reason in summary["fallback_reasons"]:
+            line("Detector fallback", reason)
+        for notice in summary["notices"]:
+            warning = QLabel(f"注意：{notice}")
+            warning.setWordWrap(True)
+            warning.setStyleSheet(f"color: {COLORS['ng']}; font-size: 12px;")
+            grid.addWidget(warning, row, 0, 1, 2)
+            row += 1
+        grid.setRowStretch(row, 1)
+        previous = self.performance_scroll.takeWidget()
+        if previous is not None:
+            previous.deleteLater()
+        self.performance_content = grid_widget
+        self.performance_scroll.setWidget(grid_widget)
+        # Keep the operator's expanded/collapsed choice across results.
+        self._set_performance_expanded(self.performance_toggle.isChecked())
 
 
 def _stat_card(label: str, color: str | None = None) -> tuple[QLabel, QFrame]:

@@ -13,6 +13,7 @@ Separate a local package request from a published release. Do not create tags or
 - For release requests, require an explicit semantic version. Inspect existing tags and releases before creating anything.
 - State whether the package is CPU-compatible only or includes a validated CUDA DLL. If CUDA inclusion is required but the DLL was not built and validated for this commit, stop instead of shipping a stale DLL.
 - Treat “same as before” or “以前的方式” as a request to inspect the relevant prior release evidence. Do not infer that it means Chrome, `gh`, or another transport from memory alone. Compare the recent release tag, asset, timestamps, and narrowly relevant prior tool trace when available; do not expose unrelated history or credentials.
+- For an incremental Utility Tools release, inspect the prior published bundle and the changes since its tag before building. When only specific tools changed, run only their dedicated build scripts and reuse unchanged EXEs from the immediately previous published bundle after verifying that bundle's published digest and downloaded ZIP hash; never trust arbitrary files already present in local `dist`. Rebuild every tool only when shared runtime/build inputs changed, the prior asset cannot be verified, or the user explicitly requests a clean rebuild. Record which EXEs were rebuilt and which verified release supplied reused EXEs.
 
 ## Prepare
 
@@ -24,7 +25,7 @@ Separate a local package request from a published release. Do not create tags or
 
 ## Build and verify
 
-1. Run `build_exe.ps1` from the repository root.
+1. Run `packaging\scripts\build_exe.ps1` from the repository root.
 2. Verify `dist\VisionFlow AOI\VisionFlow AOI.exe`, bundled recipes, required Qt/runtime files, and presence/absence of `gpu\visionflow_cuda.dll` according to the intended package.
 3. Smoke-test the packaged application on the available machine. Record any GPU/no-GPU matrix that still requires another computer.
 4. Create `release_artifacts\VisionFlow-AOI-vX.Y.Z-windows-x64.zip` from the whole distribution folder, never the executable alone.

@@ -42,3 +42,21 @@ class VfCudaTimingsV1(ctypes.Structure):
                 ("gaussian_ms", ctypes.c_float), ("adaptive_integral_ms", ctypes.c_float),
                 ("threshold_ms", ctypes.c_float), ("morphology_ms", ctypes.c_float),
                 ("total_device_ms", ctypes.c_float)]
+
+
+class VfCudaContextMemoryStatsV1(ctypes.Structure):
+    _fields_ = [
+        ("struct_size", ctypes.c_uint32),
+        ("version", ctypes.c_uint32),
+        ("reserved_bytes", ctypes.c_uint64),
+        ("peak_reserved_bytes", ctypes.c_uint64),
+        ("allocation_count", ctypes.c_uint64),
+        ("plan_bytes", ctypes.c_uint64),
+        ("resident_bytes", ctypes.c_uint64),
+        ("template_match_bytes", ctypes.c_uint64),
+        ("contour_bytes", ctypes.c_uint64),
+        ("median_bytes", ctypes.c_uint64),
+        ("gaussian_f32_bytes", ctypes.c_uint64),
+        ("cnr_mask_bytes", ctypes.c_uint64),
+        ("cnr_candidate_bytes", ctypes.c_uint64),
+    ]

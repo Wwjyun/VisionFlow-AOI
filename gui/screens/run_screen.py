@@ -23,7 +23,7 @@ from gui.image_viewer import ImageViewer
 from gui.theme import COLORS
 from gui.widgets.common import Badge, EmptyState, ProgressBar, Segmented, make_param_widget, result_badge
 from gui.widgets.panel import Panel
-from gui.table_models import RowTableModel, StatusFilterProxyModel, TableColumn
+from gui.table_models import RowTableModel, StatusFilterProxyModel, TableColumn, fit_columns_to_sample
 
 # ============================================================
 # AOI Console — 檢測執行 screen
@@ -184,6 +184,8 @@ class RecipeInfoPanel(QWidget):
 class RunControlPanel(Panel):
     start_requested = Signal()
     view_results_requested = Signal()
+    warmup_requested = Signal()
+    compare_requested = Signal()
 
     def __init__(self, parent=None):
         super().__init__(title="檢測控制", parent=parent)
@@ -195,6 +197,27 @@ class RunControlPanel(Panel):
         self.start_button.setEnabled(False)
         self.start_button.clicked.connect(self.start_requested.emit)
         self.add_widget(self.start_button)
+
+        self.warmup_button = QPushButton("GPU 預熱")
+        self.warmup_button.setProperty("variant", "secondary")
+        self.warmup_button.setToolTip(
+            "建立 CUDA context，並以目前影像試跑一次（不輸出任何檔案），"
+            "讓第一張檢測不承擔 GPU 初始化與記憶體配置成本。\n"
+            "未載入影像時只建立 CUDA context；Recipe 未啟用 CUDA 時不需要預熱。"
+        )
+        self.warmup_button.setEnabled(False)
+        self.warmup_button.clicked.connect(self.warmup_requested.emit)
+        self.add_widget(self.warmup_button)
+
+        self.compare_button = QPushButton("CPU／GPU 對照")
+        self.compare_button.setProperty("variant", "secondary")
+        self.compare_button.setToolTip(
+            "以目前影像與 Recipe 各跑一次 GPU 設定與 CPU（不輸出檔案、不修改 Recipe），"
+            "比對 PASS/NG、缺陷、bbox、area、confidence 與 metadata 是否一致，並列出各階段倍數。"
+        )
+        self.compare_button.setEnabled(False)
+        self.compare_button.clicked.connect(self.compare_requested.emit)
+        self.add_widget(self.compare_button)
 
         self.hint_label = QLabel("請先載入影像與 Recipe")
         self.hint_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -290,6 +313,16 @@ class RunControlPanel(Panel):
             self.hint_label.setText("請先載入影像與 Recipe")
         elif not has_recipe:
             self.hint_label.setText("請先載入影像與 Recipe")
+
+    def set_warmup_state(self, has_recipe: bool, busy: bool, warming: bool) -> None:
+        """Warm-up needs only a Recipe; it is blocked while any single-image work is running."""
+        self.warmup_button.setEnabled(has_recipe and not busy)
+        self.warmup_button.setText("GPU 預熱中…" if warming else "GPU 預熱")
+
+    def set_compare_state(self, ready: bool, busy: bool, comparing: bool) -> None:
+        """The comparison needs an image and a Recipe and is blocked while other single-image work runs."""
+        self.compare_button.setEnabled(ready and not busy)
+        self.compare_button.setText("CPU／GPU 對照中…" if comparing else "CPU／GPU 對照")
 
     def set_progress(self, running: bool, has_result: bool, pct: int, message: str) -> None:
         self._progress_row.setVisible(running or has_result)
@@ -473,7 +506,7 @@ class BatchDataPanel(Panel):
         self.output_label.setText(f"{output_dir}\n總耗時：{batch_duration}" if output_dir else "")
 
         self.table_model.set_rows(items)
-        self.table.resizeColumnsToContents()
+        fit_columns_to_sample(self.table)
         self.table.horizontalHeader().setStretchLastSection(True)
 
 
@@ -583,6 +616,8 @@ class RunScreen(QWidget):
     view_results_requested = Signal()
     choose_batch_folder_requested = Signal()
     start_batch_requested = Signal()
+    warmup_requested = Signal()
+    compare_requested = Signal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -630,6 +665,8 @@ class RunScreen(QWidget):
         self.run_control_panel.start_requested.connect(self.start_requested.emit)
         self.op_panel.start_requested.connect(self.start_requested.emit)
         self.run_control_panel.view_results_requested.connect(self.view_results_requested.emit)
+        self.run_control_panel.warmup_requested.connect(self.warmup_requested.emit)
+        self.run_control_panel.compare_requested.connect(self.compare_requested.emit)
         self.recipe_info_panel.open_recipe_requested.connect(self.open_recipe_requested.emit)
         self.batch_folder_panel.choose_folder_requested.connect(self.choose_batch_folder_requested.emit)
         self.batch_folder_panel.start_batch_requested.connect(self.start_batch_requested.emit)

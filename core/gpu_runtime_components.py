@@ -90,6 +90,19 @@ class GpuCapabilities:
         )
 
     @property
+    def file_order_upload(self) -> bool:
+        """Optional upload that accepts BMP-style bottom-up row order."""
+        return bool(
+            self.resident_roi
+            and self.has_exports(("vf_context_upload_u8_file_order",))
+        )
+
+    @property
+    def host_register(self) -> bool:
+        """Optional page-locking of caller-owned host buffers used as upload sources."""
+        return self.has_exports(("vf_host_register_u8", "vf_host_unregister_u8"))
+
+    @property
     def roi_batch(self) -> bool:
         return bool(
             self.resident_roi
@@ -98,6 +111,75 @@ class GpuCapabilities:
             )
         )
 
+    @property
+    def template_match(self) -> bool:
+        """Optional Template Anchor Grid localization that reads the resident image."""
+        return bool(self.resident_roi and self.has_exports(("vf_match_template_gray_u8",)))
+
+    @property
+    def find_contours(self) -> bool:
+        """Optional OpenCV-equivalent contour trace over the resident binary mask."""
+        return bool(
+            self.resident_roi
+            and self.has_exports(("vf_find_contours_u8", "vf_find_contours_download"))
+        )
+
+    @property
+    def exact_median(self) -> bool:
+        """Optional bit-exact float32 median over host values (never reads the resident image)."""
+        return self.has_exports(("vf_median_f32",))
+
+    @property
+    def gaussian_blur_f32(self) -> bool:
+        """Optional float32 Gaussian (cv2.GaussianBlur equivalence) over host float32 values."""
+        return self.has_exports(("vf_gaussian_blur_f32",))
+
+    @property
+    def gaussian_blur_f32_roi(self) -> bool:
+        """Optional rectangle variant of the float32 Gaussian; the ROI export is additive."""
+        return bool(
+            self.gaussian_blur_f32 and self.has_exports(("vf_gaussian_blur_f32_roi",))
+        )
+
+    @property
+    def gaussian_blur_f32_sigma(self) -> bool:
+        """Whether the float32 Gaussian honours an explicit sigma.
+
+        A DLL built before the sigma parameter existed still exports the same names but ignores the
+        trailing argument, which would silently return OpenCV's automatic-sigma background for a
+        non-zero sigma. The runtime probes that at load time, so this is False for such a DLL and a
+        non-zero sigma is refused instead of silently substituted.
+        """
+        return bool(
+            self.gaussian_blur_f32
+            and getattr(self.runtime, "_gaussian_f32_sigma_supported", False)
+        )
+
+    @property
+    def cnr_mask_f32(self) -> bool:
+        """Optional device-side 202-CS-SN-1 residual threshold and candidate mask.
+
+        A DLL built before this additive export exists does not export the name at all, so probing on
+        the export is enough: there is no same-name legacy variant that could ignore an argument.
+        """
+        return self.has_exports(("vf_cnr_mask_f32",))
+
+    @property
+    def cnr_mask_u8_roi(self) -> bool:
+        """202 automatic CNR pipeline reading an already resident uint8 ROI."""
+        return bool(
+            self.resident_roi
+            and self.gaussian_blur_f32_sigma
+            and self.has_exports(("vf_cnr_mask_u8_roi",))
+        )
+
+    @property
+    def cnr_candidates_u8_roi(self) -> bool:
+        """202 candidate extraction (mask, components and ring CNR) on a resident uint8 ROI."""
+        return bool(
+            self.cnr_mask_u8_roi
+            and self.has_exports(("vf_cnr_candidates_u8_roi",))
+        )
 
 @dataclass(slots=True)
 class GpuResourceRegistry:

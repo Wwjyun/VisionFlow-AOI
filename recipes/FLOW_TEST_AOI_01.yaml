@@ -1,0 +1,46 @@
+# 流程驗證用 Recipe：999-FLOW-TEST 不檢測產品，只依 mode 回傳固定結果。
+# mode: pass（全部 PASS）／ng（每個 Tile 一個固定 NG 框）／error（丟出錯誤）。
+# 請勿用於產線判定。
+recipe_name: "FLOW_TEST_AOI_01"
+product_id: "FLOW_TEST"
+machine_id: "AOI_01"
+version: "0.1.0"
+
+gpu:
+  tiling: false
+  display: false
+  dll_path: "gpu/visionflow_cuda.dll"
+  fallback_to_cpu: true
+
+tile:
+  mode: "grid"
+  width: 512
+  height: 512
+  overlap_x: 0
+  overlap_y: 0
+
+decision:
+  mode: "all_detectors_must_pass"
+  important_detectors:
+    - "999-FLOW-TEST"
+  max_ng_count: 0
+
+detectors:
+  "999-FLOW-TEST":
+    enabled: true
+    use_gpu: false
+    display_name: "999-FLOW-TEST flow validation detector"
+    params:
+      mode: "pass"
+      defect_x: 0
+      defect_y: 0
+      defect_width: 32
+      defect_height: 32
+
+output:
+  pixel_size_um_per_px: null
+  save_overlay: true
+  save_ng_tiles: true
+  save_csv: true
+  save_matrix_csv: true
+  save_json: true

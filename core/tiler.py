@@ -1,12 +1,17 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from dataclasses import replace
+from concurrent.futures import ThreadPoolExecutor
+from itertools import islice
+import os
 import time
 from typing import Iterator
 
 import cv2
 import numpy as np
 
+from core.gpu_runtime import GpuRuntimeError
 from core.image_loader import ImageLoader
 
 
@@ -31,6 +36,72 @@ class Tile:
     image: object
     metadata: dict | None = None
     device_roi: object | None = None
+
+
+def _iter_cropped_tiles(
+    image, tiles: Iterator[Tile], gpu_runtime=None, crop_workers: int | str = "auto",
+    resident_image=None,
+) -> Iterator[Tile]:
+    """Keep resident GPU ROIs as CPU views; copy only ordinary CPU tiles."""
+    if resident_image is not None:
+        for tile in tiles:
+            yield replace(
+                tile,
+                image=image[tile.y:tile.y + tile.height, tile.x:tile.x + tile.width],
+            )
+        return
+
+    def crop(tile: Tile) -> Tile:
+        return replace(
+            tile,
+            image=_crop_image(
+                image, tile.x, tile.y, tile.x + tile.width, tile.y + tile.height,
+                gpu_runtime,
+            ),
+        )
+
+    if gpu_runtime is not None or crop_workers == 1:
+        for tile in tiles:
+            yield crop(tile)
+        return
+    source = iter(tiles)
+    if crop_workers == "auto":
+        first_batch = list(islice(source, 16))
+        channels = 1 if image.ndim == 2 else image.shape[2]
+        crop_bytes = sum(tile.width * tile.height * channels * image.dtype.itemsize for tile in first_batch)
+        if len(first_batch) < 4 or crop_bytes < 8 * 1024 * 1024:
+            for tile in first_batch:
+                yield crop(tile)
+            for tile in source:
+                yield crop(tile)
+            return
+        crop_workers = min(4, os.cpu_count() or 1)
+    else:
+        first_batch = list(islice(source, crop_workers * 4))
+    if crop_workers <= 1:
+        for tile in first_batch:
+            yield crop(tile)
+        for tile in source:
+            yield crop(tile)
+        return
+    if len(first_batch) <= 1:
+        for tile in first_batch:
+            yield crop(tile)
+        return
+    with ThreadPoolExecutor(max_workers=crop_workers) as executor:
+        yield from executor.map(crop, first_batch)
+        while batch := list(islice(source, crop_workers * 4)):
+            yield from executor.map(crop, batch)
+
+
+def _crop_workers(config: dict, configured=None) -> int | str:
+    value = config.get("crop_workers", "auto") if configured is None else configured
+    if value == "auto":
+        return "auto"
+    try:
+        return max(1, min(int(value), os.cpu_count() or 1))
+    except (TypeError, ValueError):
+        return 1
 
 
 @dataclass(frozen=True)
@@ -412,6 +483,13 @@ class GridAnchorConfig:
         )
 
 
+# Device-anchor bounds taken from the RTX 3090 measurements recorded in Todo.md: above this
+# template side, or below this search area, the CPU reference is faster than the CUDA kernel, so
+# the device path is skipped for those shapes.
+MATCH_TILE_TEMPLATE_LIMIT = 128
+MATCH_TILE_SEARCH_PIXELS_LIMIT = 256 * 256
+
+
 class Tiler:
     def __init__(
         self,
@@ -422,6 +500,8 @@ class Tiler:
         anchor_config: GridAnchorConfig | None = None,
         gpu_runtime=None,
         resident_image=None,
+        crop_workers: int | str = "auto",
+        gpu_anchor_enabled: bool = True,
     ):
         if width <= 0 or height <= 0:
             raise ValueError("Tile width and height must be positive.")
@@ -438,10 +518,15 @@ class Tiler:
         self.image_loader = ImageLoader()
         self.gpu_runtime = gpu_runtime
         self.resident_image = resident_image
+        # The device localization path runs by default because it measured 1.6-3.9x faster than the
+        # CPU reference on the RTX 3090 within the shape bound checked by
+        # gpu_anchor_shapes_supported; anything outside that bound keeps the CPU reference.
+        self.gpu_anchor_enabled = bool(gpu_anchor_enabled)
+        self.crop_workers = crop_workers
         self.last_profile_ms = {"template_match_ms": 0.0, "roi_generation_ms": 0.0}
 
     @classmethod
-    def from_config(cls, config: dict, gpu_runtime=None, resident_image=None) -> "Tiler":
+    def from_config(cls, config: dict, gpu_runtime=None, resident_image=None, crop_workers=None) -> "Tiler":
         anchor_config = GridAnchorConfig.from_dict(config) if str(config.get("template_path", "")).strip() else None
         width = int(config.get("width", config.get("roi_w", 512)))
         height = int(config.get("height", config.get("roi_h", 512)))
@@ -453,6 +538,7 @@ class Tiler:
             anchor_config=anchor_config,
             gpu_runtime=gpu_runtime,
             resident_image=resident_image,
+            crop_workers=_crop_workers(config, crop_workers),
         )
 
     def iter_tiles(self, image) -> Iterator[Tile]:
@@ -465,26 +551,31 @@ class Tiler:
         y_positions = self._positions(image_height, self.height, self.step_y)
         x_positions = self._positions(image_width, self.width, self.step_x)
 
-        for row, y in enumerate(y_positions):
-            for col, x in enumerate(x_positions):
-                x2 = min(x + self.width, image_width)
-                y2 = min(y + self.height, image_height)
-                tile_image = _crop_image(image, x, y, x2, y2, self.gpu_runtime)
-                yield Tile(
-                    tile_id=f"r{row:04d}_c{col:04d}",
-                    x=x,
-                    y=y,
-                    width=x2 - x,
-                    height=y2 - y,
-                    row=row,
-                    col=col,
-                    image=tile_image,
-                    metadata={"mode": "grid"},
-                    device_roi=(
-                        self.resident_image.roi(x, y, x2 - x, y2 - y)
-                        if self.resident_image is not None else None
-                    ),
-                )
+        def tile_specs():
+            for row, y in enumerate(y_positions):
+                for col, x in enumerate(x_positions):
+                    x2 = min(x + self.width, image_width)
+                    y2 = min(y + self.height, image_height)
+                    yield Tile(
+                        tile_id=f"r{row:04d}_c{col:04d}",
+                        x=x,
+                        y=y,
+                        width=x2 - x,
+                        height=y2 - y,
+                        row=row,
+                        col=col,
+                        image=None,
+                        metadata={"mode": "grid"},
+                        device_roi=(
+                            self.resident_image.roi(x, y, x2 - x, y2 - y)
+                            if self.resident_image is not None else None
+                        ),
+                    )
+        yield from _iter_cropped_tiles(
+            image, tile_specs(), self.gpu_runtime,
+            1 if self.resident_image is not None else self.crop_workers,
+            self.resident_image,
+        )
         self.last_profile_ms = {
             "template_match_ms": 0.0,
             "roi_generation_ms": (time.perf_counter() - generation_started) * 1000.0,
@@ -510,47 +601,53 @@ class Tiler:
 
         generation_started = time.perf_counter()
         try:
-            for row in range(config.rows):
-                for col in range(config.cols):
-                    x = int(base_x + col * (config.roi_w + config.gap_x))
-                    y = int(base_y + row * (config.roi_h + config.gap_y))
-                    x1 = max(0, x)
-                    y1 = max(0, y)
-                    x2 = min(image_width, x + config.roi_w)
-                    y2 = min(image_height, y + config.roi_h)
-                    if x2 <= x1 or y2 <= y1:
-                        continue
-                    tile_image = _crop_image(image, x1, y1, x2, y2, self.gpu_runtime)
-                    yield Tile(
-                        tile_id=f"r{row:04d}_c{col:04d}",
-                        x=x1,
-                        y=y1,
-                        width=x2 - x1,
-                        height=y2 - y1,
-                        row=row,
-                        col=col,
-                        image=tile_image,
-                        device_roi=(
-                            self.resident_image.roi(x1, y1, x2 - x1, y2 - y1)
-                            if self.resident_image is not None else None
-                        ),
-                        metadata={
-                            "mode": "grid",
-                            "grid_anchor": "template_match",
-                            "search_roi": anchor["search_roi"],
-                            "match_bbox": [
-                                anchor["x"], anchor["y"], anchor["width"], anchor["height"]
-                            ],
-                            "score": float(anchor["score"]),
-                            "base_roi": [
-                                int(base_x),
-                                int(base_y),
-                                int(config.cols * config.roi_w + max(0, config.cols - 1) * config.gap_x),
-                                int(config.rows * config.roi_h + max(0, config.rows - 1) * config.gap_y),
-                            ],
-                            "template_path": config.template_path,
-                        },
-                    )
+            def tile_specs():
+                for row in range(config.rows):
+                    for col in range(config.cols):
+                        x = int(base_x + col * (config.roi_w + config.gap_x))
+                        y = int(base_y + row * (config.roi_h + config.gap_y))
+                        x1 = max(0, x)
+                        y1 = max(0, y)
+                        x2 = min(image_width, x + config.roi_w)
+                        y2 = min(image_height, y + config.roi_h)
+                        if x2 <= x1 or y2 <= y1:
+                            continue
+                        yield Tile(
+                            tile_id=f"r{row:04d}_c{col:04d}",
+                            x=x1,
+                            y=y1,
+                            width=x2 - x1,
+                            height=y2 - y1,
+                            row=row,
+                            col=col,
+                            image=None,
+                            device_roi=(
+                                self.resident_image.roi(x1, y1, x2 - x1, y2 - y1)
+                                if self.resident_image is not None else None
+                            ),
+                            metadata={
+                                "mode": "grid",
+                                "grid_anchor": "template_match",
+                                "search_roi": anchor["search_roi"],
+                                "match_bbox": [
+                                    anchor["x"], anchor["y"], anchor["width"], anchor["height"]
+                                ],
+                                "score": float(anchor["score"]),
+                                "grid_anchor_backend": str(anchor.get("backend", "cpu")),
+                                "base_roi": [
+                                    int(base_x),
+                                    int(base_y),
+                                    int(config.cols * config.roi_w + max(0, config.cols - 1) * config.gap_x),
+                                    int(config.rows * config.roi_h + max(0, config.rows - 1) * config.gap_y),
+                                ],
+                                "template_path": config.template_path,
+                            },
+                        )
+            yield from _iter_cropped_tiles(
+                image, tile_specs(), self.gpu_runtime,
+                1 if self.resident_image is not None else self.crop_workers,
+                self.resident_image,
+            )
         finally:
             self.last_profile_ms = {
                 "template_match_ms": template_match_ms,
@@ -562,11 +659,10 @@ class Tiler:
         if not template_path:
             raise ValueError("Grid template_path is required for anchored grid mode.")
 
-        image_gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY) if image.ndim == 3 else image.copy()
         template = self.image_loader.load_bgr(template_path)
         template_gray = cv2.cvtColor(template, cv2.COLOR_BGR2GRAY) if template.ndim == 3 else template.copy()
         template_height, template_width = template_gray.shape[:2]
-        image_height, image_width = image_gray.shape[:2]
+        image_height, image_width = image.shape[:2]
 
         search_x = max(0, int(config.search_x))
         search_y = max(0, int(config.search_y))
@@ -576,31 +672,115 @@ class Tiler:
         search_y2 = min(image_height, search_y + search_h)
         if search_x2 <= search_x or search_y2 <= search_y:
             raise ValueError("Grid search ROI is outside the input image.")
-
-        search_roi = image_gray[search_y:search_y2, search_x:search_x2]
-        if template_width > search_roi.shape[1] or template_height > search_roi.shape[0]:
+        if template_width > search_x2 - search_x or template_height > search_y2 - search_y:
             raise ValueError("Grid template is larger than the search ROI.")
 
-        if float(np.std(template_gray)) <= 1e-6:
-            result = cv2.matchTemplate(search_roi, template_gray, cv2.TM_SQDIFF_NORMED)
-            min_score, _, min_loc, _ = cv2.minMaxLoc(result)
-            max_score = 1.0 - float(min_score)
-            max_loc = min_loc
-        else:
-            result = cv2.matchTemplate(search_roi, template_gray, cv2.TM_CCOEFF_NORMED)
-            _, max_score, _, max_loc = cv2.minMaxLoc(result)
-        if config.match_threshold > 0 and max_score < config.match_threshold:
-            raise ValueError(
-                f"Grid template match score {max_score:.4f} is below threshold {config.match_threshold:.4f}."
+        search_rect = [int(search_x), int(search_y), int(search_x2 - search_x), int(search_y2 - search_y)]
+        anchor = self._find_grid_anchor_on_device(image, search_rect, template_gray)
+        if anchor is None:
+            # BGR->gray is a per-pixel operation, so converting only the search window gives the
+            # same pixels as slicing a whole-image conversion without touching the full canvas.
+            search_source = image[search_y:search_y2, search_x:search_x2]
+            search_roi = (
+                cv2.cvtColor(search_source, cv2.COLOR_BGR2GRAY)
+                if search_source.ndim == 3 else search_source
             )
+            if float(np.std(template_gray)) <= 1e-6:
+                result = cv2.matchTemplate(search_roi, template_gray, cv2.TM_SQDIFF_NORMED)
+                min_score, _, min_loc, _ = cv2.minMaxLoc(result)
+                anchor = {
+                    "x": int(search_x + min_loc[0]),
+                    "y": int(search_y + min_loc[1]),
+                    "width": int(template_width),
+                    "height": int(template_height),
+                    "score": float(1.0 - float(min_score)),
+                    "backend": "cpu",
+                }
+            else:
+                result = cv2.matchTemplate(search_roi, template_gray, cv2.TM_CCOEFF_NORMED)
+                _, max_score, _, max_loc = cv2.minMaxLoc(result)
+                anchor = {
+                    "x": int(search_x + max_loc[0]),
+                    "y": int(search_y + max_loc[1]),
+                    "width": int(template_width),
+                    "height": int(template_height),
+                    "score": float(max_score),
+                    "backend": "cpu",
+                }
+        # The threshold applies to whichever backend produced the score.
+        if config.match_threshold > 0 and float(anchor["score"]) < config.match_threshold:
+            raise ValueError(
+                f"Grid template match score {float(anchor['score']):.4f} is below threshold "
+                f"{config.match_threshold:.4f}."
+            )
+        anchor["search_roi"] = search_rect
+        return anchor
+
+    def _find_grid_anchor_on_device(self, image, search_rect, template_gray):
+        """Locate the anchor on the resident device image when the caller opts in.
+
+        The resident image is already on the device, so this step adds no pixel H2D. Measured on the
+        RTX 3090 the device path matches OpenCV's location on 9/9 scenes with a score delta of at
+        most 4.2e-7 and is deterministic across runs; it is faster than the CPU reference by 1.6x to
+        3.9x while the template is small (see `gpu_anchor_shapes_supported`), and slower for tiny
+        searches and templates of 200 px and above. Outside that bound, when no resident image or
+        export exists, or when the device call fails, `None` is returned so the caller uses the CPU
+        reference, which remains the correctness baseline.
+        """
+        if not self.gpu_anchor_enabled:
+            return None
+        resident = self.resident_image
+        if resident is None:
+            return None
+        # The resident image belongs to the runtime that uploaded it. The pipeline withholds
+        # `gpu_runtime` from a resident tiler so tiles are never re-cropped through CUDA, so the
+        # anchor must reach that owning runtime through the resident image itself.
+        runtime = getattr(resident, "runtime", None) or self.gpu_runtime
+        if runtime is None or not getattr(runtime, "supports_template_match", False):
+            return None
+        if not self.gpu_anchor_shapes_supported(search_rect, template_gray.shape):
+            return None
+        try:
+            match = runtime.match_template_gray(resident, tuple(search_rect), template_gray)
+            if int(match["width"]) != int(template_gray.shape[1]) or int(match["height"]) != int(template_gray.shape[0]):
+                raise GpuRuntimeError(
+                    f"vf_match_template_gray_u8 returned {match['width']}x{match['height']} for a "
+                    f"{template_gray.shape[1]}x{template_gray.shape[0]} template"
+                )
+        except Exception:
+            # With fallback enabled the CPU reference, which is the correctness baseline, restarts
+            # localization; strict CUDA mode must surface the failure instead of hiding it. The
+            # runtime's `last_error` is deliberately left alone: it disables every optional GPU step
+            # for the rest of the run, and an anchor-only miss (such as a flat template) must not
+            # push the detectors onto the CPU.
+            if not getattr(runtime, "fallback_to_cpu", True):
+                raise
+            return None
         return {
-            "x": int(search_x + max_loc[0]),
-            "y": int(search_y + max_loc[1]),
-            "width": int(template_width),
-            "height": int(template_height),
-            "score": float(max_score),
-            "search_roi": [int(search_x), int(search_y), int(search_x2 - search_x), int(search_y2 - search_y)],
+            "x": int(match["x"]),
+            "y": int(match["y"]),
+            "width": int(match["width"]),
+            "height": int(match["height"]),
+            "score": float(match["score"]),
+            "backend": "cuda_dll",
         }
+
+    @staticmethod
+    def gpu_anchor_shapes_supported(search_rect, template_shape) -> bool:
+        """Whether the device anchor path measured faster than the CPU reference for this shape.
+
+        RTX 3090 evidence (Todo.md): 1.6-3.9x faster while the template is at most
+        MATCH_TILE_TEMPLATE_LIMIT px per side, but slower for tiny searches because the CUDA call
+        overhead then dominates the CPU work. Outside the bound the CPU reference stays in charge.
+        """
+        template_height, template_width = (int(value) for value in template_shape[:2])
+        search_width = int(search_rect[2])
+        search_height = int(search_rect[3])
+        if template_height <= 0 or template_width <= 0:
+            return False
+        if max(template_height, template_width) > MATCH_TILE_TEMPLATE_LIMIT:
+            return False
+        return search_width * search_height >= MATCH_TILE_SEARCH_PIXELS_LIMIT
 
     @staticmethod
     def _positions(total: int, size: int, step: int) -> list[int]:
@@ -615,18 +795,20 @@ class Tiler:
 
 
 class ContourTiler:
-    def __init__(self, threshold: BinaryThresholdConfig, shapes: ShapeFilterConfig, gpu_runtime=None):
+    def __init__(self, threshold: BinaryThresholdConfig, shapes: ShapeFilterConfig, gpu_runtime=None, crop_workers: int | str = "auto"):
         self.segmenter = BinarySegmenter(threshold)
         self.analyzer = ContourShapeAnalyzer(shapes)
         self.shape_config = shapes
         self.gpu_runtime = gpu_runtime
+        self.crop_workers = crop_workers
 
     @classmethod
-    def from_config(cls, config: dict, gpu_runtime=None) -> "ContourTiler":
+    def from_config(cls, config: dict, gpu_runtime=None, crop_workers=None) -> "ContourTiler":
         return cls(
             threshold=BinaryThresholdConfig.from_dict(config.get("threshold")),
             shapes=ShapeFilterConfig.from_dict(config.get("shapes")),
             gpu_runtime=gpu_runtime,
+            crop_workers=_crop_workers(config, crop_workers),
         )
 
     def iter_tiles(self, image) -> Iterator[Tile]:
@@ -636,94 +818,98 @@ class ContourTiler:
         image_height, image_width = image.shape[:2]
         accepted_index = 0
 
-        for contour_index, contour in enumerate(contours):
-            metadata = self.analyzer.analyze(contour, gray)
-            if metadata is None:
-                continue
+        def tile_specs():
+            nonlocal accepted_index
+            for contour_index, contour in enumerate(contours):
+                metadata = self.analyzer.analyze(contour, gray)
+                if metadata is None:
+                    continue
 
-            x, y, width, height = metadata["bbox"]
-            padding = self.shape_config.crop_padding
-            x1 = max(0, x - padding)
-            y1 = max(0, y - padding)
-            x2 = min(image_width, x + width + padding)
-            y2 = min(image_height, y + height + padding)
-            if x2 <= x1 or y2 <= y1:
-                continue
+                x, y, width, height = metadata["bbox"]
+                padding = self.shape_config.crop_padding
+                x1 = max(0, x - padding)
+                y1 = max(0, y - padding)
+                x2 = min(image_width, x + width + padding)
+                y2 = min(image_height, y + height + padding)
+                if x2 <= x1 or y2 <= y1:
+                    continue
 
-            tile_image = _crop_image(image, x1, y1, x2, y2, self.gpu_runtime)
-            shape = metadata["shape"]
-            yield Tile(
-                tile_id=f"{shape}_{accepted_index:04d}",
-                x=x1,
-                y=y1,
-                width=x2 - x1,
-                height=y2 - y1,
-                row=accepted_index,
-                col=0,
-                image=tile_image,
-                metadata={
-                    "mode": "contour",
-                    "contour_index": int(contour_index),
-                    **metadata,
-                },
-            )
-            accepted_index += 1
+                shape = metadata["shape"]
+                yield Tile(
+                    tile_id=f"{shape}_{accepted_index:04d}",
+                    x=x1,
+                    y=y1,
+                    width=x2 - x1,
+                    height=y2 - y1,
+                    row=accepted_index,
+                    col=0,
+                    image=None,
+                    metadata={
+                        "mode": "contour",
+                        "contour_index": int(contour_index),
+                        **metadata,
+                    },
+                )
+                accepted_index += 1
+        yield from _iter_cropped_tiles(image, tile_specs(), self.gpu_runtime, self.crop_workers)
 
 
 class PatternMatchTiler:
-    def __init__(self, config: PatternMatchConfig, gpu_runtime=None):
+    def __init__(self, config: PatternMatchConfig, gpu_runtime=None, crop_workers: int | str = "auto"):
         self.config = config
         self.matcher = PatternMatcher(config)
         self.gpu_runtime = gpu_runtime
+        self.crop_workers = crop_workers
 
     @classmethod
-    def from_config(cls, config: dict, gpu_runtime=None) -> "PatternMatchTiler":
-        return cls(PatternMatchConfig.from_dict(config.get("pattern_match")), gpu_runtime=gpu_runtime)
+    def from_config(cls, config: dict, gpu_runtime=None, crop_workers=None) -> "PatternMatchTiler":
+        return cls(PatternMatchConfig.from_dict(config.get("pattern_match")), gpu_runtime=gpu_runtime, crop_workers=_crop_workers(config, crop_workers))
 
     def iter_tiles(self, image) -> Iterator[Tile]:
         image_height, image_width = image.shape[:2]
         matches = self.matcher.find_matches(image)
         padding = self.config.crop_padding
-        for index, match in enumerate(matches):
-            x = int(match["x"])
-            y = int(match["y"])
-            width = int(match["width"])
-            height = int(match["height"])
-            x1 = max(0, x - padding)
-            y1 = max(0, y - padding)
-            x2 = min(image_width, x + width + padding)
-            y2 = min(image_height, y + height + padding)
-            if x2 <= x1 or y2 <= y1:
-                continue
+        def tile_specs():
+            for index, match in enumerate(matches):
+                x = int(match["x"])
+                y = int(match["y"])
+                width = int(match["width"])
+                height = int(match["height"])
+                x1 = max(0, x - padding)
+                y1 = max(0, y - padding)
+                x2 = min(image_width, x + width + padding)
+                y2 = min(image_height, y + height + padding)
+                if x2 <= x1 or y2 <= y1:
+                    continue
 
-            tile_image = _crop_image(image, x1, y1, x2, y2, self.gpu_runtime)
-            yield Tile(
-                tile_id=f"pm_{index:04d}",
-                x=x1,
-                y=y1,
-                width=x2 - x1,
-                height=y2 - y1,
-                row=index,
-                col=0,
-                image=tile_image,
-                metadata={
-                    "mode": "pattern_match",
-                    "match_index": index,
-                    "score": float(match["score"]),
-                    "match_bbox": [x, y, width, height],
-                    "template_path": self.config.template_path,
-                },
-            )
+                yield Tile(
+                    tile_id=f"pm_{index:04d}",
+                    x=x1,
+                    y=y1,
+                    width=x2 - x1,
+                    height=y2 - y1,
+                    row=index,
+                    col=0,
+                    image=None,
+                    metadata={
+                        "mode": "pattern_match",
+                        "match_index": index,
+                        "score": float(match["score"]),
+                        "match_bbox": [x, y, width, height],
+                        "template_path": self.config.template_path,
+                    },
+                )
+        yield from _iter_cropped_tiles(image, tile_specs(), self.gpu_runtime, self.crop_workers)
 
 
-def create_tiler(tile_config: dict, gpu_runtime=None, resident_image=None):
+def create_tiler(tile_config: dict, gpu_runtime=None, resident_image=None, crop_workers=None):
     mode = str(tile_config.get("mode", "grid")).lower()
     if mode == "grid":
         return Tiler.from_config(
-            tile_config, gpu_runtime=gpu_runtime, resident_image=resident_image
+            tile_config, gpu_runtime=gpu_runtime, resident_image=resident_image, crop_workers=crop_workers
         )
     if mode == "contour":
-        return ContourTiler.from_config(tile_config, gpu_runtime=gpu_runtime)
+        return ContourTiler.from_config(tile_config, gpu_runtime=gpu_runtime, crop_workers=crop_workers)
     if mode == "pattern_match":
-        return PatternMatchTiler.from_config(tile_config, gpu_runtime=gpu_runtime)
+        return PatternMatchTiler.from_config(tile_config, gpu_runtime=gpu_runtime, crop_workers=crop_workers)
     raise ValueError(f"Unsupported tile mode: {mode}")

@@ -47,6 +47,27 @@ function Get-OptionalProperty {
     return $DefaultValue
 }
 
+function Get-Sha256Hex {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Path
+    )
+
+    # Use the framework implementation instead of Get-FileHash. Some developer shells inherit a
+    # PowerShell 7 module path while running Windows PowerShell 5.1, which can shadow the compatible
+    # Microsoft.PowerShell.Utility module and make Get-FileHash unavailable after a successful build.
+    $stream = [System.IO.File]::OpenRead($Path)
+    $algorithm = [System.Security.Cryptography.SHA256]::Create()
+    try {
+        $bytes = $algorithm.ComputeHash($stream)
+        return ([System.BitConverter]::ToString($bytes)).Replace("-", "")
+    }
+    finally {
+        $algorithm.Dispose()
+        $stream.Dispose()
+    }
+}
+
 if ($Architecture -notmatch '^sm_\d{2,3}$') {
     throw "Invalid architecture '$Architecture'. Expected sm_86, sm_89, etc."
 }
@@ -137,14 +158,22 @@ foreach ($artifact in @($dllPath, $importLibraryPath, $expPath)) {
 $optimization = [string](Get-OptionalProperty -Object $nvccConfig -Name "dll_optimization" -DefaultValue "-O2")
 $cudart = [string](Get-OptionalProperty -Object $nvccConfig -Name "cudart" -DefaultValue "static")
 $testOptimization = [string](Get-OptionalProperty -Object $nvccConfig -Name "test_optimization" -DefaultValue "-O2")
+# Exact OpenCV float semantics (for example INTER_AREA accumulation) require no fused multiply-add.
+$fmad = if ([bool](Get-OptionalProperty -Object $nvccConfig -Name "fmad" -DefaultValue $true)) { "true" } else { "false" }
+# Extra cl.exe switches for both the DLL and the native smoke target. CUB/CCCL refuses to compile
+# under the traditional MSVC preprocessor, so /Zc:preprocessor is the declared default and a normal
+# rebuild reproduces the same DLL without an ad-hoc command line.
+$msvcFlags = @(Get-OptionalProperty -Object $nvccConfig -Name "msvc_flags" -DefaultValue @("/Zc:preprocessor"))
+$compilerFlags = (@("/MD", "/utf-8") + ($msvcFlags | ForEach-Object { [string]$_ })) -join ","
 
 $dllArguments = @(
     "--std=c++17",
     $optimization,
     "--shared",
     "--cudart=$cudart",
+    "--fmad=$fmad",
     "-arch=$Architecture",
-    "-Xcompiler=/MD,/utf-8",
+    "-Xcompiler=$compilerFlags",
     "-Xlinker", "/IMPLIB:$importLibraryPath"
 )
 foreach ($includeDir in $resolvedIncludeDirs) {
@@ -185,8 +214,9 @@ foreach ($target in $testTargets) {
         "--std=c++17",
         $testOptimization,
         "--cudart=$cudart",
+        "--fmad=$fmad",
         "-arch=$Architecture",
-        "-Xcompiler=/MD,/utf-8"
+        "-Xcompiler=$compilerFlags"
     )
     foreach ($includeDir in $resolvedIncludeDirs) {
         $testArguments += "-I$includeDir"
@@ -242,11 +272,10 @@ foreach ($artifact in $publishArtifacts) {
 Write-Host "Published validated CUDA artifacts to: $projectDirectory"
 
 $artifactHashes = foreach ($artifact in $publishArtifacts) {
-    $hash = Get-FileHash -LiteralPath $artifact -Algorithm SHA256
     [pscustomobject]@{
         name = Split-Path -Leaf $artifact
         bytes = (Get-Item -LiteralPath $artifact).Length
-        sha256 = $hash.Hash
+        sha256 = Get-Sha256Hex -Path $artifact
     }
 }
 $commit = (& git -C $repositoryRoot rev-parse HEAD 2>$null | Select-Object -First 1)

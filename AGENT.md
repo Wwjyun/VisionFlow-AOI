@@ -11,10 +11,10 @@ Primary entry points:
 - CLI: `python main.py --image <image> --recipe <recipe.yaml> --output <directory>`
 - GUI: `python main.py --gui`
 - Packaged GUI entry/smoke: `gui_launcher.py` and `VisionFlow AOI.exe --smoke-test`
-- Windows package build: `build_exe.ps1` using the tracked `VisionFlow AOI.spec`
-- Traditional-CV tuning reference: `contour_preprocess_tool/` (run with `python -m contour_preprocess_tool`; build the independent EXE with `build_contour_preprocess_tool.ps1`)
-- Standalone utilities: `tools/export_ng_tiles_by_area.py`, `tools/export_pattern_grid_tiles.py`, `tools/export_matrix_summary.py`, and `tools/export_scatter_plots.py`
-- Utility bundle build: `build_utility_tools.ps1`; individual utility builds use their dedicated `build_*_exporter.ps1` or `build_ng_tile_area_tool.ps1` entry point
+- Windows package build: `packaging/scripts/build_exe.ps1` using the tracked `packaging/specs/VisionFlow AOI.spec`
+- Traditional-CV tuning reference: `contour_preprocess_tool/` (run with `python -m contour_preprocess_tool`; build the independent EXE with `packaging/scripts/build_contour_preprocess_tool.ps1`)
+- Standalone utilities: `tools/export_ng_tiles_by_area.py`, `tools/export_pattern_grid_tiles.py`, `tools/export_matrix_summary.py`, `tools/export_scatter_plots.py`, and `tools/export_tile_defect_distribution.py`
+- Utility bundle build: `packaging/scripts/build_utility_tools.ps1`; individual utility builds use their dedicated `build_*_exporter.ps1` or `build_ng_tile_area_tool.ps1` entry point under `packaging/scripts/`
 - CUDA build: `gpu/build_cuda_dll.ps1`
 - CUDA validation: `gpu/validate_cuda_dll.py`
 - CUDA source/ABI preflight: `gpu/preflight_cuda_build.py`
@@ -37,12 +37,14 @@ The normal development machine may not have `nvcc`, CMake, or an NVIDIA GPU. Nev
 
 ## Module ownership
 
-- Top-level entry points: keep CLI orchestration in `main.py`, packaged startup/smoke in `gui_launcher.py`, and main packaging in `build_exe.ps1` and `VisionFlow AOI.spec`.
-- `tools/`: standalone post-processing and tile-export utility sources; each tool keeps its dedicated root-level spec/build entry point.
+- Top-level entry points: keep CLI orchestration in `main.py`, packaged startup/smoke in `gui_launcher.py`, and main packaging in `packaging/scripts/build_exe.ps1` and `packaging/specs/VisionFlow AOI.spec`.
+- `packaging/`: every PyInstaller build entry point and spec. Keep build scripts in `packaging/scripts/` and specs in `packaging/specs/`; do not add new root-level `build_*.ps1` or `*.spec` files. Specs derive the repository root from `SPECPATH` because PyInstaller resolves relative paths against the spec directory, and build scripts derive it from `$PSScriptRoot`'s grandparent. Keep these files ASCII-only: Windows PowerShell 5.1 reads BOM-less files as ANSI and a non-ASCII comment can swallow the line ending.
+- `tools/`: standalone post-processing and tile-export utility sources; each tool keeps its dedicated spec/build entry point under `packaging/`.
 - `core/`: pipeline, recipe loading/building, tiling, aggregation, reporting, profiling, batch/monitor processing, result schemas/compaction, GPU sessions/bridge, preprocessing plans and executors.
 - `detectors/`: detector-specific feature extraction, geometry, filtering, and result metadata.
 - `gpu/`: CUDA C ABI, kernels, persistent contexts, build scripts, native smoke tests, and CPU/GPU validation.
-- `gui/`: PySide6 screens, widgets, workers, status, and preview behavior.
+- `devices/`: optional acquisition hardware (CCD line-scan camera, LSI-8181 meter wheel): backend-neutral interfaces, typed settings, simulators, vendor bindings, machine-level settings store, and frame writing. No Qt imports.
+- `gui/`: PySide6 screens, widgets, workers, status, and preview behavior; `gui/ccd_controller.py` owns the long-lived CCD sessions.
 - `recipes/`: YAML configuration and production defaults.
 - `tests/`: automated correctness, fallback, routing, and regression tests.
 - `.github/workflows/`: CI only; keep GPU runtime jobs isolated from ordinary hosted runners.
@@ -66,9 +68,12 @@ Put behavior in the narrowest appropriate module. Do not duplicate pipeline or f
 - `CpuPreprocessExecutor` defines OpenCV fallback semantics. `CudaPreprocessExecutor` selects a generic native plan, compatibility adapter, reusable primitives, or explicit fallback.
 - Add a shared operator when an algorithm is reusable. Detector-named native adapters are compatibility code, not the extension model.
 - Do not silently substitute a faster operation with different semantics, such as nearest-neighbor for OpenCV `INTER_AREA`.
-- Prefer one upload, multiple device operators, and one necessary download. Reuse context buffers across operators, tiles, and images where lifetime permits.
+- GPU-mode pipeline boundary: image file reading and decoding (PNG/BMP/JPEG) stay on CPU, and the decoded image is uploaded to the device exactly once. After that upload, every inspection step before aggregation must run on the GPU without further pixel H2D: Template Anchor Grid localization, tile/ROI generation, preprocessing, candidate extraction (contours or connected components), geometry/shape filtering, statistics such as CNR, and PASS/NG defect decisions. Download only final defect results plus pixels explicitly needed for overlay, NG tiles, debug images, or GUI display.
+- Aggregation, report generation (overlay rendering, CSV/JSON, PNG encoding), YAML, logging, GUI control, and disk I/O stay on CPU.
+- Every GPU-mode step keeps its CPU implementation as the correctness reference and the whole-detector fallback. A GPU implementation replaces a CPU step only after tests prove identical PASS/NG, defect count, bbox, area, confidence, metadata, and OpenCV contour/label ordering (or a documented, tested tolerance).
+- Steps that do not yet have a verified GPU implementation remain CPU work tracked in the `Todo.md` full-GPU section. Report the actual device/host split from runtime metadata; never describe the flow as fully GPU before it is.
+- Reuse context buffers across operators, tiles, and images where lifetime permits.
 - Preserve context-owned resident image/device ROI lifetime and generation checks. Batch and monitor share one `GpuExecutionSession`; do not create one runtime per image or per worker.
-- Keep small contour/geometry work, YAML, aggregation, GUI control, CSV/JSON, PNG encoding, and disk I/O on CPU unless profiling proves otherwise.
 - Tile-level CPU parallelism is opt-in. Use thread-local detector instances, preserve input ordering, and keep GPU detector or resident-image execution on the single serialized GPU path.
 - Recipe caching must invalidate on file metadata changes and return independent deep copies; never expose a mutable cached recipe.
 - Debug intermediate images are opt-in runtime payloads. Strip them from JSON and public tile results, and never enable them in production defaults.
@@ -96,6 +101,19 @@ Put behavior in the narrowest appropriate module. Do not duplicate pipeline or f
 - Keep hidden Results content lazy. Defer table/output population until the screen is opened and create large thumbnail collections in bounded event-loop batches so inspection completion remains responsive.
 - New operator-facing text is Traditional Chinese except established industrial abbreviations such as PASS, NG, ERROR, CPU, CUDA, ROI and DLL. Status must remain understandable without color alone and keyboard paths require tests.
 
+## CCD camera and meter wheel contract
+
+- Camera and meter wheel support is an optional capability like the CUDA DLL. Missing Sapera LT, pythonnet, `LSI8181_64.dll`, drivers, or hardware must never block GUI, CLI, batch, or monitor startup; the CCD screen shows the reason.
+- `xx_ccd/` (the C# `CameraCaptureApp`) is an untracked behavior reference only. Port its confirmed behavior into `devices/`; never import, embed, or launch it at runtime.
+- Camera settings are written to hardware only on connect; applying while connected marks a pending reconnect. Keep only the hardware write paths confirmed in `xx_ccd/PROJECT_HANDOFF.md` and do not reintroduce feature probing.
+- `MainWindow` owns one `CcdController`; screens never own or disconnect devices. Driver callbacks only hand off frames; preview conversion, saving, and status refresh run elsewhere, and older preview frames may be dropped.
+- Machine-level settings live in the CCD machine settings store, not in Recipes. Product-level camera parameters (exposure, gain, length, line rate, trigger options, auto-save rules) live in the optional Recipe `camera` section parsed by `devices/ccd_recipe.py` and validated strictly by `RecipeManager`.
+- A Recipe without a `camera` section must never change camera settings. The Designer is the only writer of the section: CCD-screen applies become unsaved Designer edits, Engineer-mode saves preserve the section, and unedited values must not be rounded by display widgets.
+- CCD controls are fail-closed through `AccessGate`: only controls explicitly registered for engineers are available in Engineer mode, OP cannot open the screen, and programmatic loads never write hardware or settings.
+- Trigger automation (external-trigger meter-wheel writes, the software-trigger monitor, auto-save) follows the trigger settings actually written to the camera at connect, never unapplied edits. Driver and monitor threads only hand work to the GUI thread, which owns camera and meter-wheel commands; Stop ends monitoring but never aborts a frame that is still capturing.
+- Camera-direct monitoring inspects only frames from trigger-mode connections, hands them off through the bounded `CameraFrameQueue`, and reports every frame that could not be queued as an ERROR item. `AOIPipeline.run_frame` must stay pixel-identical to inspecting the same frame saved as an 8-bit BMP, keep the file-path entry point and its result schema unchanged, and in GPU mode treat the frame as a decoded image uploaded once.
+- Do not mark CCD or meter wheel items hardware-validated until they run on the camera machine.
+
 ## Detector parameter access contract
 
 - Every registered Detector parameter must be classified by the shared `ParameterSpec.parameter_group` contract as `outer` or `inner`. `parameter_group` is authoritative; the derived `engineer_visible` field exists only for compatibility and detector source must not set it directly.
@@ -109,7 +127,7 @@ Put behavior in the narrowest appropriate module. Do not duplicate pipeline or f
 
 ## Future detector development contract
 
-- Every new traditional CV detector must express reusable image preprocessing as a cached immutable `PreprocessPlan`; detector code keeps only detector-specific geometry, filtering, PASS/NG decisions, defect metadata, and deterministic ordering.
+- Every new traditional CV detector must express reusable image preprocessing as a cached immutable `PreprocessPlan`; detector code keeps only detector-specific parameters, decision rules, defect metadata, and deterministic ordering. Candidate extraction, geometry filtering, and statistics must be designed so the GPU-mode boundary above can keep them on the device through shared, backend-neutral operators rather than detector-specific CUDA workflows.
 - Cache keys must cover the input shape/dtype and every detector parameter that changes preprocessing semantics. Use the bounded shared plan cache rather than mutable module globals or rebuilding plans for every tile.
 - `CpuPreprocessExecutor` is the correctness reference. Optional CUDA execution must use shared typed operators, capability reporting, and full-detector CPU restart on unsupported semantics or failure.
 - Do not add detector-specific CUDA workflows or exports for new detectors. When a reusable operation is missing, add a backend-neutral typed operator and its CPU reference first; temporary compatibility adapters require an explicit migration item in `Todo.md`.
@@ -140,7 +158,7 @@ Before finishing, always run:
 
 ```powershell
 .\env\Scripts\python.exe -m unittest discover -s tests -v
-.\env\Scripts\python.exe -m compileall main.py gui_launcher.py tools contour_preprocess_tool core detectors gui gpu
+.\env\Scripts\python.exe -m compileall main.py gui_launcher.py tools contour_preprocess_tool core detectors devices gui gpu
 .\env\Scripts\python.exe gpu\preflight_cuda_build.py
 git diff --check
 ```
@@ -154,7 +172,7 @@ $env:QT_QPA_PLATFORM='offscreen'
 .\env\Scripts\python.exe -c "from pathlib import Path; from PySide6.QtWidgets import QApplication; from gui.main_window import MainWindow; app=QApplication([]); w=MainWindow(); w.recipe_panel.load_recipe(Path('recipes/PRODUCT_A_AOI_01.yaml')); print(w.windowTitle(), w.recipe_panel.detector_list.count())"
 ```
 
-For packaging, `gui_launcher.py`, or spec changes, build through `build_exe.ps1` and run the packaged `--smoke-test` when the local environment can support a package build. The smoke must cover bundled recipe/MainWindow startup, CPU-only execution, missing-DLL fallback equivalence with zero GPU calls, and explicit strict-CUDA failure.
+For packaging, `gui_launcher.py`, or spec changes, build through `packaging\scripts\build_exe.ps1` and run the packaged `--smoke-test` when the local environment can support a package build. The smoke must cover bundled recipe/MainWindow startup, CPU-only execution, missing-DLL fallback equivalence with zero GPU calls, and explicit strict-CUDA failure.
 
 For standalone utility or utility spec/build changes, use the matching dedicated build script and run that utility's packaged `--smoke-test`. Keep utility bundle tags (`utility-tools-vX.Y.Z`) and the legacy NG Tile tool tag namespace separate from VisionFlow AOI application tags (`vX.Y.Z`).
 

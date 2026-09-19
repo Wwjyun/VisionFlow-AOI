@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "llm-delegate": {
+      "type": "stdio",
+      "command": "python",
+      "args": [".claude/mcp/llm_delegate_server.py"]
+    }
+  }
+}

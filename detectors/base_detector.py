@@ -48,6 +48,9 @@ class BaseDetector:
         self._cuda_preprocess_dag_executor = CudaPreprocessDagExecutor(gpu_runtime) if gpu_runtime is not None else None
         self._preprocess_plan_cache = PreprocessPlanCache()
         self.last_preprocess_capability: dict = {}
+        self.preprocess_route_counts: dict[str, int] = {}
+        self._run_preprocess_routes: dict[str, int] = {}
+        self._crossover_plan_keys: set[tuple] = set()
         self._active_device_roi = None
         self._active_preprocess_cache = None
         self._detection_stage_durations: dict[str, float] = {}
@@ -118,17 +121,14 @@ class BaseDetector:
                     report["reason"],
                     self._cpu_preprocess_executor,
                 )
-            result = self._cuda_preprocess_executor.execute(
+            return self._execute_cuda_or_crossover_cpu(
                 image,
                 plan,
-                device_roi=(
-                    self._device_roi_for(image, device_roi_offset)
-                    if use_device_roi
-                    else None
-                ),
+                report,
+                self._cuda_preprocess_executor,
+                self._cpu_preprocess_executor,
+                self._device_roi_for(image, device_roi_offset) if use_device_roi else None,
             )
-            self._record_preprocess_result(plan, result)
-            return result
         report = self._cpu_preprocess_executor.capability_report(plan).to_dict()
         if self.use_gpu and self.gpu_fallback_reason:
             report.update(
@@ -158,13 +158,14 @@ class BaseDetector:
                 return self._execute_cpu_fallback(
                     image, plan, report["reason"], self._cpu_preprocess_dag_executor
                 )
-            result = self._cuda_preprocess_dag_executor.execute(
+            return self._execute_cuda_or_crossover_cpu(
                 image,
                 plan,
-                device_roi=self._device_roi_for(image, device_roi_offset),
+                report,
+                self._cuda_preprocess_dag_executor,
+                self._cpu_preprocess_dag_executor,
+                self._device_roi_for(image, device_roi_offset),
             )
-            self._record_preprocess_result(plan, result)
-            return result
         report = self._cpu_preprocess_dag_executor.capability_report(plan).to_dict()
         if self.use_gpu and self.gpu_fallback_reason:
             report.update(
@@ -177,6 +178,65 @@ class BaseDetector:
         result = self._cpu_preprocess_dag_executor.execute(image, plan)
         self._record_preprocess_result(plan, result)
         return result
+
+    def _execute_cuda_or_crossover_cpu(self, image, plan, report: dict, cuda_executor, cpu_executor, device_roi):
+        """Run a CUDA-capable plan, or its pixel-identical CPU plan when measured faster here."""
+        policy = getattr(self.gpu_runtime, "crossover_policy", None) if self._gpu_fallback_enabled else None
+        resident = device_roi is not None
+        key = policy.key(plan, image, resident) if policy is not None else None
+        prefers_cpu, decided_key = policy.prefer_cpu_key(key) if policy is not None else (False, None)
+        if policy is not None:
+            # Remember the decision key each CUDA-capable plan call used so callers can tell whether a
+            # whole-run assumption (for example skipping the resident upload) is still covered.
+            self._crossover_plan_keys.add(key)
+        if prefers_cpu:
+            report.update(
+                selected_backend="cpu",
+                route="cpu_crossover",
+                reason=f"本機實測此前處理 plan 與輸入尺寸以 CPU 較快：{policy.report(decided_key)}",
+            )
+            self.last_preprocess_capability = report
+            self._count_preprocess_route("cpu_crossover")
+            result = cpu_executor.execute(image, plan)
+            self._record_preprocess_result(plan, result)
+            return result
+        started = policy.clock() if policy is not None else 0.0
+        result = cuda_executor.execute(image, plan, device_roi=device_roi)
+        self._count_preprocess_route("cuda")
+        if policy is not None:
+            policy.record(key, "cuda", policy.clock() - started)
+            if policy.wants_cpu_sample(key):
+                started = policy.clock()
+                cpu_executor.execute(image, plan)
+                policy.record(key, "cpu", policy.clock() - started)
+        self._record_preprocess_result(plan, result)
+        return result
+
+    def _count_preprocess_route(self, route: str) -> None:
+        self.preprocess_route_counts[route] = self.preprocess_route_counts.get(route, 0) + 1
+        self._run_preprocess_routes[route] = self._run_preprocess_routes.get(route, 0) + 1
+
+    @staticmethod
+    def _crossover_cpu_only(routes: dict) -> bool:
+        return bool(routes.get("cpu_crossover")) and not routes.get("cuda")
+
+    @property
+    def cpu_crossover_only(self) -> bool:
+        """True when every CUDA-capable plan in this detector instance chose the CPU route."""
+        return self._crossover_cpu_only(self.preprocess_route_counts)
+
+    def cpu_crossover_covers(self, policy) -> bool:
+        """True when every plan call this detector made still measures CPU-faster for its own key.
+
+        A run-level decision such as skipping the resident upload may only be reused while the plans
+        and input shapes that produced it still resolve to the CPU route. A different tile or image
+        shape has its own calibration key, so it keeps the upload and the measured CUDA route until
+        it is measured itself.
+        """
+        keys = self._crossover_plan_keys
+        if not self.cpu_crossover_only or not keys or policy is None:
+            return False
+        return all(policy.prefer_cpu_key(key)[0] for key in keys)
 
     def _execute_cpu_fallback(self, image, plan, reason: str, executor):
         if not self._gpu_fallback_enabled:
@@ -220,18 +280,21 @@ class BaseDetector:
 
     def run(self, image, device_roi=None, preprocess_cache=None) -> dict:
         self._detection_stage_durations = {}
+        self._run_preprocess_routes = {}
         if self.export_debug_images:
             self.debug_images = {}
         previous_device_roi = self._active_device_roi
         previous_preprocess_cache = self._active_preprocess_cache
         self._active_device_roi = device_roi
         self._active_preprocess_cache = preprocess_cache
+        # A sticky CUDA failure makes the runtime unavailable mid-run; the attempt still restarts on CPU.
+        gpu_attempted = self.gpu_active
         try:
             try:
                 processed = self.preprocess(image)
                 defects = self.detect(processed)
             except Exception as exc:
-                if not self.gpu_active or not self._gpu_fallback_enabled:
+                if not gpu_attempted or not self._gpu_fallback_enabled:
                     raise
                 self.gpu_fallback_reason = str(exc)
                 self._active_device_roi = None
@@ -241,6 +304,7 @@ class BaseDetector:
             self._active_device_roi = previous_device_roi
             self._active_preprocess_cache = previous_preprocess_cache
         max_confidence = max((defect.get("confidence", 0.0) for defect in defects), default=0.0)
+        cuda_used = self.gpu_active and not self._crossover_cpu_only(self._run_preprocess_routes)
         return {
             "detector_id": self.detector_id,
             "detector_name": self.detector_name,
@@ -250,9 +314,10 @@ class BaseDetector:
             "defects": defects,
             "execution": {
                 "gpu_requested": self.use_gpu,
-                "gpu_active": self.gpu_active,
-                "backend": "cuda_dll" if self.gpu_active else "cpu",
+                "gpu_active": cuda_used,
+                "backend": "cuda_dll" if cuda_used else "cpu",
                 "fallback_reason": self.gpu_fallback_reason,
+                "preprocess_routes": dict(self._run_preprocess_routes),
                 "preprocess_capability": self.last_preprocess_capability,
                 "performance": {
                     "measurement_scope": "host_wall_clock",

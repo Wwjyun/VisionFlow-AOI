@@ -23,15 +23,30 @@ from PySide6.QtWidgets import (
     QApplication,
 )
 
+from core.camera_monitor_processor import CameraFrameQueue
 from core.logging_system import LogMixin, configure_logging
-from core.gpu_session import GpuExecutionSessionCache
+from core.gpu_session import GpuExecutionSession, GpuExecutionSessionCache
+from gui.backend_comparison_dialog import BackendComparisonDialog, comparison_headline
+from gui.performance_summary import VRAM_LOW_NOTICE
 from core.recipe_manager import RecipeError, RecipeManager
+from devices.ccd_models import CAMERA_STATE_LABELS, TRIGGER_MODE_LABELS, CameraRecipeSettings, CameraStatus
+from devices.ccd_recipe import camera_settings_from_recipe
+from devices.ccd_settings_store import CcdMachineSettingsStore
+from devices.factory import CcdDevices, create_ccd_devices
 from gui import theme
+from gui.ccd_controller import CcdController
+from gui.image_pyramid import PreviewImage
 from gui.permission_manager import MODE_LABELS, ModePasswordPrompt, PermissionManager
 from gui.preferences import GuiPreferences
 from gui.screens.batch_dashboard_screen import BatchDashboardScreen
+from gui.screens.ccd_screen import CcdScreen
 from gui.screens.designer_screen import DesignerScreen
-from gui.screens.monitor_screen import MonitorScreen
+from gui.screens.monitor_screen import (
+    MONITOR_SOURCE_CAMERA,
+    MONITOR_SOURCE_FOLDER,
+    MONITOR_SOURCES,
+    MonitorScreen,
+)
 from gui.screens.results_screen import ResultsScreen, flatten_defects, flatten_viewer_overlays
 from gui.screens.run_screen import RunScreen
 from gui.widgets.common import InlineNotice, Toggle
@@ -40,20 +55,34 @@ from gui.widgets.rail import NavRail
 from gui.widgets.topbar import TopBar
 from gui.workflow_controllers import (
     BatchWorkflowController,
+    GpuWarmupWorkflowController,
+    BackendComparisonWorkflowController,
     InspectionWorkflowController,
     MonitorWorkflowController,
     PreviewWorkflowController,
     TilePreviewWorkflowController,
 )
-from gui.workers import BatchInspectionWorker, FolderMonitorWorker, ImagePreviewWorker, InspectionWorker, TilePreviewWorker
+from gui.workers import (
+    BackendComparisonWorker,
+    BatchInspectionWorker,
+    CameraMonitorWorker,
+    FolderMonitorWorker,
+    GpuWarmupWorker,
+    ImagePreviewWorker,
+    InspectionWorker,
+    TilePreviewWorker,
+)
 
 # ============================================================
 # AOI Console — main window shell (rail + topbar + screens + status bar)
 # ============================================================
 
-SCREEN_INDEX = {"run": 0, "monitor": 1, "designer": 2, "results": 3, "batch_dashboard": 4}
+SCREEN_INDEX = {"run": 0, "monitor": 1, "designer": 2, "results": 3, "batch_dashboard": 4, "ccd": 5}
 ALL_SCREENS = set(SCREEN_INDEX)
 HISTORY_LIMIT = 6
+METER_WHEEL_AUTO_CONNECT_DELAY_MS = 1000
+CAMERA_MONITOR_READY_MESSAGE = "相機直連已就緒：按「啟動」後會檢測每張觸發完成的影像。"
+CAMERA_MONITOR_NO_ORIGINAL_MESSAGE = "這張相機影像沒有保存原圖（檢測佇列已滿或存圖失敗），詳見錯誤欄位與 log。"
 
 OUTPUT_TOGGLE_LABELS = {
     "save_overlay": "儲存 overlay 影像",
@@ -91,11 +120,15 @@ def _backend_status_from_result(result: dict | None) -> dict:
         ),
         "",
     )
+    memory = (gpu_execution.get("resident_image", {}) or {}).get("device_memory_before_upload", {}) or {}
     return {
         "requested": requested,
         "active": active,
         "device_name": active_device or str(tiling_status.get("device_name") or "CUDA"),
         "fallback_reason": next((reason for reason in reasons if reason), ""),
+        "vram_low": bool(memory.get("dedicated_vram_low", False)),
+        "vram_free_bytes": int(memory.get("free_bytes", 0) or 0),
+        "vram_total_bytes": int(memory.get("total_bytes", 0) or 0),
     }
 
 
@@ -128,6 +161,8 @@ class MainWindow(QMainWindow, LogMixin):
         settings: QSettings | None = None,
         permission_manager: PermissionManager | None = None,
         password_prompt: ModePasswordPrompt | None = None,
+        ccd_devices: CcdDevices | None = None,
+        ccd_settings_store: CcdMachineSettingsStore | None = None,
     ):
         super().__init__()
         app = QApplication.instance()
@@ -178,6 +213,7 @@ class MainWindow(QMainWindow, LogMixin):
         self.monitor_move_dir: Path | None = None
         self.monitor_running = False
         self.monitor_result: dict | None = None
+        self.monitor_source = MONITOR_SOURCE_FOLDER
         self._current_screen = "run"
         self._restored_viewer_zoom = 0.0
         self._restored_monitor_splitter_sizes: list[int] | None = None
@@ -193,6 +229,15 @@ class MainWindow(QMainWindow, LogMixin):
         self._batch_controller = BatchWorkflowController(self)
         self._monitor_controller = MonitorWorkflowController(self)
         self._tile_preview_controller = TilePreviewWorkflowController(self)
+        self._warmup_controller = GpuWarmupWorkflowController(self)
+        self.warming_up = False
+        self._comparison_controller = BackendComparisonWorkflowController(self)
+        self.comparing_backends = False
+        self._comparison_dialog = None
+        # Background warm-up after a CUDA recipe and an image are loaded. It does not lock the UI:
+        # runs that start meanwhile wait for the shared session instead of racing it.
+        self.auto_warming_up = False
+        self._auto_warmup_key: tuple | None = None
 
         self._preview_thread: QThread | None = None
         self._preview_worker: ImagePreviewWorker | None = None
@@ -200,7 +245,10 @@ class MainWindow(QMainWindow, LogMixin):
         self._preview_started_at: float | None = None
         self._inspection_thread: QThread | None = None
         self._inspection_worker: InspectionWorker | None = None
-        self._inspection_gpu_sessions = GpuExecutionSessionCache(workload="latency")
+        # One GPU session for single inspection, warm-up, batch and monitor, so a warm-up or an earlier
+        # run also prepares the next batch/monitor. Runs on it are serialized; throughput queue depth
+        # only bounds concurrent requests inside one run.
+        self._inspection_gpu_sessions = GpuExecutionSessionCache(workload="throughput")
         self._batch_thread: QThread | None = None
         self._batch_worker: BatchInspectionWorker | None = None
         self._monitor_thread: QThread | None = None
@@ -210,6 +258,17 @@ class MainWindow(QMainWindow, LogMixin):
 
         self.recipe_manager = RecipeManager()
         self.recipe_panel = _RecipePanelCompatibility(self)
+        # The machine settings file is the single source of truth for the CCD machine location and the
+        # LSI-8181 DLL path, so the device factory reads it lazily instead of duplicating it.
+        machine_settings_store = ccd_settings_store or CcdMachineSettingsStore()
+        self.ccd_controller = CcdController(
+            ccd_devices
+            or create_ccd_devices(
+                meter_wheel_dll_path=lambda: machine_settings_store.load().meter_wheel.dll_path
+            ),
+            machine_settings_store,
+            parent=self,
+        )
 
         self._build_ui()
         self._connect_signals()
@@ -222,6 +281,13 @@ class MainWindow(QMainWindow, LogMixin):
         self._refresh_image_chip()
         self._update_run_ready()
         self.statusBar().showMessage("就緒")
+        if self.ccd_controller.load_error:
+            self._notice(self.ccd_controller.load_error, "warning")
+        QTimer.singleShot(
+            METER_WHEEL_AUTO_CONNECT_DELAY_MS,
+            self.ccd_controller,
+            self.ccd_controller.auto_connect_meter_wheel,
+        )
 
     @property
     def _preview_thread(self):
@@ -336,6 +402,7 @@ class MainWindow(QMainWindow, LogMixin):
         self.designer_screen = DesignerScreen()
         self.results_screen = ResultsScreen()
         self.batch_dashboard_screen = BatchDashboardScreen()
+        self.ccd_screen = CcdScreen()
 
         self.stack = QStackedWidget()
         self.stack.addWidget(self.run_screen)
@@ -343,6 +410,7 @@ class MainWindow(QMainWindow, LogMixin):
         self.stack.addWidget(self.designer_screen)
         self.stack.addWidget(self.results_screen)
         self.stack.addWidget(self.batch_dashboard_screen)
+        self.stack.addWidget(self.ccd_screen)
 
         content_wrap = QWidget()
         content_layout = QVBoxLayout(content_wrap)
@@ -406,7 +474,7 @@ class MainWindow(QMainWindow, LogMixin):
         machine_id_edit.setReadOnly(True)
         machine_form.addRow("Machine ID", machine_id_edit)
 
-        pipeline_version_edit = QLineEdit("1.5.1")
+        pipeline_version_edit = QLineEdit("1.7.8")
         pipeline_version_edit.setProperty("mono", "true")
         pipeline_version_edit.setReadOnly(True)
         machine_form.addRow("Pipeline 版本", pipeline_version_edit)
@@ -424,6 +492,8 @@ class MainWindow(QMainWindow, LogMixin):
         self.topbar.mode_changed.connect(self._on_mode_changed)
 
         self.run_screen.start_requested.connect(self._run_inspection)
+        self.run_screen.warmup_requested.connect(self._run_gpu_warmup)
+        self.run_screen.compare_requested.connect(self._run_backend_comparison)
         self.run_screen.open_recipe_requested.connect(self._choose_recipe)
         self.run_screen.view_results_requested.connect(lambda: self._set_screen("results"))
         self.run_screen.image_viewer.defect_clicked.connect(self._on_defect_selected)
@@ -432,6 +502,7 @@ class MainWindow(QMainWindow, LogMixin):
         self.run_screen.start_batch_requested.connect(self._run_batch_inspection)
         self.monitor_screen.choose_folder_requested.connect(self._choose_monitor_folder)
         self.monitor_screen.choose_move_folder_requested.connect(self._choose_monitor_move_folder)
+        self.monitor_screen.source_changed.connect(self._on_monitor_source_changed)
         self.monitor_screen.open_original_requested.connect(self._open_monitor_original_image)
         self.monitor_screen.start_requested.connect(self._start_monitoring)
         self.monitor_screen.stop_requested.connect(self._stop_monitoring)
@@ -447,6 +518,30 @@ class MainWindow(QMainWindow, LogMixin):
         self.results_screen.view_requested.connect(self._on_view_defect)
         self.results_screen.go_to_run_requested.connect(lambda: self._set_screen("run"))
         self.batch_dashboard_screen.go_to_run_requested.connect(lambda: self._set_screen("run"))
+
+        self.ccd_controller.notice.connect(self._notice)
+        self.ccd_controller.status_message.connect(lambda message: self.statusBar().showMessage(message, 8000))
+        self.ccd_controller.product_settings_applied.connect(self._on_ccd_product_settings_applied)
+        self.ccd_controller.camera_status_changed.connect(self._on_ccd_camera_status_changed)
+        self.ccd_controller.camera_settings_changed.connect(
+            lambda _view: self._on_ccd_camera_status_changed(self.ccd_controller.camera_status())
+        )
+        self.ccd_controller.attach(self.ccd_screen)
+        self.ccd_controller.meter_wheel_dll_requested.connect(self._choose_meter_wheel_dll)
+        self._on_ccd_camera_status_changed(self.ccd_controller.camera_status())
+
+    def _choose_meter_wheel_dll(self) -> None:
+        """Point the meter wheel at this machine's `LSI8181_64.dll` and remember it."""
+
+        current = str(self.ccd_controller.machine_settings.meter_wheel.dll_path or "")
+        start_dir = str(Path(current).parent) if current else str(Path.cwd())
+        path, _selected = QFileDialog.getOpenFileName(
+            self, "選擇 LSI8181_64.dll", start_dir, "LSI-8181 DLL (LSI8181*.dll);;所有 DLL (*.dll)"
+        )
+        if not path:
+            return
+        self.ccd_controller.set_meter_wheel_dll_path(path)
+        self._on_ccd_camera_status_changed(self.ccd_controller.camera_status())
 
     # ------------------------------------------------------------------
     # screen / mode switching
@@ -495,6 +590,8 @@ class MainWindow(QMainWindow, LogMixin):
         self.rail.set_settings_visible(self.mode != "op")
         self.run_screen.set_mode(self.mode)
         self.designer_screen.set_mode(self.mode)
+        self.ccd_screen.set_mode(self.mode)
+        self._update_monitor_source_selectable()
         self._update_mode_status_label()
         if self.stack.currentIndex() != SCREEN_INDEX["monitor"] and "monitor" in visible_screens and self.mode == "op":
             self._set_screen("monitor")
@@ -529,6 +626,10 @@ class MainWindow(QMainWindow, LogMixin):
         self.run_screen.set_batch_folder(str(self.batch_dir) if self.batch_dir else None)
         self.monitor_screen.set_folder(str(self.monitor_dir) if self.monitor_dir else None)
         self.monitor_screen.set_move_folder(str(self.monitor_move_dir) if self.monitor_move_dir else None)
+        monitor_source = str(self.preferences.value("monitor/source", MONITOR_SOURCE_FOLDER) or "")
+        self.monitor_source = monitor_source if monitor_source in MONITOR_SOURCES else MONITOR_SOURCE_FOLDER
+        self.monitor_screen.set_source(self.monitor_source)
+        self._update_monitor_ready()
 
         recipe_path = self.preferences.existing_path("paths/recipe")
         if recipe_path is not None:
@@ -553,6 +654,7 @@ class MainWindow(QMainWindow, LogMixin):
         self.preferences.set_value("paths/batch", str(self.batch_dir or ""))
         self.preferences.set_value("paths/monitor", str(self.monitor_dir or ""))
         self.preferences.set_value("paths/monitor_move", str(self.monitor_move_dir or ""))
+        self.preferences.set_value("monitor/source", self.monitor_source)
         self.preferences.set_value(
             "paths/yolox_model_directory", str(self.yolox_model_directory or "")
         )
@@ -567,6 +669,7 @@ class MainWindow(QMainWindow, LogMixin):
         self.preferences.set_value("paths/yolox_model_directory", resolved)
         self.preferences.settings.sync()
         self._inspection_gpu_sessions.invalidate()
+        self._auto_warmup_key = None
 
     def _confirm_discard_designer_changes(self) -> bool:
         if not self.designer_screen.is_dirty():
@@ -661,6 +764,7 @@ class MainWindow(QMainWindow, LogMixin):
             output_dir=Path(self.output_dir or "outputs"),
             output_overrides=dict(self.output_opts),
             recursive=self.run_screen.batch_recursive(),
+            gpu_session_cache=self._inspection_gpu_sessions,
         )
         self._batch_controller.start(
             worker,
@@ -735,11 +839,69 @@ class MainWindow(QMainWindow, LogMixin):
         self.monitor_screen.set_move_folder(str(self.monitor_move_dir))
 
     def _update_monitor_ready(self) -> None:
-        ready = self.monitor_dir is not None and self.recipe_path is not None and not self.monitor_running
+        if self.monitor_source == MONITOR_SOURCE_CAMERA:
+            blocker = self.ccd_controller.camera_monitor_blocker()
+            ready = self.recipe_path is not None and not blocker and not self.monitor_running
+            if not self.monitor_running:
+                idle_message = blocker or ("請先載入 Recipe。" if self.recipe_path is None else CAMERA_MONITOR_READY_MESSAGE)
+                self.monitor_screen.set_progress(0, idle_message)
+        else:
+            ready = self.monitor_dir is not None and self.recipe_path is not None and not self.monitor_running
         self.monitor_screen.set_ready(ready, self.monitor_running)
+        self._update_monitor_source_selectable()
+
+    def _update_monitor_source_selectable(self) -> None:
+        self.monitor_screen.set_source_selectable(self.mode != "op" and not self.monitor_running)
+
+    def _on_monitor_source_changed(self, source: str) -> None:
+        if self.monitor_running or source not in MONITOR_SOURCES:
+            self.monitor_screen.set_source(self.monitor_source)
+            return
+        self.monitor_source = source
+        self.monitor_screen.set_source(source)
+        if source == MONITOR_SOURCE_FOLDER:
+            self.monitor_screen.set_progress(0, "監控已就緒" if self.monitor_dir else "等待選擇資料夾與 Recipe")
+        self._update_monitor_ready()
+
+    def _on_ccd_camera_status_changed(self, status: CameraStatus) -> None:
+        camera_availability = self.ccd_controller.devices.camera.availability()
+        # Sapera version／API facts come from the same cached availability probe; the mismatch
+        # notice is emitted at most once per session (see CcdController._notice_version_mismatch_once).
+        self.ccd_controller.refresh_sapera_versions()
+        if not camera_availability.available:
+            text = "相機：不可用（請至 CCD 控制查看原因）"
+        else:
+            trigger = self.ccd_controller.hardware_trigger() or self.ccd_controller.product_settings.trigger
+            parts = [f"相機：{CAMERA_STATE_LABELS[status.state]}"]
+            if status.camera_name:
+                parts.append(status.camera_name)
+            parts.append(f"觸發：{TRIGGER_MODE_LABELS[trigger.mode]}")
+            text = " · ".join(parts)
+        self.monitor_screen.set_camera_status_text(text)
+        if self.monitor_source == MONITOR_SOURCE_CAMERA:
+            self._update_monitor_ready()
+
+    def _on_ccd_product_settings_applied(self, settings: CameraRecipeSettings) -> None:
+        if self.ccd_controller.pending_hardware_write():
+            write_text = "需斷線重連才會寫入相機。"
+        else:
+            write_text = "下次連線時寫入相機。"
+        if self.recipe is None:
+            self._notice(f"未載入 Recipe，相機參數只用於本次執行；{write_text}", "warning")
+            return
+        if self.designer_screen.apply_camera_settings(settings):
+            self._notice(f"相機參數已同步到 Recipe 設計（未儲存），請至 Recipe 設計儲存；{write_text}", "info")
+        else:
+            self._notice(f"相機參數與 Recipe 設計內容相同；{write_text}", "success")
 
     def _start_monitoring(self) -> None:
-        if not self.monitor_dir:
+        camera_source = self.monitor_source == MONITOR_SOURCE_CAMERA
+        if camera_source:
+            blocker = self.ccd_controller.camera_monitor_blocker()
+            if blocker:
+                self._notice(blocker, "warning")
+                return
+        elif not self.monitor_dir:
             self._notice("請先選擇監控資料夾。", "warning")
             return
         if not self.recipe_path:
@@ -760,13 +922,30 @@ class MainWindow(QMainWindow, LogMixin):
         self.topbar.set_running(True, 0)
         self.statusBar().showMessage("監控模式中")
 
-        worker = FolderMonitorWorker(
-            input_dir=self.monitor_dir,
-            recipe_path=self.recipe_path,
-            output_dir=Path(self.output_dir or "outputs"),
-            output_overrides=dict(self.output_opts),
-            processed_move_dir=self.monitor_move_dir,
-        )
+        if camera_source:
+            frame_queue = CameraFrameQueue()
+            # Every inspected frame is saved to the monitor folder while it is inspected, from the same
+            # in-memory frame, so the original is kept without a write-then-read round trip.
+            self.ccd_controller.attach_inspection_queue(frame_queue, monitor_saves_raw=True)
+            worker = CameraMonitorWorker(
+                frame_queue=frame_queue,
+                recipe_path=self.recipe_path,
+                output_dir=Path(self.output_dir or "outputs"),
+                output_overrides=dict(self.output_opts),
+                warmup_image_path=self.image_path,
+                gpu_session_cache=self._inspection_gpu_sessions,
+                raw_frame_saver=self.ccd_controller.raw_frame_saver(),
+            )
+        else:
+            worker = FolderMonitorWorker(
+                input_dir=self.monitor_dir,
+                recipe_path=self.recipe_path,
+                output_dir=Path(self.output_dir or "outputs"),
+                output_overrides=dict(self.output_opts),
+                processed_move_dir=self.monitor_move_dir,
+                warmup_image_path=self.image_path,
+                gpu_session_cache=self._inspection_gpu_sessions,
+            )
         self._monitor_controller.start(
             worker,
             signal_handlers=(
@@ -780,6 +959,8 @@ class MainWindow(QMainWindow, LogMixin):
         )
 
     def _stop_monitoring(self) -> None:
+        # New camera frames stop at once; frames already queued are still inspected by the worker.
+        self.ccd_controller.detach_inspection_queue()
         self._monitor_controller.stop()
         self.monitor_screen.set_progress(0, "正在停止監控")
         self.statusBar().showMessage("停止監控中")
@@ -800,7 +981,16 @@ class MainWindow(QMainWindow, LogMixin):
         self.statusBar().showMessage(f"監控完成：{item.get('image_name', '')} → {final}")
 
     def _open_monitor_original_image(self, item: dict) -> None:
-        image_path = Path(str(item.get("image_path") or item.get("moved_image_path") or item.get("source_image_path") or ""))
+        if item.get("source") == "camera":
+            if not item.get("raw_image_path"):
+                message = str(item.get("raw_image_error") or CAMERA_MONITOR_NO_ORIGINAL_MESSAGE)
+                self._notice(message, "info")
+                return
+            image_path = Path(str(item["raw_image_path"]))
+        else:
+            image_path = Path(
+                str(item.get("image_path") or item.get("moved_image_path") or item.get("source_image_path") or "")
+            )
         if not image_path.exists():
             self._notice(f"找不到原圖：{image_path}", "warning")
             return
@@ -809,14 +999,17 @@ class MainWindow(QMainWindow, LogMixin):
     def _on_monitor_finished(self, result: dict) -> None:
         self.monitor_result = result
         processed = result.get("processed", 0)
-        self.monitor_screen.set_progress(0, f"監控已停止，共處理 {processed} 張")
-        self._notice(f"監控模式已停止，共處理 {processed} 張。", "success")
+        dropped = int(result.get("dropped", 0) or 0)
+        dropped_text = f"，另有 {dropped} 張因檢測佇列已滿未檢測" if dropped else ""
+        self.monitor_screen.set_progress(0, f"監控已停止，共處理 {processed} 張{dropped_text}")
+        self._notice(f"監控模式已停止，共處理 {processed} 張{dropped_text}。", "warning" if dropped else "success")
 
     def _on_monitor_failed(self, message: str) -> None:
         self.monitor_screen.set_progress(0, "監控模式失敗")
         self._notice(f"監控模式失敗：{message}", "error")
 
     def _on_monitor_thread_finished(self) -> None:
+        self.ccd_controller.detach_inspection_queue()
         self.monitor_running = False
         self._monitor_controller.clear()
         self.topbar.set_running(False, 0)
@@ -863,8 +1056,10 @@ class MainWindow(QMainWindow, LogMixin):
             on_thread_finished=self._on_preview_thread_finished,
         )
 
-    def _on_preview_loaded(self, path: Path, image, backend_status: dict) -> None:
-        viewer_performance = self.run_screen.image_viewer.set_qimage(image, name=Path(path).name)
+    def _on_preview_loaded(self, path: Path, preview, backend_status: dict) -> None:
+        viewer_performance = self.run_screen.image_viewer.set_qimage(preview, name=Path(path).name)
+        # Results thumbnails crop defects from the full-resolution image, not the display pyramid.
+        image = preview.image if isinstance(preview, PreviewImage) else preview
         display_performance = backend_status.setdefault("display_performance", {})
         display_performance["viewer"] = viewer_performance
         if self._preview_started_at is not None:
@@ -888,6 +1083,10 @@ class MainWindow(QMainWindow, LogMixin):
             if self._restored_viewer_zoom > 0:
                 self.run_screen.image_viewer.set_zoom_scale(self._restored_viewer_zoom)
                 self._restored_viewer_zoom = 0.0
+        elif self.image_path is not None and Path(path) == self.image_path:
+            # A Recipe reload re-decoded the current file; share the viewer's copy instead of
+            # keeping a second full-resolution image alive.
+            self._current_image = image
         self.statusBar().showMessage(f"影像已載入：{path}")
         self._update_run_ready()
 
@@ -899,6 +1098,8 @@ class MainWindow(QMainWindow, LogMixin):
         self._preview_started_at = None
         self._preview_controller.clear()
         self._refresh_image_chip()
+        # A Recipe load also reloads the preview, so this covers both "image then Recipe" orders.
+        self._maybe_auto_gpu_warmup()
 
     def _refresh_image_chip(self) -> None:
         if self.image_path:
@@ -930,6 +1131,7 @@ class MainWindow(QMainWindow, LogMixin):
         self.topbar.recipe_chip.set_value(path.name)
         self.run_screen.recipe_info_panel.set_recipe(recipe)
         self.designer_screen.set_recipe(recipe)
+        self.ccd_controller.set_recipe_camera_settings(camera_settings_from_recipe(recipe), path.name)
         self.topbar.set_backend_status({"requested": False, "active": False})
         if self.image_path is not None and not (self._preview_thread and self._preview_thread.isRunning()):
             self._start_preview_load(self.image_path, update_current_image=False)
@@ -955,6 +1157,8 @@ class MainWindow(QMainWindow, LogMixin):
         has_recipe = self.recipe_path is not None
         ready = has_image and has_recipe
         self.run_screen.run_control_panel.set_ready(ready, has_image, has_recipe, False)
+        self.run_screen.run_control_panel.set_warmup_state(has_recipe, self.auto_warming_up, self.auto_warming_up)
+        self.run_screen.run_control_panel.set_compare_state(ready, False, False)
         self.run_screen.op_panel.set_state(ready, False, 0, "", self.result)
         self._update_batch_ready()
 
@@ -964,6 +1168,9 @@ class MainWindow(QMainWindow, LogMixin):
             return
         if not self.recipe_path:
             self._notice("請先載入 Recipe。", "warning")
+            return
+        if self.warming_up:
+            self._notice("GPU 預熱中，請稍候。")
             return
         if self._inspection_thread and self._inspection_thread.isRunning():
             self._notice("檢測執行中，請稍候。")
@@ -1044,6 +1251,8 @@ class MainWindow(QMainWindow, LogMixin):
         self.run_screen.op_panel.set_history(self.history)
 
         self.statusBar().showMessage(f"檢測完成：{final}{backend_text}")
+        if backend_status.get("vram_low"):
+            self._notice(f"效能提醒：{VRAM_LOW_NOTICE}", "warning")
 
     def _on_inspection_failed(self, message: str) -> None:
         self._notice(f"檢測失敗：{message}", "error")
@@ -1063,6 +1272,234 @@ class MainWindow(QMainWindow, LogMixin):
         has_recipe = self.recipe_path is not None
         ready = has_image and has_recipe and not running
         self.run_screen.run_control_panel.set_ready(ready, has_image, has_recipe, running)
+        self.run_screen.run_control_panel.set_warmup_state(
+            has_recipe, running or self.auto_warming_up, self.auto_warming_up
+        )
+        self.run_screen.run_control_panel.set_compare_state(has_image and has_recipe, running, False)
+
+    # ------------------------------------------------------------------
+    # GPU warm-up
+    # ------------------------------------------------------------------
+    # ------------------------------------------------------------------
+    # CPU/GPU comparison (Engineer/Admin; the run control panel is hidden in OP mode)
+    # ------------------------------------------------------------------
+    def _run_backend_comparison(self) -> None:
+        if self.mode == "op":
+            return
+        if not self.image_path or not self.recipe_path:
+            self._notice("請先載入影像與 Recipe。", "warning")
+            return
+        if self.running or self.batch_running or self.monitor_running or self._comparison_controller.is_running:
+            self._notice("請先等待目前檢測、預熱或對照完成。", "warning")
+            return
+        self._set_comparison_running(True)
+        self.statusBar().showMessage("CPU／GPU 對照中")
+        worker = BackendComparisonWorker(
+            image_path=self.image_path,
+            recipe_path=self.recipe_path,
+            output_dir=Path(self.output_dir or "outputs"),
+            gpu_session_cache=self._inspection_gpu_sessions,
+        )
+        self._comparison_controller.start(
+            worker,
+            signal_handlers=(
+                (worker.progress, self._on_backend_comparison_progress),
+                (worker.finished, self._on_backend_comparison_finished),
+                (worker.failed, self._on_backend_comparison_failed),
+            ),
+            terminal_signals=(worker.finished, worker.failed),
+            on_thread_finished=self._on_backend_comparison_thread_finished,
+        )
+
+    def _set_comparison_running(self, comparing: bool) -> None:
+        # The comparison runs two full inspections on the shared session; block other single-image work.
+        self.comparing_backends = comparing
+        self.running = comparing
+        self.topbar.set_running(comparing, 0)
+        has_image = self.image_path is not None
+        has_recipe = self.recipe_path is not None
+        panel = self.run_screen.run_control_panel
+        panel.set_ready(has_image and has_recipe and not comparing, has_image, has_recipe, False)
+        panel.set_warmup_state(has_recipe, comparing, False)
+        panel.set_compare_state(has_image and has_recipe, comparing, comparing)
+
+    def _on_backend_comparison_progress(self, percent: int, message: str) -> None:
+        percent = max(0, min(100, int(percent)))
+        self.topbar.set_running(True, percent)
+        self.run_screen.run_control_panel.set_progress(True, self.result is not None, percent, message)
+
+    def _on_backend_comparison_finished(self, summary: dict) -> None:
+        headline, level = comparison_headline(summary)
+        self._notice(headline, level)
+        dialog = BackendComparisonDialog(summary, self)
+        self._comparison_dialog = dialog
+        dialog.show()
+
+    def _on_backend_comparison_failed(self, message: str) -> None:
+        self._notice(f"CPU／GPU 對照失敗：{message}", "error")
+
+    def _on_backend_comparison_thread_finished(self) -> None:
+        self._comparison_controller.clear()
+        self._set_comparison_running(False)
+        self.run_screen.run_control_panel.set_progress(False, self.result is not None, 0, "")
+        self._update_run_ready()
+
+    def _run_gpu_warmup(self) -> None:
+        if not self.recipe_path:
+            self._notice("請先載入 Recipe。", "warning")
+            return
+        if self.auto_warming_up:
+            self._notice("GPU 背景預熱中，完成後即可直接檢測。")
+            return
+        if self.running or self._warmup_controller.is_running:
+            self._notice("請先等待目前檢測或預熱完成。", "warning")
+            return
+        self._set_warmup_running(True)
+        self.statusBar().showMessage("GPU 預熱中...")
+        worker = GpuWarmupWorker(
+            recipe_path=self.recipe_path,
+            gpu_session_cache=self._inspection_gpu_sessions,
+            image_path=self.image_path,
+        )
+        self._warmup_controller.start(
+            worker,
+            signal_handlers=(
+                (worker.progress, self._on_gpu_warmup_progress),
+                (worker.finished, self._on_gpu_warmup_finished),
+                (worker.failed, self._on_gpu_warmup_failed),
+            ),
+            terminal_signals=(worker.finished, worker.failed),
+            on_thread_finished=self._on_gpu_warmup_thread_finished,
+        )
+
+    def _auto_gpu_warmup_key(self) -> tuple | None:
+        """Session identity plus image size, or ``None`` when an automatic warm-up does not apply."""
+        if not self.recipe or not self.recipe_path or not self.image_path:
+            return None
+        try:
+            if not GpuExecutionSession.cuda_requested(self.recipe):
+                return None
+            identity = GpuExecutionSession.identity(self.recipe, self._inspection_gpu_sessions.workload)
+        except Exception:  # an unusable GPU section is reported by the inspection itself
+            self.logger.debug("Automatic GPU warm-up skipped: GPU identity unavailable", exc_info=True)
+            return None
+        image = self._current_image
+        size = (int(image.width()), int(image.height())) if hasattr(image, "width") else (str(self.image_path),)
+        return (identity, size)
+
+    def _maybe_auto_gpu_warmup(self) -> None:
+        """Warm the shared session in the background once per GPU identity and image size.
+
+        Operators never see the warm-up button, so the first inspection after loading a CUDA recipe
+        would otherwise pay the CUDA context, device buffer and pinned host buffer setup.
+        """
+        key = self._auto_gpu_warmup_key()
+        if key is None or key == self._auto_warmup_key:
+            return
+        if (
+            self.running
+            or self.batch_running
+            or self.monitor_running
+            or self._warmup_controller.is_running
+            or (self._preview_thread and self._preview_thread.isRunning())
+        ):
+            return
+        self._auto_warmup_key = key
+        self.auto_warming_up = True
+        self._update_run_ready()
+        self.statusBar().showMessage("GPU 背景預熱中（可直接開始檢測）")
+        worker = GpuWarmupWorker(
+            recipe_path=self.recipe_path,
+            gpu_session_cache=self._inspection_gpu_sessions,
+            image_path=self.image_path,
+        )
+        self._warmup_controller.start(
+            worker,
+            signal_handlers=(
+                (worker.finished, self._on_auto_gpu_warmup_finished),
+                (worker.failed, self._on_auto_gpu_warmup_failed),
+            ),
+            terminal_signals=(worker.finished, worker.failed),
+            on_thread_finished=self._on_auto_gpu_warmup_thread_finished,
+        )
+
+    def _on_auto_gpu_warmup_finished(self, summary: dict) -> None:
+        status = summary.get("status", "")
+        reason = str(summary.get("reason", "") or "")
+        if status == "warmed":
+            self.statusBar().showMessage(f"GPU 背景預熱完成（{summary.get('pipeline_ms', 0):.0f} ms）")
+        elif status == "fallback":
+            self._notice(f"GPU 背景預熱時 Detector 改用 CPU fallback：{reason}", "warning")
+        elif status == "unavailable":
+            self._notice(f"GPU 背景預熱略過：CUDA 不可用（{reason}）", "warning")
+        else:
+            self.statusBar().showMessage("GPU 背景預熱結束")
+
+    def _on_auto_gpu_warmup_failed(self, message: str) -> None:
+        self._notice(f"GPU 背景預熱失敗，檢測時會再嘗試：{message}", "warning")
+
+    def _on_auto_gpu_warmup_thread_finished(self) -> None:
+        self._warmup_controller.clear()
+        self.auto_warming_up = False
+        if not self.running:
+            self._update_run_ready()
+        # The Recipe or image may have changed while this warm-up ran.
+        self._maybe_auto_gpu_warmup()
+
+    def _set_warmup_running(self, warming: bool) -> None:
+        # Warm-up owns the shared single-image GPU session, so `running` also blocks the image,
+        # Recipe and inspection actions that would replace or close that session mid-run.
+        self.warming_up = warming
+        self.running = warming
+        self.topbar.set_running(warming, 0)
+        has_image = self.image_path is not None
+        has_recipe = self.recipe_path is not None
+        panel = self.run_screen.run_control_panel
+        panel.set_ready(has_image and has_recipe and not warming, has_image, has_recipe, False)
+        panel.set_warmup_state(has_recipe, warming, warming)
+        panel.set_compare_state(has_image and has_recipe, warming, False)
+        self.run_screen.op_panel.set_state(has_image and has_recipe and not warming, False, 0, "", self.result)
+
+    def _on_gpu_warmup_progress(self, percent: int, message: str) -> None:
+        percent = max(0, min(100, int(percent)))
+        self.topbar.set_running(True, percent)
+        self.run_screen.run_control_panel.set_progress(True, self.result is not None, percent, message)
+        self.statusBar().showMessage("GPU 預熱中")
+
+    def _on_gpu_warmup_finished(self, summary: dict) -> None:
+        # A manual warm-up of the current Recipe and image also satisfies the automatic one.
+        self._auto_warmup_key = self._auto_gpu_warmup_key()
+        status = summary.get("status", "")
+        reason = str(summary.get("reason", "") or "")
+        reserved_mb = int(summary.get("reserved_bytes", 0) or 0) / (1024 * 1024)
+        if status == "warmed":
+            device = summary.get("device_name") or "CUDA"
+            self._notice(
+                f"GPU 預熱完成（{device}）：CUDA context 已建立，並以目前影像試跑一次"
+                f"（{summary.get('pipeline_ms', 0):.0f} ms，未輸出檔案），已配置 {reserved_mb:.0f} MB 裝置記憶體。",
+                "success",
+            )
+        elif status == "context_only":
+            self._notice(
+                f"已建立 CUDA context（{summary.get('session_ms', 0):.0f} ms）。載入影像後再預熱，"
+                "可一併依影像尺寸配置裝置記憶體。",
+                "info",
+            )
+        elif status == "fallback":
+            self._notice(f"GPU 預熱時 Detector 改用 CPU fallback：{reason}", "warning")
+        elif status == "unavailable":
+            self._notice(f"無法預熱：CUDA 不可用（{reason}）", "warning")
+        else:
+            self._notice(reason or "此 Recipe 未啟用 CUDA，不需要預熱。", "info")
+
+    def _on_gpu_warmup_failed(self, message: str) -> None:
+        self._notice(f"GPU 預熱失敗：{message}", "error")
+
+    def _on_gpu_warmup_thread_finished(self) -> None:
+        self._warmup_controller.clear()
+        self._set_warmup_running(False)
+        self.run_screen.run_control_panel.set_progress(False, self.result is not None, 0, "")
+        self._update_run_ready()
 
     # ------------------------------------------------------------------
     # tile preview (Recipe designer)
@@ -1119,6 +1556,14 @@ class MainWindow(QMainWindow, LogMixin):
             QMessageBox.information(self, "背景作業", "檢測仍在執行中，請等待完成後再關閉。")
             event.ignore()
             return
+        if self._warmup_controller.is_running:
+            QMessageBox.information(self, "背景作業", "GPU 預熱仍在執行中，請等待完成後再關閉。")
+            event.ignore()
+            return
+        if self._comparison_controller.is_running:
+            QMessageBox.information(self, "背景作業", "CPU／GPU 對照仍在執行中，請等待完成後再關閉。")
+            event.ignore()
+            return
         if self._preview_thread and self._preview_thread.isRunning():
             QMessageBox.information(self, "背景作業", "影像仍在載入中，請等待完成後再關閉。")
             event.ignore()
@@ -1135,9 +1580,14 @@ class MainWindow(QMainWindow, LogMixin):
             QMessageBox.information(self, "關閉視窗", "監控模式仍在執行中，請先停止監控。")
             event.ignore()
             return
+        if self.ccd_controller.has_pending_saves():
+            QMessageBox.information(self, "背景作業", "CCD 影像仍在儲存中，請等待完成後再關閉。")
+            event.ignore()
+            return
         if not self._confirm_discard_designer_changes():
             event.ignore()
             return
+        self.ccd_controller.close()
         self._inspection_gpu_sessions.close()
         self._save_preferences()
         super().closeEvent(event)

@@ -56,6 +56,8 @@ OPTIONAL_EXPORT_GROUPS = {
         "vf_plan_execute_roi",
         "vf_dag_plan_execute_roi",
     },
+    "file_order_upload": {"vf_context_upload_u8_file_order"},
+    "host_register": {"vf_host_register_u8", "vf_host_unregister_u8"},
     "roi_batch": {
         "vf_gpu_memory_info",
         "vf_roi_batch_create",
@@ -64,6 +66,7 @@ OPTIONAL_EXPORT_GROUPS = {
         "vf_roi_batch_destroy",
     },
     "timings": {"vf_context_last_timings"},
+    "context_memory_stats": {"vf_context_memory_stats_v1"},
 }
 OPTIONAL_GENERIC_PLAN_EXPORTS = OPTIONAL_EXPORT_GROUPS["generic_plan"]
 OPTIONAL_RESIDENT_ROI_EXPORTS = OPTIONAL_EXPORT_GROUPS["resident_roi"]

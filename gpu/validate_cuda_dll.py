@@ -71,6 +71,14 @@ def parse_args() -> argparse.Namespace:
         "--morphology-profile", action="store_true",
         help="Profile detector-401-style morphology iterations and native CUDA event share.",
     )
+    parser.add_argument(
+        "--roi-batch-matrix", action="store_true",
+        help="Validate 8/16/32/64 ROI batches of production-sized ROIs on a 16384x13000 resident image.",
+    )
+    parser.add_argument(
+        "--resize-area-pipeline", action="store_true",
+        help="Compare full CPU/GPU pipelines of the 401-CS-AP-1 production recipe across process_scale values.",
+    )
     parser.add_argument("--json-output", help="Write validation, benchmark, device and commit metadata as JSON.")
     args = parser.parse_args()
     if bool(args.image) != bool(args.recipe):
@@ -102,6 +110,59 @@ def compare(name: str, actual: np.ndarray, expected: np.ndarray, max_diff: int =
         "out_of_tolerance_ratio": round(out_of_tolerance_ratio, 6),
     }
     print(f"PASS {name}: {result}")
+    return result
+
+
+def area_resize_cases(seed: int = 20260914, random_cases: int = 160) -> list[tuple[tuple[int, int], tuple[int, int]]]:
+    """Source/target (height, width) pairs covering every OpenCV INTER_AREA branch."""
+    rng = np.random.default_rng(seed)
+    cases = [
+        ((3, 7), (1, 2)), ((17, 19), (16, 18)), ((31, 47), (10, 15)), ((64, 96), (21, 32)),
+        ((101, 173), (100, 172)), ((64, 96), (64, 96)),          # copy
+        ((64, 96), (32, 48)), ((65, 97), (32, 48)),              # 2x2 fast / non-integer
+        ((60, 90), (20, 30)), ((64, 64), (16, 32)),              # integer fast area
+        ((50, 70), (50, 35)), ((70, 50), (35, 50)),              # one axis unchanged
+        ((1, 500), (1, 7)), ((500, 1), (7, 1)), ((401, 301), (7, 3)),
+        ((2160, 3840), (1080, 1920)), ((2160, 3840), (1000, 1777)), ((4096, 4096), (1, 1)),
+        ((13000, 2300), (4333, 767)),
+    ]
+    for _ in range(random_cases):
+        height, width = (int(value) for value in rng.integers(1, 1500, size=2))
+        cases.append(((height, width), (int(rng.integers(1, height + 1)), int(rng.integers(1, width + 1)))))
+    return cases
+
+
+def validate_area_resize_matrix(runtime: GpuRuntime) -> dict:
+    """CUDA Resize(area) must be pixel-identical to cv2.INTER_AREA (no tolerance)."""
+    rng = np.random.default_rng(20260915)
+    compared = 0
+    pixels = 0
+    for index, ((source_height, source_width), (target_height, target_width)) in enumerate(area_resize_cases()):
+        pattern = index % 3
+        if pattern == 0:
+            source = rng.integers(0, 256, (source_height, source_width), dtype=np.uint8)
+        elif pattern == 1:
+            source = ((rng.random((source_height, source_width)) > 0.5) * 255).astype(np.uint8)
+        else:
+            source = rng.integers(0, 256, (source_height * 2, source_width + 3), dtype=np.uint8)[::2, 3:]
+        expected = cv2.resize(source, (target_width, target_height), interpolation=cv2.INTER_AREA)
+        label = f"resize_area_{source_height}x{source_width}_to_{target_height}x{target_width}"
+        contiguous = np.ascontiguousarray(source)
+        outputs = {"stateless": runtime.resize_gray(contiguous, target_width, target_height)}
+        if runtime.supports_native_plan:
+            plan = PreprocessPlan((Resize(target_width, target_height, "area"),), name=label)
+            outputs["native"] = runtime.execute_plan(contiguous, plan)
+        for route, actual in outputs.items():
+            if actual.shape != expected.shape or not np.array_equal(actual, expected):
+                delta = np.abs(actual.astype(np.int16) - expected.astype(np.int16))
+                raise AssertionError(
+                    f"{route}_{label}: INTER_AREA mismatch max_diff={int(delta.max(initial=0))} "
+                    f"pixels={int(np.count_nonzero(delta))}"
+                )
+            compared += 1
+        pixels += int(expected.size)
+    result = {"name": "resize_area_matrix", "outputs": compared, "target_pixels": pixels, "max_diff": 0}
+    print(f"PASS resize_area_matrix: {result}")
     return result
 
 
@@ -148,6 +209,12 @@ def validate_context_reuse_matrix(runtime: GpuRuntime) -> list[dict]:
             "Persistent context allocated again after shape/channel/parameter matrix warm-up: "
             f"warmed={warmed}, reused={reused}"
         )
+    if reused.get("accounting") == "detailed_v1":
+        breakdown = reused.get("breakdown", {})
+        if sum(int(value) for value in breakdown.values()) != reused.get("reserved_bytes"):
+            raise AssertionError(f"CUDA context memory breakdown does not sum to total: {reused}")
+        if int(reused.get("peak_reserved_bytes") or 0) < int(reused.get("reserved_bytes") or 0):
+            raise AssertionError(f"CUDA context peak memory is below current memory: {reused}")
     print(f"PASS context reuse matrix: warmed={warmed}, reused={reused}")
     return metrics
 
@@ -166,10 +233,9 @@ def validate_primitives(runtime: GpuRuntime) -> list[dict]:
             "resize_gray",
             runtime.resize_gray(gray, 96, 64),
             cv2.resize(gray, (96, 64), interpolation=cv2.INTER_AREA),
-            max_diff=1,
-            mismatch_ratio=0.001,
         )
     )
+    metrics.append(validate_area_resize_matrix(runtime))
     metrics.append(
         compare(
             "gaussian_blur_gray",
@@ -291,6 +357,48 @@ def validate_primitives(runtime: GpuRuntime) -> list[dict]:
             else cv2.erode(binary, kernel, iterations=1)
         )
         metrics.append(compare(f"morphology_{operation}", runtime.morphology(binary, operation, 3, 1), expected))
+    # The 5x5 path uses a shared-memory separable kernel. Cover partial CUDA
+    # blocks, neutral borders, BGR channels, and repeated open/close passes.
+    morphology_rng = np.random.default_rng(20260914)
+    for shape in ((1, 1), (17, 19), (65, 67), (65, 67, 3)):
+        source = morphology_rng.integers(0, 256, shape, dtype=np.uint8)
+        for operation, cv_operation, iterations in (
+            ("open", cv2.MORPH_OPEN, 10),
+            ("close", cv2.MORPH_CLOSE, 2),
+            ("erode", cv2.MORPH_ERODE, 1),
+            ("dilate", cv2.MORPH_DILATE, 1),
+        ):
+            expected = cv2.morphologyEx(
+                source, cv_operation, np.ones((5, 5), dtype=np.uint8),
+                iterations=iterations,
+            )
+            label = f"morphology_k5_{operation}_i{iterations}_{'x'.join(map(str, shape))}"
+            metrics.append(compare(label, runtime.morphology(source, operation, 5, iterations), expected))
+            if runtime.supports_native_plan:
+                plan = PreprocessPlan(
+                    (Morphology(operation, 5, iterations),), name=label,
+                )
+                metrics.append(compare(f"native_{label}", runtime.execute_plan(source, plan), expected))
+    strided_morphology = morphology_rng.integers(
+        0, 256, (67, 139, 3), dtype=np.uint8,
+    )[1:-1, 1:-1:2]
+    strided_expected = cv2.morphologyEx(
+        strided_morphology, cv2.MORPH_OPEN,
+        np.ones((5, 5), dtype=np.uint8), iterations=10,
+    )
+    metrics.append(compare(
+        "morphology_k5_strided_bgr", runtime.morphology(
+            strided_morphology, "open", 5, 10,
+        ), strided_expected,
+    ))
+    if runtime.supports_native_plan:
+        strided_plan = PreprocessPlan(
+            (Morphology("open", 5, 10),), name="native_k5_strided_bgr",
+        )
+        metrics.append(compare(
+            "native_morphology_k5_strided_bgr",
+            runtime.execute_plan(strided_morphology, strided_plan), strided_expected,
+        ))
     if runtime.supports_native_plan:
         native_plans = (
             PreprocessPlan(
@@ -344,6 +452,26 @@ def validate_primitives(runtime: GpuRuntime) -> list[dict]:
     else:
         print(f"SKIP generic native plan: {runtime.native_plan_unavailable_reason}")
     if runtime.supports_native_dag_plan:
+        morphology_dag = PreprocessDagPlan(
+            name="native_k5_bgr_morphology_dag",
+            nodes=(
+                PreprocessDagNode("morph", "root", Morphology("open", 5, 10)),
+                PreprocessDagNode("gray", "root", Gray()),
+            ),
+            outputs=("morph", "gray"),
+        )
+        morphology_source = np.random.default_rng(20260915).integers(
+            0, 256, (65, 67, 3), dtype=np.uint8,
+        )
+        morphology_expected = CpuPreprocessDagExecutor().execute(
+            morphology_source, morphology_dag,
+        )
+        morphology_actual = runtime.execute_dag_plan(morphology_source, morphology_dag)
+        for name in morphology_dag.outputs:
+            metrics.append(compare(
+                f"{morphology_dag.name}_{name}",
+                morphology_actual[name], morphology_expected[name],
+            ))
         dag_plan = PreprocessDagPlan(
             name="native_900_shared_gray",
             nodes=(
@@ -433,6 +561,68 @@ def validate_primitives(runtime: GpuRuntime) -> list[dict]:
         print("SKIP resident image/ROI routing: optional exports unavailable")
     metrics.extend(validate_context_reuse_matrix(runtime))
     return metrics
+
+
+def validate_roi_batch_matrix(runtime: GpuRuntime, repetitions: int = 5) -> dict:
+    """Production-sized ROI batches: every pixel, timing, VRAM plateau and OOM downshift."""
+    if not runtime.supports_roi_batch:
+        print(f"SKIP ROI batch matrix: {runtime.native_plan_unavailable_reason or 'ROI batch exports unavailable'}")
+        return {}
+    rng = np.random.default_rng(20260916)
+    image = rng.integers(0, 256, (13000, 16384, 3), dtype=np.uint8)
+    resident = runtime.upload_image(image)
+    report = {"image_shape": list(image.shape), "repetitions": repetitions, "cases": []}
+    for side in (256, 512, 1024):
+        coordinates = [
+            (x, y, side, side)
+            for y in range(0, 13000 - side + 1, 1200)
+            for x in range(0, 16384 - side + 1, 997)
+        ][:64]
+        recommended = runtime.recommended_roi_batch_size(side, side, 3)
+        for batch_size in (8, 16, 32, 64):
+            regions = coordinates[:batch_size]
+            memory_before = runtime.memory_info()["free_bytes"]
+            create_ms, download_ms, free_during = [], [], []
+            for repetition in range(repetitions):
+                started = time.perf_counter()
+                with runtime.create_roi_batch(resident, regions) as batch:
+                    created = time.perf_counter()
+                    free_during.append(runtime.memory_info()["free_bytes"])
+                    for index, (x, y, width, height) in enumerate(regions):
+                        roi = batch.download(index)
+                        if repetition == 0 and not np.array_equal(roi, image[y:y + height, x:x + width]):
+                            raise AssertionError(f"ROI batch {side}px x{batch_size} index {index} differs")
+                    download_ms.append((time.perf_counter() - created) * 1000.0)
+                create_ms.append((created - started) * 1000.0)
+            memory_after = runtime.memory_info()["free_bytes"]
+            case = {
+                "roi": [side, side], "batch_size": batch_size, "recommended_batch_size": recommended,
+                "batch_bytes": side * side * 3 * batch_size,
+                "create_median_ms": round(statistics.median(create_ms), 3),
+                "download_all_median_ms": round(statistics.median(download_ms), 3),
+                "device_bytes_in_use_during_batch": int(memory_before - min(free_during)),
+                "device_bytes_retained_after_close": int(memory_before - memory_after),
+            }
+            if case["device_bytes_retained_after_close"] > 64 * 1024 * 1024:
+                raise AssertionError(f"ROI batch memory did not return to its plateau: {case}")
+            report["cases"].append(case)
+            print(f"PASS roi_batch_matrix: {case}")
+    large = [(192 + index * 2800, 500, 2000, 12000) for index in range(6)] * 11  # 66 ROIs, about 4.8 GiB at once
+    batches = []
+    for batch in runtime.iter_roi_batches(resident, large, candidates=(8, 16, 32, 64)):
+        x, y, width, height = large[batch.offset + batch.count - 1]
+        if not np.array_equal(batch.download(batch.count - 1), image[y:y + height, x:x + width]):
+            raise AssertionError("large ROI batch download differs")
+        batches.append(batch.count)
+    report["large_roi_batches"] = {
+        "roi": [2000, 12000], "roi_count": len(large), "batch_counts": batches,
+        "recommended_batch_size": runtime.recommended_roi_batch_size(2000, 12000, 3),
+        "registered_batches_after": len(runtime._roi_batches),
+    }
+    if sum(batches) != len(large) or runtime._roi_batches:
+        raise AssertionError(f"large ROI batch iteration lost ROIs or handles: {report['large_roi_batches']}")
+    print(f"PASS roi_batch_large: {report['large_roi_batches']}")
+    return report
 
 
 def _timing_summary(operation, repetitions: int, warmup: int) -> dict:
@@ -913,6 +1103,56 @@ def validate_production_manifest(path: Path, dll_path: str) -> list[dict]:
     return results
 
 
+RESIZE_AREA_RECIPE = "PRODUCT_A_CIRCLE_401_1_AOI_01.yaml"
+RESIZE_AREA_SCALES = (1.0, 0.5, 0.37, 0.25)
+
+
+def synthetic_circle_image(seed: int, circles: int) -> np.ndarray:
+    """1300x1200 BGR background with optional bright circles sized for 401-CS-AP-1 filters."""
+    rng = np.random.default_rng(seed)
+    gray = cv2.GaussianBlur(rng.integers(90, 120, (1300, 1200), dtype=np.uint8), (0, 0), 3)
+    for _ in range(circles):
+        center = (int(rng.integers(160, 1040)), int(rng.integers(160, 1140)))
+        cv2.circle(gray, center, int(rng.integers(9, 17)), int(rng.integers(190, 240)), -1)
+    return cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
+
+
+def validate_resize_area_recipe_sweep(dll_path: str) -> list[dict]:
+    """Detector end-to-end CPU/GPU equivalence whose native plan exercises every Resize(area) branch."""
+    recipe_path = ROOT / "recipes" / RESIZE_AREA_RECIPE
+    base = RecipeManager().load(recipe_path)
+    results = []
+    with tempfile.TemporaryDirectory(prefix="visionflow_resize_area_") as temporary:
+        folder = Path(temporary)
+        images = {}
+        for label, circles in (("pass", 0), ("ng", 12)):
+            image_path = folder / f"{label}.png"
+            if not cv2.imwrite(str(image_path), synthetic_circle_image(20260914 + circles, circles)):
+                raise AssertionError(f"Failed to write {image_path}")
+            images[label] = image_path
+        for scale in RESIZE_AREA_SCALES:
+            recipe = deepcopy(base)
+            recipe["detectors"]["401-CS-AP-1"]["params"]["process_scale"] = scale
+            scaled_recipe = folder / f"circle_scale_{scale}.yaml"
+            scaled_recipe.write_text(yaml.safe_dump(recipe, allow_unicode=True, sort_keys=False), encoding="utf-8")
+            for label, image_path in images.items():
+                result = validate_pipeline(image_path, scaled_recipe, dll_path)
+                routes = {
+                    detector_id: status.get("fallback_reason", "")
+                    for detector_id, status in result["gpu"].get("detectors", {}).items()
+                }
+                if any(routes.values()):
+                    raise AssertionError(f"Resize(area) sweep fell back to CPU: {routes}")
+                results.append({
+                    "recipe": RESIZE_AREA_RECIPE, "process_scale": scale, "image": label,
+                    "final_result": result["final_result"], "summary": result["summary"],
+                })
+    if not any(item["final_result"] == "NG" for item in results):
+        raise AssertionError("Resize(area) sweep never produced an NG decision")
+    print(f"PASS resize_area_pipeline: {json.dumps(results, ensure_ascii=False)}")
+    return results
+
+
 def _disabled_report_output(output: dict) -> dict:
     return {
         key: False if isinstance(value, bool) else value
@@ -943,6 +1183,10 @@ def main() -> int:
     )
     if args.image and args.recipe:
         validate_pipeline(Path(args.image), Path(args.recipe), str(runtime.dll_path))
+    roi_batch_matrix = validate_roi_batch_matrix(runtime) if args.roi_batch_matrix else {}
+    resize_area_pipeline = (
+        validate_resize_area_recipe_sweep(str(runtime.dll_path)) if args.resize_area_pipeline else []
+    )
     if args.json_output:
         output_path = Path(args.json_output)
         output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -960,6 +1204,8 @@ def main() -> int:
                     "morphology_profile": morphology_result,
                     "stress": stress_result,
                     "production": production_results,
+                    "resize_area_pipeline": resize_area_pipeline,
+                    "roi_batch_matrix": roi_batch_matrix,
                     "gpu_metrics": runtime.performance_stats(),
                 },
                 ensure_ascii=False,

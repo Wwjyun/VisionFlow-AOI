@@ -11,7 +11,13 @@ import cv2
 import numpy as np
 import yaml
 
-from core.gpu_runtime import GpuResidentImage, GpuRuntime, GpuRuntimeError, _VfCudaTimingsV1
+from core.gpu_runtime import (
+    GpuResidentImage,
+    GpuRuntime,
+    GpuRuntimeError,
+    _VfCudaContextMemoryStatsV1,
+    _VfCudaTimingsV1,
+)
 from core.performance import PipelineProfiler
 from core.pipeline import AOIPipeline
 from core.preprocess_plan import (
@@ -125,6 +131,30 @@ class _FusedDll:
         return 0
 
 
+class _DetailedMemoryDll(_FusedDll):
+    def __init__(self):
+        super().__init__()
+        self.vf_context_memory_stats_v1 = _Function(self._memory_stats)
+
+    @staticmethod
+    def _memory_stats(_context, stats):
+        value = stats._obj
+        if value.struct_size != ctypes.sizeof(_VfCudaContextMemoryStatsV1) or value.version != 1:
+            return 1
+        value.reserved_bytes = 4096
+        value.peak_reserved_bytes = 8192
+        value.allocation_count = 7
+        value.plan_bytes = 1000
+        value.resident_bytes = 2000
+        value.template_match_bytes = 300
+        value.contour_bytes = 200
+        value.median_bytes = 100
+        value.gaussian_f32_bytes = 96
+        value.cnr_mask_bytes = 200
+        value.cnr_candidate_bytes = 200
+        return 0
+
+
 class _NativePlanDll(_FusedDll):
     def __init__(self):
         super().__init__()
@@ -133,6 +163,7 @@ class _NativePlanDll(_FusedDll):
         self.plan_execute_calls = 0
         self.plan_output_shapes = {}
         self.fail_next_plan_execute = False
+        self.plan_execute_failure_code = 2
         self.vf_plan_query = _Function(self._query)
         self.vf_plan_create = _Function(self._plan_create)
         self.vf_plan_execute = _Function(self._plan_execute)
@@ -165,7 +196,7 @@ class _NativePlanDll(_FusedDll):
         self.plan_execute_calls += 1
         if self.fail_next_plan_execute:
             self.fail_next_plan_execute = False
-            return 2
+            return self.plan_execute_failure_code
         handle = plan.value if hasattr(plan, "value") else int(plan)
         output_height = self.plan_output_shapes.get(handle, (int(height), 0))[0]
         ctypes.memset(dst, 0, output_height * int(dst_stride))
@@ -200,6 +231,7 @@ class _NativeDagPlanDll(_NativePlanDll):
         self.vf_dag_plan_execute = _Function(self._dag_execute)
         self.vf_dag_plan_destroy = _Function(self._dag_destroy)
         self.vf_context_upload_u8 = _Function(self._upload)
+        self.vf_context_upload_u8_file_order = _Function(self._upload)
         self.vf_plan_execute_roi = _Function(self._plan_execute_roi)
         self.vf_dag_plan_execute_roi = _Function(self._dag_execute_roi)
         self.vf_gpu_memory_info = _Function(self._memory_info)
@@ -510,6 +542,9 @@ class GpuRuntimeMetricsTests(unittest.TestCase):
         self.assertEqual(metrics["functions"]["vf_preprocess_401_2_u8"]["calls"], 1)
         self.assertEqual(metrics["persistent_context"]["reserved_bytes"], 4096)
         self.assertEqual(metrics["persistent_context"]["allocation_count"], 7)
+        self.assertEqual(metrics["persistent_context"]["accounting"], "legacy_total")
+        self.assertIsNone(metrics["persistent_context"]["peak_reserved_bytes"])
+        self.assertEqual(metrics["persistent_context"]["breakdown"], {})
         self.assertEqual(metrics["native_timings_ms"]["context_create_ms"], 1.25)
         self.assertEqual(metrics["native_timings_ms"]["kernel_ms"], 2.5)
         self.assertEqual(metrics["native_timings_ms"]["morphology_ms"], 1.5)
@@ -518,6 +553,23 @@ class GpuRuntimeMetricsTests(unittest.TestCase):
         runtime.close()
         self.assertFalse(runtime.supports_fused_401_2)
         self.assertEqual(dll.destroyed, [1234])
+
+    def test_optional_detailed_context_memory_stats_are_preferred_and_sum_to_total(self):
+        runtime = GpuRuntime(enabled=False)
+        runtime._dll = _DetailedMemoryDll()
+        runtime.device_count = 1
+        runtime._load_optional_context()
+
+        context = runtime.performance_stats()["persistent_context"]
+
+        self.assertEqual(context["accounting"], "detailed_v1")
+        self.assertEqual(context["reserved_bytes"], 4096)
+        self.assertEqual(context["peak_reserved_bytes"], 8192)
+        self.assertEqual(context["allocation_count"], 7)
+        self.assertEqual(sum(context["breakdown"].values()), context["reserved_bytes"])
+        self.assertEqual(context["breakdown"]["resident_bytes"], 2000)
+        self.assertEqual(context["breakdown"]["cnr_candidate_bytes"], 200)
+        runtime.close()
 
     def test_generic_native_plan_is_cached_and_destroyed_before_context(self):
         runtime = GpuRuntime(enabled=False)
@@ -561,6 +613,60 @@ class GpuRuntimeMetricsTests(unittest.TestCase):
         self.assertEqual(dll.plan_create_calls, 1)
         self.assertEqual(dll.plan_execute_calls, 2)
         self.assertEqual(len(runtime._native_plans), 1)
+
+    def test_sticky_cuda_error_disables_runtime_until_restart(self):
+        runtime = GpuRuntime(enabled=False)
+        dll = _NativePlanDll()
+        runtime._dll = dll
+        runtime.device_count = 1
+        runtime._load_optional_context()
+        plan = PreprocessPlan((Gray(),), name="sticky_device_loss")
+        image = np.zeros((4, 5, 3), dtype=np.uint8)
+        dll.fail_next_plan_execute = True
+        dll.plan_execute_failure_code = 1700
+
+        with self.assertRaisesRegex(GpuRuntimeError, "error 1700"):
+            runtime.execute_plan(image, plan)
+
+        self.assertFalse(runtime.available)
+        self.assertFalse(runtime.supports_native_plan)
+        self.assertIn("重新啟動", runtime.unavailable_reason)
+        self.assertIn("error 1700", runtime.device_lost_reason)
+        status = runtime.status(requested=True)
+        self.assertFalse(status["active"])
+        self.assertEqual(status["fallback_reason"], runtime.device_lost_reason)
+        runtime.clear_recoverable_error()
+        self.assertFalse(runtime.available)
+        with self.assertRaisesRegex(GpuRuntimeError, "重新啟動"):
+            runtime.bgr_to_gray(image)
+        self.assertEqual(dll.plan_execute_calls, 1)
+
+    def test_non_sticky_cuda_errors_keep_runtime_available(self):
+        for code in (1001, 1002, 1999, 2):
+            runtime = GpuRuntime(enabled=False)
+            dll = _NativePlanDll()
+            runtime._dll = dll
+            runtime.device_count = 1
+            runtime._load_optional_context()
+            dll.fail_next_plan_execute = True
+            dll.plan_execute_failure_code = code
+            with self.assertRaises(GpuRuntimeError):
+                runtime.execute_plan(np.zeros((4, 5, 3), dtype=np.uint8), PreprocessPlan((Gray(),), name="x"))
+            self.assertTrue(runtime.available, code)
+            self.assertEqual(runtime.device_lost_reason, "")
+
+    def test_sticky_context_creation_failure_marks_device_lost(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            dll_path = Path(temporary) / "visionflow_cuda.dll"
+            dll_path.write_bytes(b"fake")
+            with patch(
+                "core.gpu_runtime.ctypes.CDLL",
+                return_value=_LoadScenarioDll(context_result=1700),
+            ):
+                runtime = GpuRuntime(dll_path, enabled=True)
+
+        self.assertFalse(runtime.available)
+        self.assertIn("context creation failed with error 1700", runtime.unavailable_reason)
 
     def test_context_reuse_matrix_covers_shape_channel_and_parameter_changes(self):
         runtime = GpuRuntime(enabled=False)
@@ -681,8 +787,11 @@ class GpuRuntimeMetricsTests(unittest.TestCase):
         )
         host_roi = image[1:5, 2:7]
 
-        output = runtime.execute_plan(host_roi, linear, device_roi=roi)
-        outputs = runtime.execute_dag_plan(host_roi, dag, device_roi=roi)
+        self.assertFalse(host_roi.flags.c_contiguous)
+        with patch("core.gpu_runtime.np.ascontiguousarray", side_effect=AssertionError("unexpected CPU ROI copy")):
+            self.assertEqual(CudaPreprocessExecutor(runtime).capability_report(linear, host_roi).selected_backend, "cuda")
+            output = runtime.execute_plan(host_roi, linear, device_roi=roi)
+            outputs = runtime.execute_dag_plan(host_roi, dag, device_roi=roi)
 
         self.assertTrue(runtime.supports_resident_roi)
         self.assertEqual(output.shape, (4, 5))
@@ -694,6 +803,50 @@ class GpuRuntimeMetricsTests(unittest.TestCase):
         self.assertEqual(metrics["host_to_device_bytes"], image.nbytes)
         self.assertEqual(metrics["functions"]["vf_plan_execute_roi"]["host_to_device_bytes"], 0)
         self.assertEqual(metrics["functions"]["vf_dag_plan_execute_roi"]["host_to_device_bytes"], 0)
+
+    def test_resident_upload_passes_packed_negative_row_stride_without_host_copy(self):
+        runtime = GpuRuntime(enabled=False)
+        dll = _NativeDagPlanDll()
+        runtime._dll = dll
+        runtime.device_count = 1
+        runtime._load_optional_context()
+        backing = np.arange(6 * 7 * 3, dtype=np.uint8).reshape(6, 7, 3)
+        logical_top_down = backing[::-1]
+
+        with patch(
+            "core.gpu_runtime.np.ascontiguousarray",
+            side_effect=AssertionError("unexpected full-image host copy"),
+        ):
+            resident = runtime.upload_image(logical_top_down)
+
+        self.assertEqual(
+            (resident.height, resident.width, resident.channels), logical_top_down.shape
+        )
+        np.testing.assert_array_equal(dll.resident, logical_top_down)
+        metrics = runtime.performance_stats()
+        self.assertEqual(metrics["host_to_device_bytes"], logical_top_down.nbytes)
+        self.assertIn("vf_context_upload_u8_file_order", metrics["functions"])
+
+    def test_old_dll_copies_negative_stride_before_legacy_upload(self):
+        runtime = GpuRuntime(enabled=False)
+        dll = _NativeDagPlanDll()
+        del dll.vf_context_upload_u8_file_order
+        runtime._dll = dll
+        runtime.device_count = 1
+        runtime._load_optional_context()
+        backing = np.arange(6 * 7 * 3, dtype=np.uint8).reshape(6, 7, 3)
+        logical_top_down = backing[::-1]
+        contiguous = np.ascontiguousarray
+
+        with patch("core.gpu_runtime.np.ascontiguousarray", wraps=contiguous) as copied:
+            runtime.upload_image(logical_top_down)
+
+        self.assertTrue(copied.called)
+        self.assertFalse(runtime.supports_file_order_upload)
+        np.testing.assert_array_equal(dll.resident, logical_top_down)
+        self.assertIn(
+            "vf_context_upload_u8", runtime.performance_stats()["functions"]
+        )
 
     def test_resident_sub_roi_validates_parent_bounds_and_runtime(self):
         runtime = GpuRuntime(enabled=False)
@@ -824,6 +977,43 @@ class DetectorNativeRoutingTests(unittest.TestCase):
         self.assertFalse(result["execution"]["gpu_active"])
         self.assertEqual(result["execution"]["preprocess_capability"]["route"], "fallback")
         self.assertIn("injected native plan failure", result["execution"]["fallback_reason"])
+
+    def test_sticky_native_failure_routes_later_detectors_to_cpu_without_cuda_calls(self):
+        runtime = GpuRuntime(enabled=False)
+        dll = _NativePlanDll()
+        runtime._dll = dll
+        runtime.device_count = 1
+        runtime._load_optional_context()
+        dll.fail_next_plan_execute = True
+        dll.plan_execute_failure_code = 1700
+        image = np.random.default_rng(700).integers(0, 256, (32, 40, 3), dtype=np.uint8)
+        reference = Detector401(params=self._params()).run(image)
+
+        first = Detector401(params=self._params(), use_gpu=True, gpu_runtime=runtime).run(image)
+        calls_after_failure = dll.plan_execute_calls
+        later_detector = Detector401(params=self._params(), use_gpu=True, gpu_runtime=runtime)
+        later = later_detector.run(image)
+
+        self.assertIn("error 1700", first["execution"]["fallback_reason"])
+        self.assertEqual(first["defects"], reference["defects"])
+        self.assertFalse(later["execution"]["gpu_active"])
+        self.assertIn("重新啟動", later["execution"]["fallback_reason"])
+        self.assertEqual(later["defects"], reference["defects"])
+        self.assertEqual(dll.plan_execute_calls, calls_after_failure)
+
+    def test_native_plan_failure_restarts_on_cpu_from_resident_tile_view(self):
+        source = np.random.default_rng(401).integers(0, 256, (72, 96, 3), dtype=np.uint8)
+        tile_view = source[4:68, 7:87]
+        self.assertFalse(tile_view.flags.c_contiguous)
+        before = source.copy()
+        reference = Detector401(params=self._params()).run(tile_view.copy())
+        runtime = _FailingNativePlanRuntimeStub()
+        result = Detector401(params=self._params(), use_gpu=True, gpu_runtime=runtime).run(tile_view)
+
+        self.assertEqual(runtime.calls, 1)
+        self.assertEqual(result["defects"], reference["defects"])
+        self.assertEqual(result["pass"], reference["pass"])
+        np.testing.assert_array_equal(source, before)
 
 
 class DetectorFusedRoutingTests(unittest.TestCase):

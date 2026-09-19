@@ -58,10 +58,23 @@ int main() {
     uint64_t reserved_bytes = 0;
     uint64_t allocation_count = 0;
     int stats_result = vf_context_stats(context, &reserved_bytes, &allocation_count);
+    VfCudaContextMemoryStatsV1 memory_stats{};
+    memory_stats.struct_size = sizeof(VfCudaContextMemoryStatsV1);
+    memory_stats.version = 1;
+    int memory_stats_result = vf_context_memory_stats_v1(context, &memory_stats);
     if (result != VF_CUDA_OK || stats_result != VF_CUDA_OK ||
-        reserved_bytes == 0 || allocation_count == 0) {
+        memory_stats_result != VF_CUDA_OK || reserved_bytes == 0 || allocation_count == 0 ||
+        memory_stats.reserved_bytes != reserved_bytes ||
+        memory_stats.peak_reserved_bytes < memory_stats.reserved_bytes ||
+        memory_stats.allocation_count != allocation_count ||
+        memory_stats.plan_bytes + memory_stats.resident_bytes +
+                memory_stats.template_match_bytes + memory_stats.contour_bytes +
+                memory_stats.median_bytes + memory_stats.gaussian_f32_bytes +
+                memory_stats.cnr_mask_bytes + memory_stats.cnr_candidate_bytes !=
+            memory_stats.reserved_bytes) {
         char message[256]{};
-        int failed = result != VF_CUDA_OK ? result : stats_result;
+        int failed = result != VF_CUDA_OK ? result :
+            (stats_result != VF_CUDA_OK ? stats_result : memory_stats_result);
         vf_gpu_error_message(failed, message, static_cast<int>(sizeof(message)));
         std::cerr << "Fused 401-2 smoke failed: " << message << "\n";
         return 7;
@@ -114,6 +127,50 @@ int main() {
     if (result == VF_CUDA_OK) {
         result = vf_context_upload_u8(
             context, bgr.data(), width, height, width * 3, 3, &resident_generation);
+    }
+    if (result == VF_CUDA_OK) {
+        const int row_bytes = width * 3;
+        std::vector<uint8_t> bottom_up(bgr.size(), 0);
+        for (int row = 0; row < height; ++row) {
+            std::memcpy(
+                bottom_up.data() + static_cast<size_t>(height - 1 - row) * row_bytes,
+                bgr.data() + static_cast<size_t>(row) * row_bytes,
+                static_cast<size_t>(row_bytes));
+        }
+        uint64_t bottom_up_generation = 0;
+        result = vf_host_register_u8(context, bottom_up.data(), bottom_up.size());
+        if (result == VF_CUDA_OK) {
+            result = vf_context_upload_u8_file_order(
+                context,
+                bottom_up.data() + static_cast<size_t>(height - 1) * row_bytes,
+                width, height, -row_bytes, 3, &bottom_up_generation);
+        }
+        int unregister_result = vf_host_unregister_u8(context, bottom_up.data());
+        if (result == VF_CUDA_OK && unregister_result != VF_CUDA_OK) {
+            std::cerr << "pinned host buffer unregister failed\n";
+            return 11;
+        }
+        VfRoiV1 full_roi{sizeof(VfRoiV1), 0, 0, width, height};
+        void* full_batch = nullptr;
+        if (result == VF_CUDA_OK) {
+            result = vf_roi_batch_create(
+                context, bottom_up_generation, &full_roi, 1, &full_batch);
+        }
+        std::vector<uint8_t> bottom_up_download(bgr.size(), 0);
+        if (result == VF_CUDA_OK) {
+            result = vf_roi_batch_download_u8(
+                full_batch, 0, bottom_up_download.data(), row_bytes, 3);
+        }
+        int full_destroy_result = vf_roi_batch_destroy(full_batch);
+        if (result == VF_CUDA_OK &&
+            (full_destroy_result != VF_CUDA_OK || bottom_up_download != bgr)) {
+            std::cerr << "negative-stride resident upload changed row order\n";
+            return 11;
+        }
+        if (result == VF_CUDA_OK) {
+            result = vf_context_upload_u8(
+                context, bgr.data(), width, height, row_bytes, 3, &resident_generation);
+        }
     }
     if (result == VF_CUDA_OK) {
         result = vf_plan_execute_roi(
@@ -195,6 +252,86 @@ int main() {
         result = vf_roi_batch_download_u8(roi_batch, 1, downloaded_roi.data(), 4 * 3, 3);
     }
     int batch_destroy_result = vf_roi_batch_destroy(roi_batch);
+    std::vector<uint8_t> resident_cnr_mask(width * height, 0);
+    float resident_cnr_median = 0.0f;
+    float resident_cnr_mad = 0.0f;
+    double resident_cnr_threshold = 0.0;
+    if (result == VF_CUDA_OK) {
+        result = vf_cnr_mask_u8_roi(
+            context, resident_generation, 0, 0, width, height,
+            3, 0.0, 3.0, 8.0, 0.000001, 1.4826, 255,
+            &resident_cnr_median, &resident_cnr_mad, &resident_cnr_threshold,
+            resident_cnr_mask.data(), static_cast<long long>(resident_cnr_mask.size()));
+    }
+    std::vector<int32_t> candidate_ints(1024 * 7, 0);
+    std::vector<float> candidate_floats(1024 * 3, 0.0f);
+    int candidate_count = -1;
+    int candidate_components = -1;
+    int candidate_status = -1;
+    if (result == VF_CUDA_OK) {
+        const int32_t candidate_int_params[22] = {
+            3, 255, VF_MORPH_OPEN, 3, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 8, 1, 0, 0, 0, 1, 4, 0};
+        const double candidate_real_params[6] = {0.0, 3.0, 8.0, 0.000001, 1.4826, 1.5};
+        float candidate_median = 0.0f;
+        float candidate_mad = 0.0f;
+        double candidate_threshold = 0.0;
+        result = vf_cnr_candidates_u8_roi(
+            context, resident_generation, 0, 0, width, height,
+            candidate_int_params, 22, candidate_real_params, 6,
+            &candidate_median, &candidate_mad, &candidate_threshold,
+            candidate_ints.data(), candidate_floats.data(), 1024,
+            &candidate_count, &candidate_components, &candidate_status);
+        if (result == VF_CUDA_OK && (candidate_count < 0 || candidate_status != 0 ||
+                                     candidate_median != resident_cnr_median ||
+                                     candidate_mad != resident_cnr_mad ||
+                                     candidate_threshold != resident_cnr_threshold)) {
+            std::cerr << "resident CNR candidates disagree with the resident CNR mask chain\n";
+            return 10;
+        }
+    }
+    VfCudaContextMemoryStatsV1 exercised_memory_stats{};
+    exercised_memory_stats.struct_size = sizeof(VfCudaContextMemoryStatsV1);
+    exercised_memory_stats.version = 1;
+    int exercised_memory_result = result == VF_CUDA_OK
+        ? vf_context_memory_stats_v1(context, &exercised_memory_stats)
+        : result;
+    if (result == VF_CUDA_OK &&
+        (exercised_memory_result != VF_CUDA_OK ||
+         exercised_memory_stats.plan_bytes == 0 ||
+         exercised_memory_stats.resident_bytes == 0 ||
+         exercised_memory_stats.median_bytes == 0 ||
+         exercised_memory_stats.gaussian_f32_bytes == 0 ||
+         exercised_memory_stats.cnr_mask_bytes == 0 ||
+         exercised_memory_stats.cnr_candidate_bytes == 0)) {
+        std::cerr << "Detailed context memory accounting missed an exercised buffer family\n";
+        return 11;
+    }
+    // A real device OOM must not leave a stale error for the next ROI batch.
+    const int oom_side = 4096;
+    std::vector<uint8_t> oom_source(static_cast<size_t>(oom_side) * oom_side, 7);
+    uint64_t oom_generation = 0;
+    int oom_result = VF_CUDA_OK;
+    int oom_recovery_result = VF_CUDA_OK;
+    if (result == VF_CUDA_OK) {
+        result = vf_context_upload_u8(
+            context, oom_source.data(), oom_side, oom_side, oom_side, 1, &oom_generation);
+    }
+    if (result == VF_CUDA_OK) {
+        std::vector<VfRoiV1> oom_rois(65535, VfRoiV1{sizeof(VfRoiV1), 0, 0, oom_side, oom_side});
+        void* oom_batch = nullptr;
+        oom_result = vf_roi_batch_create(
+            context, oom_generation, oom_rois.data(), static_cast<int>(oom_rois.size()), &oom_batch);
+        if (oom_result == VF_CUDA_OK) vf_roi_batch_destroy(oom_batch);
+        void* recovery_batch = nullptr;
+        oom_recovery_result = vf_roi_batch_create(
+            context, oom_generation, batch_rois, 2, &recovery_batch);
+        if (oom_recovery_result == VF_CUDA_OK) vf_roi_batch_destroy(recovery_batch);
+    }
+    if (result == VF_CUDA_OK && (oom_result == VF_CUDA_OK || oom_recovery_result != VF_CUDA_OK)) {
+        std::cerr << "ROI batch OOM recovery failed: oom_result=" << oom_result
+                  << " recovery_result=" << oom_recovery_result << "\n";
+        return 9;
+    }
     VfCudaTimingsV1 timings{};
     timings.struct_size = sizeof(VfCudaTimingsV1);
     timings.version = 1;

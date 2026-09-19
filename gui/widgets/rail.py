@@ -13,6 +13,7 @@ from gui.theme import COLORS, RAIL_W
 NAV_ITEMS = [
     ("run", "play", "執行檢測"),
     ("monitor", "eye", "監控模式"),
+    ("ccd", "camera", "CCD 控制"),
     ("designer", "designer", "Recipe 設計"),
     ("results", "table", "檢測結果"),
     ("batch_dashboard", "bar_chart", "批量數據圖表"),

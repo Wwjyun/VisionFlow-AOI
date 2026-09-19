@@ -502,5 +502,548 @@ class Detector2021RoutingTests(unittest.TestCase):
         )
 
 
+class _GaussianRuntime(_PrimitiveRuntime):
+    """A runtime that offers the float32 Gaussian, with a call log and optional legacy mode."""
+
+    supports_gaussian_blur_f32 = True
+
+    def __init__(self, honour_sigma=True, fail=False):
+        super().__init__()
+        self.supports_gaussian_f32_sigma = honour_sigma
+        self.fail = fail
+        self.gaussian_calls = []
+
+    def gaussian_blur_f32(self, image, kernel_size, sigma=0.0):
+        self.gaussian_calls.append((image.shape, int(kernel_size), float(sigma)))
+        if self.fail:
+            raise RuntimeError("injected detector 202-1 gaussian failure")
+        if not self.supports_gaussian_f32_sigma and float(sigma) > 0.0:
+            raise RuntimeError("legacy DLL ignores sigma")
+        return cv2.GaussianBlur(image, (int(kernel_size), int(kernel_size)), float(sigma))
+
+
+class Detector2021BackgroundRoutingTests(unittest.TestCase):
+    """The CNR background runs on the device only when the DLL can honour sigma."""
+
+    @staticmethod
+    def _gray():
+        rng = np.random.default_rng(2021)
+        gray = np.full((240, 320), 150, dtype=np.float64)
+        gray += rng.normal(0.0, 2.0, gray.shape)
+        gray[90:110, 150:180] = 60.0
+        return np.clip(gray, 0, 255).astype(np.uint8)
+
+    def _analysis(self, detector):
+        gray = self._gray()
+        return detector._automatic_cnr_mask(gray)
+
+    def test_device_background_is_used_and_preserves_the_candidate_mask(self):
+        gray = self._gray()
+        runtime = _GaussianRuntime()
+        detector = Detector202_1(
+            params={"center_mask_enabled": False, "edge_mask_enabled": False},
+            use_gpu=True,
+            gpu_runtime=runtime,
+        )
+        analysis = detector._automatic_cnr_mask(gray)
+        self.assertEqual(len(runtime.gaussian_calls), 1)
+        shape, kernel, sigma = runtime.gaussian_calls[0]
+        self.assertEqual(shape, gray.shape)
+        self.assertEqual(kernel, analysis["background_kernel"])
+        self.assertEqual(sigma, 0.0)
+        # The device path is used, so the filtered image differs from cv2's in the last bits
+        # while the mask it produces must still be exactly the CPU mask.
+        reference = Detector202_1(
+            params={"center_mask_enabled": False, "edge_mask_enabled": False}
+        )._automatic_cnr_mask(gray)
+        np.testing.assert_array_equal(analysis["candidate_mask"], reference["candidate_mask"])
+
+    def test_explicit_sigma_is_forwarded_to_the_device(self):
+        gray = self._gray()
+        runtime = _GaussianRuntime()
+        detector = Detector202_1(
+            params={
+                "center_mask_enabled": False,
+                "edge_mask_enabled": False,
+                "gaussian_sigma": 1.25,
+                "background_kernel_size": 31,
+            },
+            use_gpu=True,
+            gpu_runtime=runtime,
+        )
+        analysis = detector._automatic_cnr_mask(gray)
+        self.assertEqual(runtime.gaussian_calls[0][1:], (31, 1.25))
+        self.assertEqual(analysis["gaussian_sigma"], 1.25)
+
+    def test_old_dll_that_ignores_sigma_falls_back_to_opencv(self):
+        """A DLL without the sigma parameter must not be used for the background."""
+
+        gray = self._gray()
+        runtime = _GaussianRuntime(honour_sigma=False)
+        params = {
+            "center_mask_enabled": False,
+            "edge_mask_enabled": False,
+            "gaussian_sigma": 1.25,
+            "background_kernel_size": 31,
+        }
+        detector = Detector202_1(params=params, use_gpu=True, gpu_runtime=runtime)
+        analysis = detector._automatic_cnr_mask(gray)
+        reference = Detector202_1(params=params)._automatic_cnr_mask(gray)
+        np.testing.assert_array_equal(analysis["candidate_mask"], reference["candidate_mask"])
+        self.assertEqual(
+            analysis["residual_median"], reference["residual_median"]
+        )
+
+    def test_device_gaussian_failure_falls_back_for_the_whole_call(self):
+        gray = self._gray()
+        runtime = _GaussianRuntime(fail=True)
+        params = {"center_mask_enabled": False, "edge_mask_enabled": False}
+        analysis = Detector202_1(
+            params=params, use_gpu=True, gpu_runtime=runtime
+        )._automatic_cnr_mask(gray)
+        reference = Detector202_1(params=params)._automatic_cnr_mask(gray)
+        np.testing.assert_array_equal(analysis["candidate_mask"], reference["candidate_mask"])
+        self.assertEqual(analysis["residual_median"], reference["residual_median"])
+
+    def test_cpu_run_never_calls_the_device_gaussian(self):
+        gray = self._gray()
+        runtime = _GaussianRuntime()
+        Detector202_1(
+            params={"center_mask_enabled": False, "edge_mask_enabled": False},
+            use_gpu=False,
+            gpu_runtime=runtime,
+        )._automatic_cnr_mask(gray)
+        self.assertEqual(runtime.gaussian_calls, [])
+
+    def test_reported_metadata_names_the_background_backend(self):
+        """The report must say which background produced the diagnostics.
+
+        The device filter drifts the four residual-derived diagnostics in their last
+        bits, so a reader of the CSV/JSON has to be able to tell the two paths apart
+        without re-running the detector.
+        """
+
+        gray = self._gray()
+        params = {"center_mask_enabled": False, "edge_mask_enabled": False}
+
+        cpu_detector = Detector202_1(params=params)
+        self.assertEqual(
+            cpu_detector._automatic_cnr_mask(gray)["background_backend"], "opencv_cpu"
+        )
+        cpu_defect = cpu_detector.run(np.dstack([gray] * 3))["defects"][0]
+        self.assertEqual(cpu_defect["metadata"]["background_backend"], "opencv_cpu")
+
+        device_detector = Detector202_1(
+            params=params, use_gpu=True, gpu_runtime=_GaussianRuntime()
+        )
+        self.assertEqual(
+            device_detector._automatic_cnr_mask(gray)["background_backend"], "cuda_f32"
+        )
+        device_defect = device_detector.run(np.dstack([gray] * 3))["defects"][0]
+        self.assertEqual(device_defect["metadata"]["background_backend"], "cuda_f32")
+        self.assertIn(
+            "尾位", device_defect["metadata"]["background_precision_note"]
+        )
+
+
+class _FusedRuntime(_GaussianRuntime):
+    """A runtime that also offers the fused residual/mask export."""
+
+    supports_cnr_mask_f32 = True
+
+    def __init__(self, honour_sigma=True, fail_gaussian=False, fail_fused=False):
+        super().__init__(honour_sigma=honour_sigma, fail=fail_gaussian)
+        self.fail_fused = fail_fused
+        self.fused_calls = []
+        self.median_calls = 0
+
+    def median_f32(self, values):
+        self.median_calls += 1
+        return super().median_f32(values)
+
+    def cnr_mask_f32(
+        self,
+        image,
+        background,
+        *,
+        sigma_multiplier,
+        threshold_floor,
+        absolute_floor,
+        mad_scale,
+        candidate_value,
+    ):
+        self.fused_calls.append(
+            {
+                "shape": image.shape,
+                "sigma_multiplier": float(sigma_multiplier),
+                "threshold_floor": float(threshold_floor),
+                "absolute_floor": float(absolute_floor),
+                "mad_scale": float(mad_scale),
+                "candidate_value": int(candidate_value),
+            }
+        )
+        if self.fail_fused:
+            raise RuntimeError("injected detector 202-1 fused mask failure")
+        residual = image - background
+        median = float(np.median(residual))
+        mad = float(np.median(np.abs(residual - median)))
+        robust = max(mad_scale * mad, absolute_floor)
+        threshold = max(threshold_floor, sigma_multiplier * robust)
+        mask = (
+            np.abs(residual - median).astype(np.float32) > np.float32(threshold)
+        ).astype(np.uint8) * candidate_value
+        return {
+            "mask": mask,
+            "residual_median": np.float32(median),
+            "mad": np.float32(mad),
+            "threshold": float(threshold),
+        }
+
+
+class Detector2021FusedResidualRoutingTests(unittest.TestCase):
+    """The fused residual/mask export is used when present and falls back cleanly."""
+
+    @staticmethod
+    def _gray():
+        rng = np.random.default_rng(77)
+        gray = np.full((200, 260), 150, dtype=np.float64)
+        gray += rng.normal(0.0, 2.0, gray.shape)
+        gray[80:100, 120:150] = 60.0
+        return np.clip(gray, 0, 255).astype(np.uint8)
+
+    @staticmethod
+    def _params(**overrides):
+        params = {"center_mask_enabled": False, "edge_mask_enabled": False}
+        params.update(overrides)
+        return params
+
+    def test_fused_export_replaces_both_medians_and_the_host_mask(self):
+        gray = self._gray()
+        runtime = _FusedRuntime()
+        detector = Detector202_1(
+            params=self._params(), use_gpu=True, gpu_runtime=runtime
+        )
+        analysis = detector._automatic_cnr_mask(gray)
+        self.assertEqual(len(runtime.fused_calls), 1)
+        self.assertEqual(analysis["residual_backend"], "cuda_f32")
+        # The whole point of the export: no separate median uploads happen any more.
+        self.assertEqual(runtime.median_calls, 0)
+        reference = Detector202_1(params=self._params())._automatic_cnr_mask(gray)
+        np.testing.assert_array_equal(
+            analysis["candidate_mask"], reference["candidate_mask"]
+        )
+
+    def test_detector_parameters_reach_the_export(self):
+        gray = self._gray()
+        runtime = _FusedRuntime()
+        params = self._params(
+            mad_scale=2.0,
+            noise_sigma_floor=0.25,
+            residual_threshold_floor=6.0,
+            residual_sigma_multiplier=2.5,
+            candidate_max_value=200,
+        )
+        Detector202_1(
+            params=params, use_gpu=True, gpu_runtime=runtime
+        )._automatic_cnr_mask(gray)
+        call = runtime.fused_calls[0]
+        self.assertEqual(call["mad_scale"], 2.0)
+        self.assertEqual(call["absolute_floor"], 0.25)
+        self.assertEqual(call["threshold_floor"], 6.0)
+        self.assertEqual(call["sigma_multiplier"], 2.5)
+        self.assertEqual(call["candidate_value"], 200)
+
+    def test_fused_failure_falls_back_to_the_numpy_reference(self):
+        gray = self._gray()
+        runtime = _FusedRuntime(fail_fused=True)
+        analysis = Detector202_1(
+            params=self._params(), use_gpu=True, gpu_runtime=runtime
+        )._automatic_cnr_mask(gray)
+        self.assertEqual(analysis["residual_backend"], "numpy_cpu")
+        # This runtime offers no separate median export either, so the fallback is the
+        # pure NumPy reference; the point is that a fused failure still produces exactly
+        # the reference mask rather than a partially device-derived one.
+        self.assertEqual(runtime.median_calls, 0)
+        reference = Detector202_1(params=self._params())._automatic_cnr_mask(gray)
+        np.testing.assert_array_equal(
+            analysis["candidate_mask"], reference["candidate_mask"]
+        )
+        self.assertEqual(analysis["residual_median"], reference["residual_median"])
+
+    def test_fused_failure_with_a_median_export_falls_back_to_the_device_medians(self):
+        """With both exports present, a fused failure degrades to the two median calls."""
+
+        gray = self._gray()
+        runtime = _FusedRuntime(fail_fused=True)
+        runtime.supports_exact_median = True
+
+        def median_f32(values):
+            runtime.median_calls += 1
+            return np.float32(np.median(np.asarray(values, dtype=np.float32)))
+
+        runtime.median_f32 = median_f32
+        params = self._params()
+        analysis = Detector202_1(
+            params=params, use_gpu=True, gpu_runtime=runtime
+        )._automatic_cnr_mask(gray)
+        self.assertEqual(analysis["residual_backend"], "numpy_cpu")
+        self.assertGreater(runtime.median_calls, 0)
+        reference = Detector202_1(params=params)._automatic_cnr_mask(gray)
+        np.testing.assert_array_equal(
+            analysis["candidate_mask"], reference["candidate_mask"]
+        )
+
+    def test_runtime_without_the_export_keeps_the_median_path(self):
+        gray = self._gray()
+        runtime = _GaussianRuntime()
+        analysis = Detector202_1(
+            params=self._params(), use_gpu=True, gpu_runtime=runtime
+        )._automatic_cnr_mask(gray)
+        self.assertEqual(len(runtime.gaussian_calls), 1)
+        self.assertEqual(analysis["residual_backend"], "numpy_cpu")
+
+    def test_cpu_run_never_calls_the_fused_export(self):
+        gray = self._gray()
+        runtime = _FusedRuntime()
+        Detector202_1(
+            params=self._params(), use_gpu=False, gpu_runtime=runtime
+        )._automatic_cnr_mask(gray)
+        self.assertEqual(runtime.fused_calls, [])
+        self.assertEqual(runtime.median_calls, 0)
+
+    def test_reported_metadata_names_the_residual_backend(self):
+        gray = self._gray()
+        image = np.dstack([gray] * 3)
+        cpu_defect = Detector202_1(params=self._params()).run(image)["defects"][0]
+        self.assertEqual(cpu_defect["metadata"]["residual_backend"], "numpy_cpu")
+        fused_defect = Detector202_1(
+            params=self._params(), use_gpu=True, gpu_runtime=_FusedRuntime()
+        ).run(image)["defects"][0]
+        self.assertEqual(fused_defect["metadata"]["residual_backend"], "cuda_f32")
+
+
+class _ResidentRoi:
+    def __init__(self, width, height):
+        self.width = width
+        self.height = height
+
+
+class _ResidentFusedRuntime(_FusedRuntime):
+    supports_cnr_mask_u8_roi = True
+
+    def __init__(self, gray, fail_resident=False):
+        super().__init__()
+        self.gray = gray
+        self.fail_resident = fail_resident
+        self.resident_calls = []
+
+    def cnr_mask_u8_roi(self, device_roi, **params):
+        self.resident_calls.append((device_roi, dict(params)))
+        if self.fail_resident:
+            raise RuntimeError("injected resident CNR failure")
+        image = self.gray.astype(np.float32)
+        kernel = int(params["kernel_size"])
+        background = cv2.GaussianBlur(
+            image, (kernel, kernel), float(params["sigma"])
+        )
+        return self.cnr_mask_f32(
+            image,
+            background,
+            sigma_multiplier=params["sigma_multiplier"],
+            threshold_floor=params["threshold_floor"],
+            absolute_floor=params["absolute_floor"],
+            mad_scale=params["mad_scale"],
+            candidate_value=params["candidate_value"],
+        )
+
+
+class Detector2021ResidentCnrRoutingTests(unittest.TestCase):
+    @staticmethod
+    def _gray():
+        return Detector2021FusedResidualRoutingTests._gray()
+
+    @staticmethod
+    def _params():
+        return {"center_mask_enabled": False, "edge_mask_enabled": False}
+
+    def test_resident_roi_replaces_host_gaussian_and_host_operand_cnr(self):
+        gray = self._gray()
+        runtime = _ResidentFusedRuntime(gray)
+        detector = Detector202_1(params=self._params(), use_gpu=True, gpu_runtime=runtime)
+        detector._active_device_roi = _ResidentRoi(gray.shape[1], gray.shape[0])
+        analysis = detector._automatic_cnr_mask(gray)
+        self.assertEqual(len(runtime.resident_calls), 1)
+        self.assertEqual(runtime.gaussian_calls, [])
+        self.assertEqual(analysis["background_backend"], "cuda_resident_fused")
+        self.assertEqual(analysis["residual_backend"], "cuda_resident_fused")
+        reference = Detector202_1(params=self._params())._automatic_cnr_mask(gray)
+        np.testing.assert_array_equal(analysis["candidate_mask"], reference["candidate_mask"])
+
+    def test_resident_failure_uses_the_existing_host_operand_gpu_path(self):
+        gray = self._gray()
+        runtime = _ResidentFusedRuntime(gray, fail_resident=True)
+        detector = Detector202_1(params=self._params(), use_gpu=True, gpu_runtime=runtime)
+        detector._active_device_roi = _ResidentRoi(gray.shape[1], gray.shape[0])
+        analysis = detector._automatic_cnr_mask(gray)
+        self.assertEqual(len(runtime.resident_calls), 1)
+        self.assertEqual(len(runtime.gaussian_calls), 1)
+        self.assertEqual(analysis["residual_backend"], "cuda_f32")
+
+    def test_debug_export_keeps_the_host_residual_needed_for_the_debug_image(self):
+        gray = self._gray()
+        runtime = _ResidentFusedRuntime(gray)
+        detector = Detector202_1(params=self._params(), use_gpu=True, gpu_runtime=runtime)
+        detector.export_debug_images = True
+        detector._active_device_roi = _ResidentRoi(gray.shape[1], gray.shape[0])
+        detector._automatic_cnr_mask(gray)
+        self.assertEqual(runtime.resident_calls, [])
+        self.assertIn("202-1_residual_abs", detector.debug_images)
+
+
+class _PlanResidentRoi(_ResidentRoi):
+    """Resident ROI whose gray plan runs on the host when the detector falls back."""
+
+    def roi(self, *_args):
+        return None
+
+
+class _CandidateRuntime(_ResidentFusedRuntime):
+    """Offers the resident candidate export; records come from the CPU reference in reverse order."""
+
+    supports_cnr_candidates_u8_roi = True
+
+    def __init__(self, gray, params, fail_candidates=False):
+        super().__init__(gray)
+        self.params = dict(params)
+        self.fail_candidates = fail_candidates
+        self.candidate_calls = []
+
+    def cnr_candidates_u8_roi(self, device_roi, int_params, real_params):
+        self.candidate_calls.append((device_roi, list(int_params), list(real_params)))
+        if self.fail_candidates:
+            raise RuntimeError("injected candidate export failure")
+        reference = Detector202_1(params=self.params)
+        analysis = reference._automatic_cnr_mask(self.gray)
+        candidates = reference._collect_candidates(
+            analysis["image_float"], analysis["candidate_mask"], analysis["inclusion_mask"]
+        )[::-1]
+        records = np.array(
+            [[*candidate.bbox, candidate.area, candidate.background_area, 0] for candidate in candidates],
+            dtype=np.int32,
+        ).reshape(-1, 7)
+        stats = np.array(
+            [[candidate.defect_mean, candidate.background_mean, candidate.background_std] for candidate in candidates],
+            dtype=np.float32,
+        ).reshape(-1, 3)
+        return {
+            "residual_median": np.float32(analysis["residual_median"]),
+            "mad": np.float32(analysis["mad"]),
+            "threshold": float(analysis["residual_threshold"]),
+            "records": records,
+            "stats": stats,
+            "component_count": len(candidates),
+        }
+
+
+class Detector2021DeviceCandidateRoutingTests(unittest.TestCase):
+    PROVENANCE = {"background_backend", "residual_backend", "background_precision_note", "component_backend"}
+
+    @staticmethod
+    def _gray():
+        rng = np.random.default_rng(909)
+        gray = np.full((200, 260), 150, dtype=np.float64)
+        gray += rng.normal(0.0, 2.0, gray.shape)
+        for top, left in ((40, 40), (40, 180), (120, 60), (130, 200)):
+            gray[top : top + 8, left : left + 12] = 60.0
+        return np.clip(gray, 0, 255).astype(np.uint8)
+
+    @staticmethod
+    def _params(**overrides):
+        params = {"center_mask_enabled": False, "edge_mask_enabled": False}
+        params.update(overrides)
+        return params
+
+    def _strip(self, defects):
+        return [
+            {**defect, "metadata": {k: v for k, v in defect["metadata"].items() if k not in self.PROVENANCE}}
+            for defect in defects
+        ]
+
+    def _device_detector(self, gray, params, **runtime_options):
+        runtime = _CandidateRuntime(gray, params, **runtime_options)
+        detector = Detector202_1(params=params, use_gpu=True, gpu_runtime=runtime)
+        detector._active_device_roi = _PlanResidentRoi(gray.shape[1], gray.shape[0])
+        return detector, runtime
+
+    def test_device_candidates_replace_mask_components_and_ring_on_the_host(self):
+        gray = self._gray()
+        params = self._params()
+        detector, runtime = self._device_detector(gray, params)
+        defects = detector.detect(gray)
+        expected = Detector202_1(params=params).detect(gray)
+        self.assertEqual(len(runtime.candidate_calls), 1)
+        self.assertEqual(runtime.resident_calls, [])
+        self.assertEqual(runtime.gaussian_calls, [])
+        self.assertGreaterEqual(len(expected), 4)
+        self.assertEqual(self._strip(defects), self._strip(expected))
+        self.assertEqual({d["metadata"]["component_backend"] for d in defects}, {"cuda_resident"})
+        self.assertEqual({d["metadata"]["component_backend"] for d in expected}, {"opencv_cpu"})
+        self.assertIn("device_cnr_candidates", detector._detection_stage_durations)
+
+    def test_parameters_follow_the_documented_export_layout(self):
+        gray = self._gray()
+        params = self._params(
+            morph_operation="close", morph_kernel=5, morph_iterations=2, connectivity=4,
+            center_mask_enabled=True, center_mask_use_image_center=False, center_mask_x=100,
+            center_mask_y=90, center_mask_width=20, center_mask_height=10, edge_mask_enabled=True,
+            edge_inset_all=7, component_border_margin_px=3, background_padding_min_px=4,
+            background_padding_max_px=30, background_padding_scale=2.25, min_background_pixels=11,
+            candidate_max_value=200, gaussian_sigma=1.5,
+        )
+        detector, runtime = self._device_detector(gray, params)
+        detector.detect(gray)
+        _roi, ints, reals = runtime.candidate_calls[0]
+        height, width = gray.shape
+        minimum_area, maximum_area = detector._effective_component_area_limits(height, width)
+        insets = detector._effective_edge_insets(width, height)
+        self.assertEqual(len(ints), 22)
+        self.assertEqual(len(reals), 6)
+        self.assertEqual(ints[0], detector._background_kernel(height, width))
+        self.assertEqual(ints[1:5], [200, 1, 5, 2])
+        self.assertEqual(ints[5:10], [1, 80, 80, 120, 100])
+        self.assertEqual(ints[10:14], [insets["top"], insets["bottom"], insets["left"], insets["right"]])
+        self.assertEqual(ints[14:22], [4, minimum_area, maximum_area, 1, 3, 4, 30, 11])
+        self.assertEqual(reals, [1.5, 3.0, 8.0, 0.000001, 1.4826, 2.25])
+
+        disabled = self._params(morph_iterations=0)
+        self.assertEqual(Detector202_1(params=disabled)._device_candidate_parameters(height, width)[0][2], -1)
+        unknown = self._params(morph_operation="gradient")
+        self.assertEqual(Detector202_1(params=unknown)._device_candidate_parameters(height, width)[0][2], -1)
+
+    def test_candidate_export_failure_keeps_the_resident_mask_and_host_components(self):
+        gray = self._gray()
+        params = self._params()
+        detector, runtime = self._device_detector(gray, params, fail_candidates=True)
+        defects = detector.detect(gray)
+        self.assertEqual(len(runtime.candidate_calls), 1)
+        self.assertEqual(len(runtime.resident_calls), 1)
+        self.assertEqual({d["metadata"]["component_backend"] for d in defects}, {"opencv_cpu"})
+        self.assertEqual(self._strip(defects), self._strip(Detector202_1(params=params).detect(gray)))
+
+    def test_debug_exports_and_shape_mismatches_keep_the_host_route(self):
+        gray = self._gray()
+        params = self._params()
+        debug_detector, debug_runtime = self._device_detector(gray, params)
+        debug_detector.export_debug_images = True
+        debug_detector.detect(gray)
+        self.assertEqual(debug_runtime.candidate_calls, [])
+
+        mismatched, mismatched_runtime = self._device_detector(gray, params)
+        mismatched._active_device_roi = _PlanResidentRoi(gray.shape[1] - 1, gray.shape[0])
+        mismatched.detect(gray)
+        self.assertEqual(mismatched_runtime.candidate_calls, [])
+        self.assertIn("202-1_candidate_mask", debug_detector.debug_images)
+
+
 if __name__ == "__main__":
     unittest.main()

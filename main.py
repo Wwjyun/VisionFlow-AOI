@@ -12,6 +12,11 @@ from core.pipeline import AOIPipeline
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run AOI CV inspection pipeline.")
     parser.add_argument("--gui", action="store_true", help="Start the PySide6 GUI.")
+    parser.add_argument(
+        "--sapera-diagnose",
+        action="store_true",
+        help="Run the Sapera LT field diagnosis (S1-S8) without an image or recipe.",
+    )
     parser.add_argument("--image", help="Path to input image.")
     parser.add_argument("--recipe", help="Path to YAML recipe.")
     parser.add_argument("--output", default="outputs", help="Output directory.")
@@ -19,6 +24,24 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--log-level", default=None, help="Logging level: DEBUG, INFO, WARNING, ERROR.")
     parser.add_argument("--log-dir", default=None, help="Directory for rotating AOI log files.")
     return parser.parse_args()
+
+
+def _run_sapera_diagnose() -> int:
+    """Print one manually-copyable line per step; the full report stays on this machine."""
+
+    from devices.sapera_diagnose import run_machine_sapera_diagnose
+
+    report = run_machine_sapera_diagnose()
+    print(report.summary())
+    print(f"數字短碼（優先抄這組）：{report.numeric_line()}")
+    readback = getattr(report, "readback_text", "")
+    if readback:
+        print(f"讀回值（一併抄回）：{readback}")
+    for step in report.steps:
+        print(step.line())
+    print(f"完整報告：{report.report_path}")
+    print(f"機器可讀報告：{report.log_path}")
+    return 0 if report.passed else 1
 
 
 def main() -> int:
@@ -32,6 +55,10 @@ def main() -> int:
 
         logger.info("Launching GUI")
         return run_app()
+
+    if args.sapera_diagnose:
+        logger.info("Sapera diagnosis requested")
+        return _run_sapera_diagnose()
 
     if not args.image or not args.recipe:
         logger.error("CLI run missing required --image or --recipe argument")

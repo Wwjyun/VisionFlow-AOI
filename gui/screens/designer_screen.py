@@ -25,6 +25,8 @@ from core.detector_manager import DetectorManager
 from core.gpu_runtime import GpuRuntime
 from core.parameter_schema import PARAMETER_GROUP_INNER, PARAMETER_GROUP_OUTER
 from core.recipe_manager import RecipeError
+from devices.ccd_models import CameraRecipeSettings
+from devices.ccd_recipe import camera_section, camera_settings_from_recipe
 from gui import icons
 from gui.designer_model import (
     DesignerEditorState,
@@ -32,10 +34,18 @@ from gui.designer_model import (
     DesignerRecipeValidator,
     RecipeDraft,
 )
-from gui.designer_panels import GpuSettingsPanel, PreviewPanel, RecipeInfoPanel
+from gui.designer_panels import CameraRecipePanel, GpuSettingsPanel, PreviewPanel, RecipeInfoPanel
 from gui.detector_labels import detector_zh_name
 from gui.theme import COLORS, R_MD
-from gui.widgets.common import Badge, NumStepper, Segmented, Toggle, make_param_widget, param_value
+from gui.widgets.common import (
+    Badge,
+    ElidedLabel,
+    NumStepper,
+    Segmented,
+    Toggle,
+    make_param_widget,
+    param_value,
+)
 from gui.widgets.panel import Panel
 
 # ============================================================
@@ -250,6 +260,11 @@ class DesignerScreen(QWidget):
     validation_changed = Signal(bool, str)
     yolox_model_directory_changed = Signal(str)
 
+    # Detector list column: wide enough for the enable/GPU switches plus the text,
+    # capped so a long detector name cannot squeeze the parameter form.
+    DETECTOR_LIST_MIN_WIDTH = 280
+    DETECTOR_LIST_MAX_WIDTH = 420
+
     def __init__(self, parent=None):
         super().__init__(parent)
         self._editor_state = DesignerEditorState()
@@ -292,6 +307,8 @@ class DesignerScreen(QWidget):
 
         left_layout.addWidget(self._build_recipe_info_panel())
         left_layout.addWidget(self._build_gpu_panel())
+        self.camera_panel = CameraRecipePanel()
+        left_layout.addWidget(self.camera_panel)
         left_layout.addWidget(self._build_tiling_panel())
         left_layout.addWidget(self._build_preview_panel())
         left_layout.addStretch(1)
@@ -353,41 +370,71 @@ class DesignerScreen(QWidget):
 
     def _build_gpu_panel(self) -> Panel:
         panel = GpuSettingsPanel(self._refresh_gpu_status, self._refresh_active_detector_status)
-        self.gpu_mode_combo = panel.mode_combo
+        self.gpu_panel = panel
         self.gpu_tiling_toggle = panel.tiling_toggle
         self.gpu_display_toggle = panel.display_toggle
-        self.gpu_fallback_toggle = panel.fallback_toggle
         self.gpu_dll_path_edit = panel.dll_path_edit
         self.gpu_status_label = panel.status_label
+        panel.policy_changed.connect(self._mark_dirty)
         self._refresh_gpu_status()
         return panel
 
+    def _probe_cuda(self, dll_path: str) -> tuple[bool, str, str]:
+        """Load the DLL once per path; Detector switches refresh the status without reloading it."""
+        cached = getattr(self, "_cuda_probe", None)
+        if cached is not None and cached[0] == dll_path:
+            return cached[1]
+        with GpuRuntime(dll_path) as runtime:
+            probe = (bool(runtime.available), str(runtime.device_name or ""), str(runtime.unavailable_reason or ""))
+        self._cuda_probe = (dll_path, probe)
+        return probe
+
+    def _gpu_detector_count(self) -> int:
+        enabled = getattr(self, "_enabled", {}) or {}
+        return sum(
+            1 for detector_id, use_gpu in (getattr(self, "_gpu_enabled", {}) or {}).items()
+            if use_gpu and enabled.get(detector_id, False)
+        )
+
     def _refresh_gpu_status(self) -> None:
-        mode = str(self.gpu_mode_combo.currentData() or "auto")
-        self.gpu_fallback_toggle.setEnabled(mode != "cuda")
+        panel = self.gpu_panel
+        policy = panel.policy()
         self._refresh_active_detector_status()
+        lines = [f"目前：{panel.POLICY_TITLES[policy]}"]
+        legacy = panel.legacy_note()
+        if legacy:
+            lines.append(legacy)
         yolox_status = self._yolox_cuda_provider_status()
-        if mode == "cpu":
-            self.gpu_status_label.setText(
-                "CPU mode · 不載入 CUDA DLL"
-                + (f"\n{yolox_status}" if yolox_status else "")
+        color = COLORS["text_3"]
+        if policy == panel.POLICY_CPU:
+            lines.append("不載入 CUDA DLL，Detector 的 GPU 開關不會生效。")
+        else:
+            available, device_name, reason = self._probe_cuda(
+                self.gpu_dll_path_edit.text().strip() or GpuRuntime.DEFAULT_DLL
             )
-            self.gpu_status_label.setStyleSheet(f"color: {COLORS['text_3']}; font-size: 11px;")
-            return
-        with GpuRuntime(self.gpu_dll_path_edit.text().strip() or GpuRuntime.DEFAULT_DLL) as runtime:
-            if runtime.available:
-                self.gpu_status_label.setText(
-                    f"CUDA DLL 可用 · {runtime.device_name} · mode={mode}"
-                    + (f"\n{yolox_status}" if yolox_status else "")
-                )
-                self.gpu_status_label.setStyleSheet(f"color: {COLORS['accent_text']}; font-size: 11px;")
+            if available:
+                lines.append(f"CUDA 可用 · {device_name}")
+                color = COLORS["accent_text"]
+            elif policy == panel.POLICY_GPU_FALLBACK:
+                lines.append(f"CUDA 不可用，執行時會改用 CPU · {reason}")
             else:
-                suffix = "將回退 CPU" if mode == "auto" else "執行時將明確失敗"
-                self.gpu_status_label.setText(
-                    f"CUDA DLL 不可用 · {suffix} · {runtime.unavailable_reason}"
-                    + (f"\n{yolox_status}" if yolox_status else "")
-                )
-                self.gpu_status_label.setStyleSheet(f"color: {COLORS['text_3']}; font-size: 11px;")
+                lines.append(f"CUDA 不可用，執行時會直接報錯 · {reason}")
+                color = COLORS["ng"]
+            gpu_detectors = self._gpu_detector_count()
+            if gpu_detectors:
+                lines.append(f"{gpu_detectors} 個啟用中的 Detector 已開啟 GPU。")
+            else:
+                lines.append("尚無啟用中的 Detector 開啟 GPU，檢測實際仍全部在 CPU 執行。")
+                if self.gpu_tiling_toggle.isChecked():
+                    lines.append(
+                        "「切小圖使用 GPU」需搭配 Detector 開啟 GPU 才會生效：GPU 優先時改用 CPU 切圖；"
+                        "僅 GPU 時會逐張重傳整張原圖，明顯變慢。"
+                    )
+                    color = COLORS["ng"] if policy == panel.POLICY_GPU_STRICT else color
+        if yolox_status:
+            lines.append(yolox_status)
+        self.gpu_status_label.setText("\n".join(lines))
+        self.gpu_status_label.setStyleSheet(f"color: {color}; font-size: 11px;")
 
     def _yolox_cuda_provider_status(self) -> str:
         if not self._gpu_enabled.get("yolox", False):
@@ -575,14 +622,15 @@ class DesignerScreen(QWidget):
 
             self._set_tile_config(recipe.get("tile", {}), recipe.get("assets", {}))
             gpu = recipe.get("gpu", {}) or {}
-            mode_index = self.gpu_mode_combo.findData(str(gpu.get("mode", "auto")).lower())
-            self.gpu_mode_combo.setCurrentIndex(max(0, mode_index))
+            self.gpu_panel.set_gpu_values(
+                str(gpu.get("mode", "auto")), bool(gpu.get("fallback_to_cpu", True))
+            )
             self.gpu_tiling_toggle.setChecked(bool(gpu.get("tiling", False)))
             self.gpu_display_toggle.setChecked(bool(gpu.get("display", False)))
-            self.gpu_fallback_toggle.setChecked(bool(gpu.get("fallback_to_cpu", True)))
             self.gpu_dll_path_edit.setText(str(gpu.get("dll_path", GpuRuntime.DEFAULT_DLL)))
-            self._refresh_gpu_status()
+            self.camera_panel.set_camera_settings(camera_settings_from_recipe(recipe))
             self._set_detector_config(recipe.get("detectors", {}))
+            self._refresh_gpu_status()
         finally:
             self._loading_recipe = False
         self._set_dirty(False)
@@ -643,7 +691,21 @@ class DesignerScreen(QWidget):
         valid = state != "invalid"
         self.validation_changed.emit(valid, message)
 
+    def apply_camera_settings(self, settings: CameraRecipeSettings) -> bool:
+        """Adopt camera settings applied on the CCD screen as an unsaved Recipe edit."""
+        settings = settings.normalized()
+        if self.camera_panel.camera_settings() == settings:
+            return False
+        self._loading_recipe = True
+        try:
+            self.camera_panel.set_camera_settings(settings)
+        finally:
+            self._loading_recipe = False
+        self._mark_dirty()
+        return True
+
     def set_mode(self, mode: str) -> None:
+        self.camera_panel.set_editable(mode == "admin")
         if mode == self.mode:
             return
         self.mode = mode
@@ -777,9 +839,9 @@ class DesignerScreen(QWidget):
 
         list_scroll = QScrollArea()
         list_scroll.setWidgetResizable(True)
-        list_scroll.setFixedWidth(280)
         list_scroll.setFrameShape(QFrame.Shape.NoFrame)
         list_scroll.setStyleSheet(f"QScrollArea {{ border-right: 1px solid {COLORS['border']}; }}")
+        self.detector_list_scroll = list_scroll
 
         list_widget = QWidget()
         list_layout = QVBoxLayout(list_widget)
@@ -791,6 +853,7 @@ class DesignerScreen(QWidget):
         list_layout.addStretch(1)
 
         list_scroll.setWidget(list_widget)
+        list_scroll.setFixedWidth(self._detector_list_width())
         body_layout.addWidget(list_scroll)
 
         params_scroll = QScrollArea()
@@ -835,6 +898,23 @@ class DesignerScreen(QWidget):
         self._select_detector("401-CS-AP-1")
         return panel
 
+    def _detector_list_width(self) -> int:
+        """Width that keeps every detector row (including its GPU switch) fully visible.
+
+        Rows reserve a fixed switch column on the right, so the list must be at least
+        as wide as the widest row or that column is pushed out of the viewport. The
+        width is measured from the rows themselves so it follows the active font and
+        detector metadata instead of a hard-coded guess.
+        """
+
+        rows = [widgets["row"] for widgets in self._row_widgets.values()]
+        content = max((row.sizeHint().width() for row in rows), default=0)
+        scrollbar = self.detector_list_scroll.verticalScrollBar().sizeHint().width()
+        return min(
+            max(self.DETECTOR_LIST_MIN_WIDTH, content + scrollbar),
+            self.DETECTOR_LIST_MAX_WIDTH,
+        )
+
     def _build_detector_row(self, detector_id: str) -> QWidget:
         definition = self.detector_definitions[detector_id]
 
@@ -868,13 +948,13 @@ class DesignerScreen(QWidget):
         id_label = QLabel(detector_id)
         id_label.setProperty("mono", "true")
         id_label.setStyleSheet("font-weight: 600;")
-        zh_label = QLabel(detector_zh_name(detector_id))
+        zh_label = ElidedLabel(detector_zh_name(detector_id))
         zh_label.setStyleSheet(f"color: {COLORS['text_2']}; font-size: 12px;")
         title_row.addWidget(id_label)
         title_row.addWidget(zh_label, 1)
         text_col.addLayout(title_row)
 
-        display_label = QLabel(definition["display_name"])
+        display_label = ElidedLabel(definition["display_name"])
         display_label.setStyleSheet(f"color: {COLORS['text_3']}; font-size: 11px;")
         text_col.addWidget(display_label)
 
@@ -900,10 +980,12 @@ class DesignerScreen(QWidget):
         self._refresh_enabled_count()
         if detector_id == "yolox":
             self._refresh_active_detector_status()
+        if not self._loading_recipe:
+            self._refresh_gpu_status()
 
     def _on_detector_gpu_toggled(self, detector_id: str, checked: bool) -> None:
         self._gpu_enabled[detector_id] = checked
-        if detector_id == "yolox":
+        if not self._loading_recipe:
             self._refresh_gpu_status()
 
     def _select_detector(self, detector_id: str) -> None:
@@ -1108,8 +1190,8 @@ class DesignerScreen(QWidget):
                     "yolox",
                     self._params_for_detector("yolox"),
                     use_gpu=self._gpu_enabled.get("yolox", False),
-                    gpu_mode=str(self.gpu_mode_combo.currentData() or "auto"),
-                    fallback_to_cpu=bool(self.gpu_fallback_toggle.isChecked()),
+                    gpu_mode=self.gpu_panel.gpu_values()[0],
+                    fallback_to_cpu=self.gpu_panel.gpu_values()[1],
                 )
             except (RuntimeError, TypeError, ValueError) as exc:
                 error = str(exc)
@@ -1261,8 +1343,13 @@ class DesignerScreen(QWidget):
                 detectors=detectors,
                 pixel_size_um_per_px=self._pixel_size_um_per_px(),
                 active_template_path=self._active_template_path(),
+                camera=self._camera_section(),
             )
         )
+
+    def _camera_section(self) -> dict | None:
+        settings = self.camera_panel.camera_settings()
+        return None if settings is None else camera_section(settings)
 
     def _pixel_size_um_per_px(self) -> float | None:
         text = self.pixel_size_um_edit.text().strip()
@@ -1274,12 +1361,13 @@ class DesignerScreen(QWidget):
         return value
 
     def build_gpu_config(self) -> dict:
+        mode, fallback_to_cpu = self.gpu_panel.gpu_values()
         return {
-            "mode": str(self.gpu_mode_combo.currentData() or "auto"),
+            "mode": mode,
             "tiling": bool(self.gpu_tiling_toggle.isChecked()),
             "display": bool(self.gpu_display_toggle.isChecked()),
             "dll_path": self.gpu_dll_path_edit.text().strip() or GpuRuntime.DEFAULT_DLL,
-            "fallback_to_cpu": bool(self.gpu_fallback_toggle.isChecked()),
+            "fallback_to_cpu": fallback_to_cpu,
         }
 
     def _active_template_path(self) -> str:

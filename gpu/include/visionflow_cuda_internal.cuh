@@ -9,7 +9,12 @@
 namespace visionflow_cuda {
 
 inline int runtime_error(cudaError_t error) {
-    return error == cudaSuccess ? VF_CUDA_OK : VF_CUDA_RUNTIME_ERROR_BASE + static_cast<int>(error);
+    if (error == cudaSuccess) return VF_CUDA_OK;
+    // A failed runtime call (for example cudaMalloc OOM) also stores a thread-local
+    // last error. Consume it here so the next kernel launch check cannot report the
+    // already-returned failure again; sticky context errors still persist.
+    (void)cudaGetLastError();
+    return VF_CUDA_RUNTIME_ERROR_BASE + static_cast<int>(error);
 }
 
 inline bool valid_image(

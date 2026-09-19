@@ -12,12 +12,25 @@ Release notes 位於 [`release-notes/`](release-notes/)，檔名同時標示產�
 
 目前版本：
 
+- [`visionflow-aoi-v1.7.8.md`](release-notes/visionflow-aoi-v1.7.8.md)
+- [`visionflow-aoi-v1.7.7.md`](release-notes/visionflow-aoi-v1.7.7.md)
+- [`visionflow-aoi-v1.7.6.md`](release-notes/visionflow-aoi-v1.7.6.md)
+- [`visionflow-aoi-v1.7.5.md`](release-notes/visionflow-aoi-v1.7.5.md)
+- [`visionflow-aoi-v1.7.4.md`](release-notes/visionflow-aoi-v1.7.4.md)
+- [`visionflow-aoi-v1.7.2.md`](release-notes/visionflow-aoi-v1.7.2.md)
+- [`visionflow-aoi-v1.7.1.md`](release-notes/visionflow-aoi-v1.7.1.md)
+- [`visionflow-aoi-v1.7.0.md`](release-notes/visionflow-aoi-v1.7.0.md)
+- [`visionflow-aoi-v1.6.3.md`](release-notes/visionflow-aoi-v1.6.3.md)
+- [`visionflow-aoi-v1.6.2.md`](release-notes/visionflow-aoi-v1.6.2.md)
+- [`visionflow-aoi-v1.6.1.md`](release-notes/visionflow-aoi-v1.6.1.md)
+- [`visionflow-aoi-v1.6.0.md`](release-notes/visionflow-aoi-v1.6.0.md)
 - [`visionflow-aoi-v1.5.1.md`](release-notes/visionflow-aoi-v1.5.1.md)
 - [`visionflow-aoi-v1.5.0.md`](release-notes/visionflow-aoi-v1.5.0.md)
 - [`visionflow-aoi-v1.4.0.md`](release-notes/visionflow-aoi-v1.4.0.md)
 - [`visionflow-aoi-v1.3.1.md`](release-notes/visionflow-aoi-v1.3.1.md)
 - [`visionflow-aoi-v1.3.0.md`](release-notes/visionflow-aoi-v1.3.0.md)
 - [`visionflow-aoi-v1.2.0.md`](release-notes/visionflow-aoi-v1.2.0.md)
+- [`utility-tools-v1.1.0.md`](release-notes/utility-tools-v1.1.0.md)
 - [`utility-tools-v1.0.0.md`](release-notes/utility-tools-v1.0.0.md)
 - [`traditional-cv-tuning-tool-v1.0.0.md`](release-notes/traditional-cv-tuning-tool-v1.0.0.md)
 
@@ -33,6 +46,8 @@ Release notes 位於 [`release-notes/`](release-notes/)，檔名同時標示產�
 ## Packaging 文件
 
 打包時會收錄的純文字說明位於 [`packaging/`](packaging/)。建置腳本會由此處複製到對應的 Windows 發行工件。
+
+PyInstaller 建置入口與 spec 位於根目錄的 [`../packaging/`](../packaging/)：建置腳本在 `scripts/`、spec 在 `specs/`。
 
 ## 仍保留在根目錄的文件
 

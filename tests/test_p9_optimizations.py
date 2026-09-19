@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import tempfile
 import time
@@ -15,6 +16,7 @@ from core.batch_processor import BatchInspectionProcessor
 from core.pipeline import AOIPipeline
 from core.recipe_manager import RecipeManager
 from core.report_artifacts import ReportImageEncoder
+from core.report_writers import JsonReportWriter
 from core.result_types import ExecutionBlock, GpuExecution, InspectionResult, InspectionSummary, required_keys
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -111,6 +113,15 @@ class TileParallelEquivalenceTests(unittest.TestCase):
         self.assertEqual(serial["summary"], parallel["summary"])
         self.assertEqual(normalized_tiles(serial), normalized_tiles(parallel))
 
+    def test_parallel_cpu_crops_match_serial_pipeline(self):
+        with mock.patch.dict(os.environ, {"AOI_CROP_WORKERS": "1"}):
+            serial = self._run(None)
+        with mock.patch.dict(os.environ, {"AOI_CROP_WORKERS": "4"}):
+            parallel = self._run(None)
+        self.assertEqual(serial["final_result"], parallel["final_result"])
+        self.assertEqual(serial["summary"], parallel["summary"])
+        self.assertEqual(normalized_tiles(serial), normalized_tiles(parallel))
+
 
 class WorkerAndGcPolicyTests(unittest.TestCase):
     def _processor(self, **env):
@@ -153,6 +164,24 @@ class ReporterParameterTests(unittest.TestCase):
         self.assertEqual(ReportImageEncoder.resolve_overlay_params({"overlay_jpeg_quality": 200})[2], 100)
         self.assertEqual(ReportImageEncoder.resolve_overlay_params({"overlay_jpeg_quality": "bad"})[2], 90)
 
+    def test_json_writer_persists_duration_after_prior_report_artifacts(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            context = mock.Mock()
+            context.profiler.snapshot.return_value = {"end_to_end_sec": 1.2344}
+            context.result = {"execution": {}, "tiles": []}
+            context.paths.json = Path(tmp)
+            context.base_name = "inspection"
+            context.outputs = {"overlay": "overlay.png", "csv": "result.csv"}
+            context.artifacts.json.json_safe_result.side_effect = (
+                lambda result, outputs: {**result, "outputs": dict(outputs)}
+            )
+
+            JsonReportWriter().write(context)
+            payload = json.loads((Path(tmp) / "inspection.json").read_text(encoding="utf-8"))
+
+        self.assertEqual(payload["duration_sec"], 1.234)
+        self.assertEqual(payload["outputs"], {"overlay": "overlay.png", "csv": "result.csv"})
+
 
 class PipelineOutputTests(unittest.TestCase):
     def _run(self, overrides):
@@ -194,6 +223,30 @@ class PipelineOutputTests(unittest.TestCase):
         self.assertTrue(paths)
         self.assertTrue(all(exist))
         self.assertTrue(all("_debug_images" not in tile for tile in result["tiles"]))
+
+    def test_pipeline_duration_is_finalized_after_report_writers_return(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            image_path = root / "input.png"
+            image_path.write_bytes(cv2.imencode(".png", multi_tile_image())[1].tobytes())
+
+            def delayed_report(*_args, **_kwargs):
+                time.sleep(0.04)
+                return {}
+
+            with mock.patch("core.pipeline.Reporter.write", side_effect=delayed_report):
+                result = AOIPipeline(
+                    CIRCLE_RECIPE,
+                    root / "out",
+                    output_overrides=NO_FILE_OUTPUT,
+                ).run(image_path)
+
+        performance = result["execution"]["performance"]
+        self.assertGreaterEqual(performance["stages_sec"]["reporting_total"], 0.035)
+        self.assertGreaterEqual(result["duration_sec"], 0.035)
+        self.assertAlmostEqual(
+            result["duration_sec"], performance["end_to_end_sec"], delta=0.02
+        )
 
 
 class ResultSchemaContractTests(unittest.TestCase):

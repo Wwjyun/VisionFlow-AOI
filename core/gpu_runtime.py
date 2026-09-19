@@ -9,10 +9,12 @@ from pathlib import Path
 
 import numpy as np
 from core.gpu_abi import (
+    VfCudaContextMemoryStatsV1 as _VfCudaContextMemoryStatsV1,
     VfCudaTimingsV1 as _VfCudaTimingsV1, VfDagOutputV1 as _VfDagOutputV1,
     VfDagPlanDescV1 as _VfDagPlanDescV1, VfPlanDescV1 as _VfPlanDescV1,
     VfPlanOperatorV1 as _VfPlanOperatorV1, VfRoiV1 as _VfRoiV1,
 )
+from core.gpu_crossover import PlanCrossoverPolicy
 from core.gpu_metrics import GpuPerformanceRecorder
 from core.gpu_plan_descriptors import GpuPlanDescriptorBuilder
 from core.gpu_runtime_components import (
@@ -25,6 +27,17 @@ from core.gpu_runtime_components import (
 
 class GpuRuntimeError(RuntimeError):
     pass
+
+
+CUDA_RUNTIME_ERROR_BASE = 1000
+# Native error codes the bridge exposes to callers that must restart a step on the CPU reference.
+CUDA_ERROR_UNSUPPORTED = 8
+# cv2.RETR_EXTERNAL / cv2.RETR_LIST, which the contour export reuses as its mode codes.
+CUDA_CONTOURS_EXTERNAL = 0
+CUDA_CONTOURS_LIST = 1
+CONTOUR_MODES = {"list": CUDA_CONTOURS_LIST, "external": CUDA_CONTOURS_EXTERNAL}
+# cudaError_t values that leave the process CUDA context unusable until the process exits.
+STICKY_CUDA_ERRORS = frozenset({214, 220, 226, 700, 702, 709, 710, 714, 715, 716, 717, 718, 719})
 
 
 @dataclass(frozen=True, slots=True)
@@ -128,6 +141,7 @@ class GpuRuntime:
         self.device_name = ""
         self.compute_capability = ""
         self.unavailable_reason = ""
+        self.device_lost_reason = ""
         self.last_error = ""
         self.fused_unavailable_reason = ""
         self.native_plan_unavailable_reason = ""
@@ -135,13 +149,17 @@ class GpuRuntime:
         self._performance_recorder = GpuPerformanceRecorder()
         self._performance = self._performance_recorder.values
         self._capture_native_cumulative = False
+        # Set by _load_optional_gaussian_blur_f32(); False means the loaded DLL ignores sigma.
+        self._gaussian_f32_sigma_supported = False
+        # Strict CUDA mode must never route a CUDA-capable plan to CPU.
+        self.crossover_policy = PlanCrossoverPolicy() if self.fallback_to_cpu else None
         if enabled:
             self._load()
             self._performance["load_sec"] = time.perf_counter() - load_started
 
     @property
     def available(self) -> bool:
-        return self._dll is not None and self.device_count > 0
+        return self._dll is not None and self.device_count > 0 and not self.device_lost_reason
 
     @property
     def backend(self) -> str:
@@ -164,8 +182,56 @@ class GpuRuntime:
         return self._capabilities.resident_roi
 
     @property
+    def supports_file_order_upload(self) -> bool:
+        return self._capabilities.file_order_upload
+
+    @property
+    def supports_host_register(self) -> bool:
+        return self._capabilities.host_register
+
+    @property
     def supports_roi_batch(self) -> bool:
         return self._capabilities.roi_batch
+
+    @property
+    def supports_template_match(self) -> bool:
+        return self._capabilities.template_match
+
+    @property
+    def supports_find_contours(self) -> bool:
+        return self._capabilities.find_contours
+
+    @property
+    def supports_exact_median(self) -> bool:
+        return self._capabilities.exact_median
+
+    @property
+    def supports_gaussian_blur_f32(self) -> bool:
+        return self._capabilities.gaussian_blur_f32
+
+    @property
+    def supports_gaussian_blur_f32_roi(self) -> bool:
+        return self._capabilities.gaussian_blur_f32_roi
+
+    @property
+    def supports_gaussian_f32_sigma(self) -> bool:
+        """Whether the float32 Gaussian export honours an explicit sigma (load-time probe)."""
+        return self._capabilities.gaussian_blur_f32_sigma
+
+    @property
+    def supports_cnr_mask_f32(self) -> bool:
+        """Optional device-side 202-CS-SN-1 residual threshold and candidate mask export."""
+        return self._capabilities.cnr_mask_f32
+
+    @property
+    def supports_cnr_mask_u8_roi(self) -> bool:
+        """Optional 202 CNR export that reads the current resident uint8 ROI."""
+        return self._capabilities.cnr_mask_u8_roi
+
+    @property
+    def supports_cnr_candidates_u8_roi(self) -> bool:
+        """Optional 202 export that also keeps morphology, components and ring CNR on the device."""
+        return self._capabilities.cnr_candidates_u8_roi
 
     def status(self, requested: bool = False) -> dict:
         active = bool(requested and self.available and not self.last_error)
@@ -182,8 +248,19 @@ class GpuRuntime:
                 "native_plan": self.supports_native_plan,
                 "native_dag_plan": self.supports_native_dag_plan,
                 "resident_roi": self.supports_resident_roi,
+                "file_order_upload": self.supports_file_order_upload,
+                "host_register": self.supports_host_register,
                 "roi_batch": self.supports_roi_batch,
                 "fused_401_2": self.supports_fused_401_2,
+                "template_match": self.supports_template_match,
+                "find_contours": self.supports_find_contours,
+                "exact_median": self.supports_exact_median,
+                "gaussian_blur_f32": self.supports_gaussian_blur_f32,
+                "gaussian_blur_f32_roi": self.supports_gaussian_blur_f32_roi,
+                "gaussian_blur_f32_sigma": self.supports_gaussian_f32_sigma,
+                "cnr_mask_f32": self.supports_cnr_mask_f32,
+                "cnr_mask_u8_roi": self.supports_cnr_mask_u8_roi,
+                "cnr_candidates_u8_roi": self.supports_cnr_candidates_u8_roi,
             },
             "queue": {
                 "depth": self.queue_depth,
@@ -330,21 +407,34 @@ class GpuRuntime:
                 lock_acquired - queued,
             )
         if result != 0:
-            raise GpuRuntimeError(
-                f"{function_name} failed with CUDA DLL error {result}: {self._error_message(result)}"
-            )
+            raise self._native_error(function_name, result)
         return output
 
     def upload_image(self, image: np.ndarray) -> GpuResidentImage:
         if not self.supports_resident_roi:
             raise GpuRuntimeError("CUDA DLL has no resident image/ROI exports")
-        source = self._u8_image(image, channels=(1, 3))
+        source = self._u8_image(image, channels=(1, 3), contiguous=False)
         channels = 1 if source.ndim == 2 else int(source.shape[2])
+        packed_columns = source.strides[1] == (1 if source.ndim == 2 else channels)
+        packed_channels = source.ndim == 2 or source.strides[2] == 1
+        if (
+            not packed_columns
+            or not packed_channels
+            or abs(int(source.strides[0])) < int(source.shape[1]) * channels
+            or (int(source.strides[0]) < 0 and not self.supports_file_order_upload)
+        ):
+            source = np.ascontiguousarray(source)
+        function_name = (
+            "vf_context_upload_u8_file_order"
+            if int(source.strides[0]) < 0
+            else "vf_context_upload_u8"
+        )
+        function = getattr(self._dll, function_name)
         generation = ctypes.c_uint64()
         queued = time.perf_counter()
         with self._queue_slots, self._lock:
             lock_acquired = time.perf_counter()
-            result = int(self._dll.vf_context_upload_u8(
+            result = int(function(
                 self._context,
                 source.ctypes.data_as(ctypes.POINTER(ctypes.c_uint8)),
                 int(source.shape[1]), int(source.shape[0]), int(source.strides[0]), channels,
@@ -352,18 +442,674 @@ class GpuRuntime:
             ))
             completed = time.perf_counter()
             self._record_performance(
-                "vf_context_upload_u8", int(source.nbytes), 0,
+                function_name, int(source.nbytes), 0,
                 completed - lock_acquired, lock_acquired - queued,
             )
             if result == 0 and self._capture_native_cumulative:
                 self._record_native_performance_unlocked()
         if result != 0 or generation.value == 0:
-            raise GpuRuntimeError(
-                f"vf_context_upload_u8 failed with CUDA DLL error {result}: {self._error_message(result)}"
-            )
+            raise self._native_error(function_name, result)
         return GpuResidentImage(
             self, int(generation.value), int(source.shape[1]), int(source.shape[0]), channels
         )
+
+    def register_host_buffer(self, buffer: np.ndarray) -> None:
+        """Page-lock a caller-owned contiguous ``uint8`` buffer used as a later upload source.
+
+        The caller must keep ``buffer`` alive and call ``unregister_host_buffer`` before it is
+        released. Registration only changes how uploads copy, never the uploaded pixels.
+        """
+        array = self._host_buffer(buffer)
+        with self._lock:
+            result = int(self._dll.vf_host_register_u8(
+                self._context, array.ctypes.data_as(ctypes.POINTER(ctypes.c_uint8)), int(array.nbytes)
+            ))
+        if result != 0:
+            raise self._native_error("vf_host_register_u8", result)
+
+    def unregister_host_buffer(self, buffer: np.ndarray) -> None:
+        array = self._host_buffer(buffer)
+        with self._lock:
+            result = int(self._dll.vf_host_unregister_u8(
+                self._context, array.ctypes.data_as(ctypes.POINTER(ctypes.c_uint8))
+            ))
+        if result != 0:
+            raise self._native_error("vf_host_unregister_u8", result)
+
+    def _host_buffer(self, buffer: np.ndarray) -> np.ndarray:
+        if not self.supports_host_register:
+            raise GpuRuntimeError("CUDA DLL has no host buffer registration exports")
+        array = buffer if isinstance(buffer, np.ndarray) else None
+        if array is None or array.dtype != np.uint8 or array.size == 0 or not array.flags.c_contiguous:
+            raise GpuRuntimeError("Host buffer registration requires a non-empty contiguous uint8 array")
+        return array
+
+    def match_template_gray(
+        self,
+        resident: "GpuResidentImage",
+        search_rect: tuple[int, int, int, int],
+        template_gray: np.ndarray,
+    ) -> dict:
+        """Locate a gray template inside the resident image without uploading pixels again.
+
+        Returns the match rectangle in full-image coordinates plus the TM_CCOEFF_NORMED score.
+        Only the rectangle and score cross PCIe. Raises GpuRuntimeError on a missing export or a
+        flat template, which lets the caller restart localization on the CPU.
+        """
+        if not self.supports_template_match:
+            raise GpuRuntimeError("CUDA DLL has no Template Anchor Grid localization export")
+        if resident is None or resident.runtime is not self:
+            raise GpuRuntimeError("Template match requires a resident image owned by this runtime")
+        template = np.ascontiguousarray(template_gray, dtype=np.uint8)
+        if template.ndim != 2:
+            raise GpuRuntimeError("Template match requires a single-channel template")
+        search_x, search_y, search_width, search_height = (int(value) for value in search_rect)
+        if search_width <= 0 or search_height <= 0:
+            raise GpuRuntimeError(f"Invalid template match search rect: {search_rect}")
+        match = np.zeros(4, dtype=np.int32)
+        score = ctypes.c_float(0.0)
+        queued = time.perf_counter()
+        with self._queue_slots, self._lock:
+            lock_acquired = time.perf_counter()
+            result = int(self._dll.vf_match_template_gray_u8(
+                self._context,
+                ctypes.c_uint64(resident.generation),
+                search_x, search_y, search_width, search_height,
+                template.ctypes.data_as(ctypes.POINTER(ctypes.c_uint8)),
+                int(template.shape[1]), int(template.shape[0]),
+                match.ctypes.data_as(ctypes.POINTER(ctypes.c_int)),
+                ctypes.byref(score),
+            ))
+            completed = time.perf_counter()
+            self._record_performance(
+                "vf_match_template_gray_u8", int(template.nbytes), int(match.nbytes + 4),
+                completed - lock_acquired, lock_acquired - queued,
+            )
+        if result != 0:
+            raise self._native_error("vf_match_template_gray_u8", result)
+        return {
+            "x": int(match[0]),
+            "y": int(match[1]),
+            "width": int(match[2]),
+            "height": int(match[3]),
+            "score": float(score.value),
+        }
+
+    def find_contours_gray(self, mask: np.ndarray, mode, region=None) -> list[np.ndarray]:
+        """Reproduce ``cv2.findContours(mask, mode, cv2.CHAIN_APPROX_SIMPLE)`` on the device.
+
+        ``mask`` is the single-channel ``uint8`` *binary* mask whose non-zero pixels are foreground;
+        it is uploaded as the context's resident image (1 byte per pixel, never the 3 bytes per
+        pixel of the colour image), and only the contour result is copied back. ``mode`` accepts
+        ``"list"``/``"external"`` or the OpenCV constants ``cv2.RETR_LIST``/``cv2.RETR_EXTERNAL``.
+        ``region`` optionally restricts the trace to ``(x, y, width, height)`` of the mask; the
+        returned points are then 0-based within that region, exactly like ``cv2.findContours`` on
+        the same sub-array (the region is treated as an isolated image with a zero border).
+
+        Returns the contours in OpenCV order as ``(N, 1, 2)`` ``int32`` arrays. An unsupported
+        semantic (a colour resident image, or a too-small output buffer) raises ``GpuRuntimeError``
+        with ``error_code`` set, so the caller restarts the step on the CPU reference instead of
+        receiving a partial or reinterpreted result.
+        """
+        if not self.supports_find_contours:
+            raise GpuRuntimeError("CUDA DLL has no contour trace export (vf_find_contours_u8)")
+        source = self._u8_image(mask, channels=(1,))
+        mode_code = self._contour_mode_code(mode)
+        if region is None:
+            x, y, width, height = 0, 0, int(source.shape[1]), int(source.shape[0])
+        else:
+            x, y, width, height = (int(value) for value in region)
+            if (
+                x < 0 or y < 0 or width <= 0 or height <= 0
+                or x + width > source.shape[1] or y + height > source.shape[0]
+            ):
+                raise GpuRuntimeError(
+                    f"Contour region is out of bounds: {region}, mask={source.shape}"
+                )
+        # The mask becomes the resident image, so the trace reads a device ROI with no further H2D.
+        resident = self.upload_image(source)
+        contour_count = ctypes.c_int(0)
+        point_count = ctypes.c_int(0)
+        offsets = np.empty(0, dtype=np.int32)
+        points = np.empty(0, dtype=np.int32)
+        queued = time.perf_counter()
+        with self._queue_slots, self._lock:
+            lock_acquired = time.perf_counter()
+            result = int(self._dll.vf_find_contours_u8(
+                self._context,
+                ctypes.c_uint64(resident.generation),
+                x, y, width, height, mode_code,
+                ctypes.byref(contour_count), ctypes.byref(point_count),
+            ))
+            if result == 0:
+                # The capacities are exactly what the trace reported, so a short buffer is a bug
+                # here rather than a silent truncation; the native side rejects it either way.
+                offsets = np.empty(int(contour_count.value) + 1, dtype=np.int32)
+                points = np.empty(max(int(point_count.value), 1) * 2, dtype=np.int32)
+                result = int(self._dll.vf_find_contours_download(
+                    self._context,
+                    offsets.ctypes.data_as(ctypes.POINTER(ctypes.c_int32)), int(offsets.size),
+                    points.ctypes.data_as(ctypes.POINTER(ctypes.c_int32)), int(point_count.value),
+                ))
+            completed = time.perf_counter()
+            self._record_performance(
+                "vf_find_contours_u8", int(source.nbytes),
+                int(offsets.nbytes + points.nbytes),
+                completed - lock_acquired, lock_acquired - queued,
+            )
+        if result != 0:
+            raise self._native_error("vf_find_contours_u8", result)
+        return [
+            points[int(offsets[index]) * 2 : int(offsets[index + 1]) * 2].reshape(-1, 1, 2).copy()
+            for index in range(int(contour_count.value))
+        ]
+
+    @staticmethod
+    def _contour_mode_code(mode) -> int:
+        """Map the reference's mode names or the OpenCV constants onto the native mode code."""
+        if isinstance(mode, str):
+            key = mode.strip().lower()
+            if key not in CONTOUR_MODES:
+                raise GpuRuntimeError(f"Contour mode must be one of {sorted(CONTOUR_MODES)}, got {mode!r}")
+            return CONTOUR_MODES[key]
+        code = int(mode)
+        if code not in (CUDA_CONTOURS_EXTERNAL, CUDA_CONTOURS_LIST):
+            raise GpuRuntimeError(f"Contour mode must be 0 (external) or 1 (list), got {mode!r}")
+        return code
+
+    def median_f32(self, values: np.ndarray) -> np.float32:
+        """Return the bit-exact ``np.median`` of a float32 array.
+
+        Every value is uploaded once, mapped to a monotone-orderable order key, radix-sorted on the
+        device, and only the one or two middle keys are copied back; the even-count average is a
+        float32 add and a float32 divide by two on the host, which is what ``np.median`` computes.
+        The operand is only read, never written, and the result is deterministic.
+
+        ``values`` must already be float32 so the caller, not this bridge, decides any narrowing.
+        An unsupported DLL raises ``GpuRuntimeError`` so the caller can restart on the CPU
+        reference instead of receiving an approximate median. A NaN anywhere in ``values`` returns
+        NaN, mirroring NumPy; compare that case with a NaN-aware test because ``NaN != NaN``.
+        """
+        if not self.supports_exact_median:
+            raise GpuRuntimeError("CUDA DLL has no exact median export (vf_median_f32)")
+        array = np.asarray(values)
+        if array.dtype != np.float32:
+            raise GpuRuntimeError(
+                f"vf_median_f32 requires float32 input, got {array.dtype}; "
+                "convert explicitly so the narrowing is the caller's decision"
+            )
+        source = np.ascontiguousarray(array).reshape(-1)
+        if source.size == 0:
+            raise GpuRuntimeError("vf_median_f32 requires at least one value")
+        median_value = ctypes.c_float(0.0)
+        queued = time.perf_counter()
+        with self._queue_slots, self._lock:
+            lock_acquired = time.perf_counter()
+            result = int(self._dll.vf_median_f32(
+                self._context,
+                source.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+                ctypes.c_longlong(int(source.size)),
+                ctypes.byref(median_value),
+            ))
+            completed = time.perf_counter()
+            self._record_performance(
+                "vf_median_f32", int(source.nbytes), int(ctypes.sizeof(ctypes.c_float)),
+                completed - lock_acquired, lock_acquired - queued,
+            )
+        if result != 0:
+            raise self._native_error("vf_median_f32", result)
+        return np.float32(median_value.value)
+
+    def cnr_mask_f32(
+        self,
+        image: np.ndarray,
+        background: np.ndarray,
+        *,
+        sigma_multiplier: float,
+        threshold_floor: float,
+        absolute_floor: float,
+        mad_scale: float,
+        candidate_value: int = 255,
+    ) -> dict[str, object]:
+        """Run the 202-CS-SN-1 residual threshold and candidate mask on the device.
+
+        The two operands are uploaded once each and every derived array - the residual, its absolute
+        deviation, the two exact medians, the threshold and the mask - is computed on the device, so
+        no derived array is materialised on the host. Both operands must already be float32;
+        conversion is the caller's decision, exactly as for ``median_f32`` and ``gaussian_blur_f32``.
+        Non-contiguous views are accepted and passed through by their byte strides instead of being
+        copied, so a rectangular ROI of a wider plane costs nothing extra.
+
+        Returns a mapping with the keys ``residual_median``, ``mad``, ``threshold`` and ``mask`` (the
+        shape ``execute_dag_plan`` uses for a multi-output step, so a caller names what it reads).
+        The two medians are the
+        device's bit-exact ``np.median`` of the residual and of its absolute deviation (NaN if that
+        operand held a NaN: compare NaN-aware). ``threshold`` is the double the detector's
+        ``residual_threshold`` is, and ``mask`` is a uint8 array of the same shape whose bytes equal
+        ``((np.abs(residual - residual_median) > threshold).astype(np.uint8) * candidate_value)``.
+
+        An unsupported DLL or a rejected request raises ``GpuRuntimeError`` so the caller can restart
+        the whole step on the CPU reference instead of receiving an approximate result. The native
+        document in ``gpu/include/visionflow_cuda.h`` states the exact contracts and the refusal
+        cases (null pointers, non-positive shape, a candidate value outside 0..255, a plane too large
+        for the radix-sort offset type).
+        """
+        if not self.supports_cnr_mask_f32:
+            raise GpuRuntimeError("CUDA DLL has no CNR mask export (vf_cnr_mask_f32)")
+        source = self._f32_operand(image, "vf_cnr_mask_f32")
+        reference = self._f32_operand(background, "vf_cnr_mask_f32")
+        if source.shape != reference.shape:
+            raise GpuRuntimeError(
+                f"vf_cnr_mask_f32 requires image and background of the same shape, got "
+                f"{source.shape} and {reference.shape}"
+            )
+        candidate = int(candidate_value)
+        if candidate < 0 or candidate > 255:
+            raise GpuRuntimeError(
+                f"vf_cnr_mask_f32 candidate_value must be 0..255, got {candidate_value!r}"
+            )
+        height, width = int(source.shape[0]), int(source.shape[1])
+        mask = np.empty((height, width), dtype=np.uint8)
+        residual_median = ctypes.c_float(0.0)
+        mad = ctypes.c_float(0.0)
+        threshold = ctypes.c_double(0.0)
+        input_bytes = int(source.nbytes + reference.nbytes)
+        # Only the mask plane crosses PCIe: the two medians and the threshold are decoded on the host
+        # and written straight into the ctypes scalars, so they add no transfer.
+        output_bytes = int(mask.nbytes)
+        queued = time.perf_counter()
+        with self._queue_slots, self._lock:
+            lock_acquired = time.perf_counter()
+            result = int(self._dll.vf_cnr_mask_f32(
+                self._context,
+                source.ctypes.data_as(ctypes.POINTER(ctypes.c_float)), int(source.strides[0]),
+                reference.ctypes.data_as(ctypes.POINTER(ctypes.c_float)), int(reference.strides[0]),
+                width, height,
+                ctypes.c_double(float(sigma_multiplier)),
+                ctypes.c_double(float(threshold_floor)),
+                ctypes.c_double(float(absolute_floor)),
+                ctypes.c_double(float(mad_scale)),
+                candidate,
+                ctypes.byref(residual_median), ctypes.byref(mad), ctypes.byref(threshold),
+                mask.ctypes.data_as(ctypes.POINTER(ctypes.c_uint8)),
+                ctypes.c_longlong(int(mask.size)),
+            ))
+            completed = time.perf_counter()
+            self._record_performance(
+                "vf_cnr_mask_f32", input_bytes, output_bytes,
+                completed - lock_acquired, lock_acquired - queued,
+            )
+        if result != 0:
+            raise self._native_error("vf_cnr_mask_f32", result)
+        return {
+            "residual_median": np.float32(residual_median.value),
+            "mad": np.float32(mad.value),
+            "threshold": float(threshold.value),
+            "mask": mask,
+        }
+
+    def cnr_mask_u8_roi(
+        self,
+        device_roi: GpuDeviceRoi,
+        *,
+        kernel_size: int,
+        sigma: float,
+        sigma_multiplier: float,
+        threshold_floor: float,
+        absolute_floor: float,
+        mad_scale: float,
+        candidate_value: int = 255,
+    ) -> dict[str, object]:
+        """Run the 202 Gaussian/residual/MAD/mask chain from a resident uint8 ROI.
+
+        Only the uint8 candidate mask and three scalar diagnostics return to the host. The gray
+        conversion, float32 Gaussian and residual operands remain on the device.
+        """
+        if not self.supports_cnr_mask_u8_roi:
+            raise GpuRuntimeError(
+                "CUDA DLL has no resident CNR mask export (vf_cnr_mask_u8_roi)"
+            )
+        if not isinstance(device_roi, GpuDeviceRoi) or device_roi.image.runtime is not self:
+            raise GpuRuntimeError("vf_cnr_mask_u8_roi requires an ROI from this runtime")
+        self._require_gaussian_f32_sigma(sigma)
+        candidate = int(candidate_value)
+        if candidate < 0 or candidate > 255:
+            raise GpuRuntimeError(
+                f"vf_cnr_mask_u8_roi candidate_value must be 0..255, got {candidate_value!r}"
+            )
+        width, height = int(device_roi.width), int(device_roi.height)
+        mask = np.empty((height, width), dtype=np.uint8)
+        residual_median = ctypes.c_float(0.0)
+        mad = ctypes.c_float(0.0)
+        threshold = ctypes.c_double(0.0)
+        queued = time.perf_counter()
+        with self._queue_slots, self._lock:
+            lock_acquired = time.perf_counter()
+            result = int(self._dll.vf_cnr_mask_u8_roi(
+                self._context,
+                ctypes.c_uint64(int(device_roi.image.generation)),
+                int(device_roi.x), int(device_roi.y), width, height,
+                int(kernel_size), ctypes.c_double(float(sigma)),
+                ctypes.c_double(float(sigma_multiplier)),
+                ctypes.c_double(float(threshold_floor)),
+                ctypes.c_double(float(absolute_floor)),
+                ctypes.c_double(float(mad_scale)),
+                candidate,
+                ctypes.byref(residual_median), ctypes.byref(mad), ctypes.byref(threshold),
+                mask.ctypes.data_as(ctypes.POINTER(ctypes.c_uint8)),
+                ctypes.c_longlong(int(mask.size)),
+            ))
+            completed = time.perf_counter()
+            self._record_performance(
+                "vf_cnr_mask_u8_roi", 0, int(mask.nbytes),
+                completed - lock_acquired, lock_acquired - queued,
+            )
+        if result != 0:
+            raise self._native_error("vf_cnr_mask_u8_roi", result)
+        return {
+            "residual_median": np.float32(residual_median.value),
+            "mad": np.float32(mad.value),
+            "threshold": float(threshold.value),
+            "mask": mask,
+        }
+
+    _VF_CUDA_UNSUPPORTED = 8
+    CNR_CANDIDATE_INT_PARAMS = 22
+    CNR_CANDIDATE_REAL_PARAMS = 6
+    CNR_CANDIDATE_STATUS = {
+        1: "a ring background is below min_background_pixels",
+        2: "more candidates than the record capacity",
+        3: "the ring windows exceed the device gather limit",
+    }
+
+    def cnr_candidates_u8_roi(
+        self,
+        device_roi: GpuDeviceRoi,
+        int_params,
+        real_params,
+        *,
+        candidate_capacity: int = 4096,
+    ) -> dict[str, object]:
+        """Run 202 candidate extraction on a resident ROI and download one record per candidate.
+
+        ``int_params``/``real_params`` follow the layout documented for ``vf_cnr_candidates_u8_roi``
+        in ``gpu/include/visionflow_cuda.h``. A record capacity that turns out too small is retried
+        once with the exact count the export reports. Any other unsupported case raises
+        ``GpuRuntimeError`` carrying ``error_code`` and ``candidate_status`` so the caller keeps its
+        host path for the whole step.
+        """
+        if not self.supports_cnr_candidates_u8_roi:
+            raise GpuRuntimeError(
+                "CUDA DLL has no resident CNR candidate export (vf_cnr_candidates_u8_roi)"
+            )
+        if not isinstance(device_roi, GpuDeviceRoi) or device_roi.image.runtime is not self:
+            raise GpuRuntimeError("vf_cnr_candidates_u8_roi requires an ROI from this runtime")
+        ints = np.ascontiguousarray(int_params, dtype=np.int32)
+        reals = np.ascontiguousarray(real_params, dtype=np.float64)
+        if ints.shape != (self.CNR_CANDIDATE_INT_PARAMS,) or reals.shape != (self.CNR_CANDIDATE_REAL_PARAMS,):
+            raise GpuRuntimeError(
+                "vf_cnr_candidates_u8_roi expects "
+                f"{self.CNR_CANDIDATE_INT_PARAMS} int and {self.CNR_CANDIDATE_REAL_PARAMS} real parameters"
+            )
+        self._require_gaussian_f32_sigma(float(reals[0]))
+        capacity = max(1, int(candidate_capacity))
+        for attempt in range(2):
+            records = np.zeros((capacity, 7), dtype=np.int32)
+            stats = np.zeros((capacity, 3), dtype=np.float32)
+            residual_median = ctypes.c_float(0.0)
+            mad = ctypes.c_float(0.0)
+            threshold = ctypes.c_double(0.0)
+            count = ctypes.c_int(0)
+            components = ctypes.c_int(0)
+            status = ctypes.c_int(0)
+            queued = time.perf_counter()
+            with self._queue_slots, self._lock:
+                lock_acquired = time.perf_counter()
+                result = int(self._dll.vf_cnr_candidates_u8_roi(
+                    self._context,
+                    ctypes.c_uint64(int(device_roi.image.generation)),
+                    int(device_roi.x), int(device_roi.y), int(device_roi.width), int(device_roi.height),
+                    ints.ctypes.data_as(ctypes.POINTER(ctypes.c_int32)), int(ints.size),
+                    reals.ctypes.data_as(ctypes.POINTER(ctypes.c_double)), int(reals.size),
+                    ctypes.byref(residual_median), ctypes.byref(mad), ctypes.byref(threshold),
+                    records.ctypes.data_as(ctypes.POINTER(ctypes.c_int32)),
+                    stats.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+                    capacity,
+                    ctypes.byref(count), ctypes.byref(components), ctypes.byref(status),
+                ))
+                completed = time.perf_counter()
+                # Only candidate records cross PCIe; the parameter arrays are read by the host side.
+                record_bytes = records.itemsize * 7 + stats.itemsize * 3
+                self._record_performance(
+                    "vf_cnr_candidates_u8_roi", 0,
+                    int(min(max(count.value, 0), capacity)) * record_bytes if result == 0 else 0,
+                    completed - lock_acquired, lock_acquired - queued,
+                )
+            if result == self._VF_CUDA_UNSUPPORTED and status.value == 2 and attempt == 0:
+                capacity = max(capacity + 1, int(count.value))
+                continue
+            if result != 0:
+                error = self._native_error("vf_cnr_candidates_u8_roi", result)
+                error.candidate_status = int(status.value)
+                reason = self.CNR_CANDIDATE_STATUS.get(int(status.value))
+                if reason:
+                    error.args = (f"{error.args[0]} ({reason})",)
+                raise error
+            kept = int(count.value)
+            return {
+                "residual_median": np.float32(residual_median.value),
+                "mad": np.float32(mad.value),
+                "threshold": float(threshold.value),
+                "records": records[:kept].copy(),
+                "stats": stats[:kept].copy(),
+                "component_count": int(components.value),
+            }
+        raise GpuRuntimeError("vf_cnr_candidates_u8_roi record capacity retry failed")
+
+    @staticmethod
+    def _f32_operand(image: np.ndarray, function_name: str) -> np.ndarray:
+        """Validate a single-channel float32 operand while preserving its byte strides.
+
+        Unlike ``_f32_image`` this does not force contiguity: the native CNR export takes byte
+        strides, so a non-contiguous ROI is passed through instead of being copied on the host. The
+        dtype must already be float32 so the caller, not this bridge, decides any narrowing.
+        """
+        array = np.asarray(image)
+        if array.dtype != np.float32:
+            raise GpuRuntimeError(
+                f"{function_name} requires float32 input, got {array.dtype}; "
+                "convert explicitly so the narrowing is the caller's decision"
+            )
+        if array.ndim != 2 or array.size == 0:
+            raise GpuRuntimeError(
+                f"{function_name} requires a non-empty 2-D single-channel image, got {array.shape}"
+            )
+        if int(array.strides[0]) < int(array.shape[1]) * 4:
+            raise GpuRuntimeError(
+                f"{function_name} requires a row-major float32 image, got strides {array.strides}"
+            )
+        return array
+
+    def gaussian_blur_f32(
+        self, image: np.ndarray, kernel_size: int, sigma: float = 0.0
+    ) -> np.ndarray:
+        """Return ``cv2.GaussianBlur(float32_image, (k, k), sigma)`` computed on the device.
+
+        The operand is a single-channel float32 host array; it is uploaded once (2D copy), blurred
+        by the separable float32 operator with ``reflect101`` borders, and copied back. The result
+        matches the OpenCV reference within the tolerance documented on the native export (a few
+        float32 ulps: <= 2.0e-4 absolute for gray/residual values in [0, 255]), which was shown not
+        to change the 202-CS-SN-1 final output on the widened scene matrix.
+
+        ``sigma`` follows cv2 exactly: a positive value is the standard deviation of both axes and
+        zero or a negative value selects OpenCV's automatic sigma rule. It is passed as a double,
+        so the caller's value is never narrowed here.
+
+        ``kernel_size`` must be one of the odd sizes in [3, 127] that the native export verifies;
+        an unsupported size raises ``GpuRuntimeError`` with ``error_code`` set to
+        ``CUDA_ERROR_UNSUPPORTED`` so the caller can restart the step on the CPU reference. The
+        input dtype must already be float32 so the caller, not this bridge, decides any narrowing.
+        """
+        if not self.supports_gaussian_blur_f32:
+            raise GpuRuntimeError(
+                "CUDA DLL has no float32 Gaussian export (vf_gaussian_blur_f32)"
+            )
+        self._require_gaussian_f32_sigma(sigma)
+        source = self._f32_image(image)
+        output = np.empty_like(source)
+        result = self._call_gaussian_f32(
+            "vf_gaussian_blur_f32",
+            (
+                source.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+                int(source.shape[1]), int(source.shape[0]), int(source.strides[0]),
+                output.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+                int(output.strides[0]),
+                int(kernel_size),
+                ctypes.c_double(float(sigma)),
+            ),
+            int(source.nbytes),
+            int(output.nbytes),
+        )
+        if result != 0:
+            raise self._native_error("vf_gaussian_blur_f32", result)
+        return output
+
+    def gaussian_blur_f32_roi(
+        self,
+        image: np.ndarray,
+        x: int,
+        y: int,
+        width: int,
+        height: int,
+        kernel_size: int,
+        sigma: float = 0.0,
+    ) -> np.ndarray:
+        """Blur one rectangle of a float32 image on the device, as an isolated image.
+
+        Equal to ``cv2.GaussianBlur(image[y:y+height, x:x+width], (kernel_size, kernel_size),
+        sigma)``: borders reflect inside the rectangle and pixels outside it are never read, so a
+        caller can blur a sub-window without uploading the whole plane. Only the rectangle crosses
+        PCIe.
+        """
+        if not self.supports_gaussian_blur_f32_roi:
+            raise GpuRuntimeError(
+                "CUDA DLL has no float32 Gaussian ROI export (vf_gaussian_blur_f32_roi)"
+            )
+        self._require_gaussian_f32_sigma(sigma)
+        source = self._f32_image(image)
+        x, y, width, height = int(x), int(y), int(width), int(height)
+        if (
+            x < 0 or y < 0 or width <= 0 or height <= 0
+            or x + width > source.shape[1] or y + height > source.shape[0]
+        ):
+            raise GpuRuntimeError(
+                f"Float32 Gaussian ROI is out of bounds: "
+                f"x={x}, y={y}, width={width}, height={height}, image={source.shape}"
+            )
+        output = np.empty((height, width), dtype=np.float32)
+        result = self._call_gaussian_f32(
+            "vf_gaussian_blur_f32_roi",
+            (
+                source.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+                int(source.shape[1]), int(source.shape[0]), int(source.strides[0]),
+                x, y, width, height,
+                output.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+                int(output.strides[0]),
+                int(kernel_size),
+                ctypes.c_double(float(sigma)),
+            ),
+            int(width) * int(height) * 4,
+            int(output.nbytes),
+        )
+        if result != 0:
+            raise self._native_error("vf_gaussian_blur_f32_roi", result)
+        return output
+
+    def _require_gaussian_f32_sigma(self, sigma) -> None:
+        """Refuse an explicit sigma when the loaded DLL cannot honour one.
+
+        vf_gaussian_blur_f32 gained its sigma parameter as an additive change to this ABI. A DLL
+        built before that parameter exists still exports the same name and simply ignores the extra
+        argument, so it would silently return OpenCV's automatic-sigma background for a non-zero
+        sigma. That is a wrong result rather than a missing one, so it is refused loudly; sigma <= 0
+        keeps working because the automatic rule is exactly what such a DLL computes.
+        """
+        if float(sigma) > 0.0 and not self.supports_gaussian_f32_sigma:
+            raise GpuRuntimeError(
+                "CUDA DLL vf_gaussian_blur_f32 does not honour an explicit sigma (the loaded DLL "
+                "predates the sigma parameter); rebuild gpu/visionflow_cuda.dll or pass sigma <= 0"
+            )
+
+    def _probe_gaussian_f32_sigma(self) -> bool:
+        """Detect whether the float32 Gaussian export applies an explicit sigma.
+
+        Two tiny device calls with different sigmas must produce different bytes; a DLL that ignores
+        the sigma argument returns the same automatic-sigma result twice. The probe does not record
+        performance counters, so a fresh runtime still reports zero calls.
+        """
+        probe = np.zeros((16, 16), dtype=np.float32)
+        probe[6:10, 6:10] = 255.0
+        automatic = np.empty_like(probe)
+        explicit = np.empty_like(probe)
+        try:
+            with self._lock:
+                for target, sigma in ((automatic, 0.0), (explicit, 1.0)):
+                    result = int(self._dll.vf_gaussian_blur_f32(
+                        self._context,
+                        probe.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+                        int(probe.shape[1]), int(probe.shape[0]), int(probe.strides[0]),
+                        target.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+                        int(target.strides[0]),
+                        9, ctypes.c_double(sigma),
+                    ))
+                    if result != 0:
+                        return False
+        except Exception:
+            return False
+        return not np.array_equal(automatic, explicit)
+
+    def _call_gaussian_f32(self, function_name: str, arguments: tuple, input_bytes: int, output_bytes: int) -> int:
+        """Run one float32 Gaussian export under the shared queue slot and context lock."""
+        function = getattr(self._dll, function_name)
+        queued = time.perf_counter()
+        with self._queue_slots, self._lock:
+            lock_acquired = time.perf_counter()
+            result = int(function(self._context, *arguments))
+            completed = time.perf_counter()
+            self._record_performance(
+                function_name, int(input_bytes), int(output_bytes),
+                completed - lock_acquired, lock_acquired - queued,
+            )
+        return result
+
+    @staticmethod
+    def _f32_image(image: np.ndarray) -> np.ndarray:
+        """Validate and normalize a single-channel float32 host operand."""
+        array = np.asarray(image)
+        if array.dtype != np.float32:
+            raise GpuRuntimeError(
+                f"vf_gaussian_blur_f32 requires float32 input, got {array.dtype}; "
+                "convert explicitly so the narrowing is the caller's decision"
+            )
+        if array.ndim != 2 or array.size == 0:
+            raise GpuRuntimeError(
+                f"vf_gaussian_blur_f32 requires a non-empty 2-D single-channel image, got {array.shape}"
+            )
+        return np.ascontiguousarray(array)
+
+    def match_template_debug_key(self) -> int:
+        """Return the raw packed winning key of the last localization call (diagnostics only)."""
+        debug = getattr(self._dll, "vf_match_template_debug_key", None)
+        if debug is None:
+            raise GpuRuntimeError("CUDA DLL has no template match debug export")
+        debug.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_ulonglong)]
+        debug.restype = ctypes.c_int
+        key = ctypes.c_ulonglong(0)
+        with self._queue_slots, self._lock:
+            result = int(debug(self._context, ctypes.byref(key)))
+        if result != 0:
+            raise self._native_error("vf_match_template_debug_key", result)
+        return int(key.value)
 
     def memory_info(self) -> dict[str, int]:
         if not self.available or getattr(self._dll, "vf_gpu_memory_info", None) is None:
@@ -375,9 +1121,7 @@ class GpuRuntime:
                 ctypes.byref(free_bytes), ctypes.byref(total_bytes)
             ))
         if result != 0:
-            raise GpuRuntimeError(
-                f"vf_gpu_memory_info failed with CUDA DLL error {result}: {self._error_message(result)}"
-            )
+            raise self._native_error("vf_gpu_memory_info", result)
         return {"free_bytes": int(free_bytes.value), "total_bytes": int(total_bytes.value)}
 
     def recommended_roi_batch_size(
@@ -436,9 +1180,7 @@ class GpuRuntime:
                 completed - lock_acquired, lock_acquired - queued,
             )
         if result != 0 or not handle.value:
-            raise GpuRuntimeError(
-                f"vf_roi_batch_create failed with CUDA DLL error {result}: {self._error_message(result)}"
-            )
+            raise self._native_error("vf_roi_batch_create", result)
         self._roi_batches[int(handle.value)] = handle
         return GpuRoiBatch(self, handle, image, len(encoded), expected_shape[0], expected_shape[1])
 
@@ -495,9 +1237,7 @@ class GpuRuntime:
                 completed - lock_acquired, lock_acquired - queued,
             )
         if result != 0:
-            raise GpuRuntimeError(
-                f"vf_roi_batch_download_u8 failed with CUDA DLL error {result}: {self._error_message(result)}"
-            )
+            raise self._native_error("vf_roi_batch_download_u8", result)
         return output
 
     def _destroy_roi_batch(self, batch: GpuRoiBatch) -> None:
@@ -507,14 +1247,12 @@ class GpuRuntime:
                 return
             result = int(self._dll.vf_roi_batch_destroy(handle))
         if result != 0:
-            raise GpuRuntimeError(
-                f"vf_roi_batch_destroy failed with CUDA DLL error {result}: {self._error_message(result)}"
-            )
+            raise self._native_error("vf_roi_batch_destroy", result)
 
     def native_plan_capability(self, plan, image: np.ndarray) -> tuple[bool, str]:
         if not self.supports_native_plan:
             return False, self.native_plan_unavailable_reason or "CUDA DLL has no generic native plan ABI"
-        source = self._u8_image(image, channels=(1, 3))
+        source = self._u8_image(image, channels=(1, 3), contiguous=False)
         try:
             descriptor, operators = self._plan_descriptors.linear(plan, source)
         except GpuRuntimeError as exc:
@@ -532,7 +1270,7 @@ class GpuRuntime:
         return result == 0, message or self._error_message(result)
 
     def execute_plan(self, image: np.ndarray, plan, device_roi: GpuDeviceRoi | None = None) -> np.ndarray:
-        source = self._u8_image(image, channels=(1, 3))
+        source = self._u8_image(image, channels=(1, 3), contiguous=device_roi is None)
         expected = plan.validate_input(source)
         supported, reason = self.native_plan_capability(plan, source)
         if not supported:
@@ -553,9 +1291,7 @@ class GpuRuntime:
                     ctypes.byref(created),
                 ))
                 if result != 0 or not created.value:
-                    raise GpuRuntimeError(
-                        f"vf_plan_create failed with CUDA DLL error {result}: {self._error_message(result)}"
-                    )
+                    raise self._native_error("vf_plan_create", result)
                 return created
             handle = NativePlanManager(
                 self._native_plans,
@@ -597,15 +1333,13 @@ class GpuRuntime:
                     kernel_launch_count=self._plan_descriptors.kernel_launch_count(plan, src_channels)
                 )
         if result != 0:
-            raise GpuRuntimeError(
-                f"{function_name} failed with CUDA DLL error {result}: {self._error_message(result)}"
-            )
+            raise self._native_error(function_name, result)
         return plan.validate_output(output, expected)
 
     def native_dag_plan_capability(self, plan, image: np.ndarray) -> tuple[bool, str]:
         if not self.supports_native_dag_plan:
             return False, self.native_dag_plan_unavailable_reason or "CUDA DLL has no generic native DAG plan ABI"
-        source = self._u8_image(image, channels=(1, 3))
+        source = self._u8_image(image, channels=(1, 3), contiguous=False)
         try:
             descriptor, operators, output_nodes = self._plan_descriptors.dag(plan, source)
         except GpuRuntimeError as exc:
@@ -618,7 +1352,7 @@ class GpuRuntime:
         return result == 0, message or self._error_message(result)
 
     def execute_dag_plan(self, image: np.ndarray, plan, device_roi: GpuDeviceRoi | None = None) -> dict[str, np.ndarray]:
-        source = self._u8_image(image, channels=(1, 3))
+        source = self._u8_image(image, channels=(1, 3), contiguous=device_roi is None)
         supported, reason = self.native_dag_plan_capability(plan, source)
         if not supported:
             raise GpuRuntimeError(reason)
@@ -640,9 +1374,7 @@ class GpuRuntime:
                     int(source.shape[0]), ctypes.byref(created)
                 ))
                 if result != 0 or not created.value:
-                    raise GpuRuntimeError(
-                        f"vf_dag_plan_create failed with CUDA DLL error {result}: {self._error_message(result)}"
-                    )
+                    raise self._native_error("vf_dag_plan_create", result)
                 return created
             handle = NativePlanManager(
                 self._native_dag_plans,
@@ -684,9 +1416,7 @@ class GpuRuntime:
                 completed - lock_acquired, lock_acquired - queued,
             )
         if result != 0:
-            raise GpuRuntimeError(
-                f"{function_name} failed with CUDA DLL error {result}: {self._error_message(result)}"
-            )
+            raise self._native_error(function_name, result)
         return outputs
 
     def _validate_device_roi(self, device_roi: GpuDeviceRoi, source: np.ndarray) -> None:
@@ -758,6 +1488,13 @@ class GpuRuntime:
                 ctypes.POINTER(ctypes.c_uint64),
             ]
             stats.restype = ctypes.c_int
+        memory_stats = getattr(self._dll, "vf_context_memory_stats_v1", None)
+        if memory_stats is not None:
+            memory_stats.argtypes = [
+                ctypes.c_void_p,
+                ctypes.POINTER(_VfCudaContextMemoryStatsV1),
+            ]
+            memory_stats.restype = ctypes.c_int
         timings = getattr(self._dll, "vf_context_last_timings", None)
         if timings is not None:
             timings.argtypes = [ctypes.c_void_p, ctypes.POINTER(_VfCudaTimingsV1)]
@@ -768,6 +1505,7 @@ class GpuRuntime:
             reason = (
                 f"CUDA persistent context creation failed with error {result}: {self._error_message(result)}"
             )
+            self._mark_device_lost_if_sticky(result, reason)
             self.fused_unavailable_reason = reason
             self.native_plan_unavailable_reason = reason
             self.native_dag_plan_unavailable_reason = reason
@@ -779,6 +1517,13 @@ class GpuRuntime:
         self._load_optional_native_dag_plan()
         self._load_optional_resident_roi()
         self._load_optional_roi_batch()
+        self._load_optional_template_match()
+        self._load_optional_find_contours()
+        self._load_optional_exact_median()
+        self._load_optional_gaussian_blur_f32()
+        self._load_optional_cnr_mask_f32()
+        self._load_optional_cnr_mask_u8_roi()
+        self._load_optional_cnr_candidates_u8_roi()
 
     def _load_optional_native_plan(self) -> None:
         query = getattr(self._dll, "vf_plan_query", None)
@@ -835,6 +1580,7 @@ class GpuRuntime:
 
     def _load_optional_resident_roi(self) -> None:
         upload = getattr(self._dll, "vf_context_upload_u8", None)
+        file_order_upload = getattr(self._dll, "vf_context_upload_u8_file_order", None)
         linear = getattr(self._dll, "vf_plan_execute_roi", None)
         dag = getattr(self._dll, "vf_dag_plan_execute_roi", None)
         if upload is not None:
@@ -844,6 +1590,21 @@ class GpuRuntime:
                 ctypes.POINTER(ctypes.c_uint64),
             ]
             upload.restype = ctypes.c_int
+        if file_order_upload is not None:
+            file_order_upload.argtypes = [
+                ctypes.c_void_p, ctypes.POINTER(ctypes.c_uint8),
+                ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+                ctypes.POINTER(ctypes.c_uint64),
+            ]
+            file_order_upload.restype = ctypes.c_int
+        host_register = getattr(self._dll, "vf_host_register_u8", None)
+        host_unregister = getattr(self._dll, "vf_host_unregister_u8", None)
+        if host_register is not None:
+            host_register.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_uint8), ctypes.c_uint64]
+            host_register.restype = ctypes.c_int
+        if host_unregister is not None:
+            host_unregister.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_uint8)]
+            host_unregister.restype = ctypes.c_int
         if linear is not None:
             linear.argtypes = [
                 ctypes.c_void_p, ctypes.c_uint64, ctypes.c_int, ctypes.c_int,
@@ -884,6 +1645,119 @@ class GpuRuntime:
         if destroy is not None:
             destroy.argtypes = [ctypes.c_void_p]
             destroy.restype = ctypes.c_int
+
+    def _load_optional_template_match(self) -> None:
+        match = getattr(self._dll, "vf_match_template_gray_u8", None)
+        if match is None:
+            return
+        match.argtypes = [
+            ctypes.c_void_p, ctypes.c_uint64,
+            ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+            ctypes.POINTER(ctypes.c_uint8), ctypes.c_int, ctypes.c_int,
+            ctypes.POINTER(ctypes.c_int), ctypes.POINTER(ctypes.c_float),
+        ]
+        match.restype = ctypes.c_int
+
+    def _load_optional_find_contours(self) -> None:
+        trace = getattr(self._dll, "vf_find_contours_u8", None)
+        download = getattr(self._dll, "vf_find_contours_download", None)
+        if trace is not None:
+            trace.argtypes = [
+                ctypes.c_void_p, ctypes.c_uint64,
+                ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+                ctypes.POINTER(ctypes.c_int), ctypes.POINTER(ctypes.c_int),
+            ]
+            trace.restype = ctypes.c_int
+        if download is not None:
+            download.argtypes = [
+                ctypes.c_void_p,
+                ctypes.POINTER(ctypes.c_int32), ctypes.c_int,
+                ctypes.POINTER(ctypes.c_int32), ctypes.c_int,
+            ]
+            download.restype = ctypes.c_int
+
+    def _load_optional_exact_median(self) -> None:
+        median = getattr(self._dll, "vf_median_f32", None)
+        if median is None:
+            return
+        median.argtypes = [
+            ctypes.c_void_p,
+            ctypes.POINTER(ctypes.c_float), ctypes.c_longlong,
+            ctypes.POINTER(ctypes.c_float),
+        ]
+        median.restype = ctypes.c_int
+
+    def _load_optional_gaussian_blur_f32(self) -> None:
+        blur = getattr(self._dll, "vf_gaussian_blur_f32", None)
+        if blur is not None:
+            blur.argtypes = [
+                ctypes.c_void_p,
+                ctypes.POINTER(ctypes.c_float), ctypes.c_int, ctypes.c_int, ctypes.c_int,
+                ctypes.POINTER(ctypes.c_float), ctypes.c_int,
+                ctypes.c_int, ctypes.c_double,
+            ]
+            blur.restype = ctypes.c_int
+        roi = getattr(self._dll, "vf_gaussian_blur_f32_roi", None)
+        if roi is not None:
+            roi.argtypes = [
+                ctypes.c_void_p,
+                ctypes.POINTER(ctypes.c_float), ctypes.c_int, ctypes.c_int, ctypes.c_int,
+                ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+                ctypes.POINTER(ctypes.c_float), ctypes.c_int,
+                ctypes.c_int, ctypes.c_double,
+            ]
+            roi.restype = ctypes.c_int
+        if blur is not None:
+            self._gaussian_f32_sigma_supported = self._probe_gaussian_f32_sigma()
+
+    def _load_optional_cnr_mask_f32(self) -> None:
+        mask = getattr(self._dll, "vf_cnr_mask_f32", None)
+        if mask is None:
+            return
+        mask.argtypes = [
+            ctypes.c_void_p,
+            ctypes.POINTER(ctypes.c_float), ctypes.c_int,
+            ctypes.POINTER(ctypes.c_float), ctypes.c_int,
+            ctypes.c_int, ctypes.c_int,
+            ctypes.c_double, ctypes.c_double, ctypes.c_double, ctypes.c_double,
+            ctypes.c_int,
+            ctypes.POINTER(ctypes.c_float), ctypes.POINTER(ctypes.c_float),
+            ctypes.POINTER(ctypes.c_double),
+            ctypes.POINTER(ctypes.c_uint8), ctypes.c_longlong,
+        ]
+        mask.restype = ctypes.c_int
+
+    def _load_optional_cnr_mask_u8_roi(self) -> None:
+        mask = getattr(self._dll, "vf_cnr_mask_u8_roi", None)
+        if mask is None:
+            return
+        mask.argtypes = [
+            ctypes.c_void_p, ctypes.c_uint64,
+            ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+            ctypes.c_int, ctypes.c_double,
+            ctypes.c_double, ctypes.c_double, ctypes.c_double, ctypes.c_double,
+            ctypes.c_int,
+            ctypes.POINTER(ctypes.c_float), ctypes.POINTER(ctypes.c_float),
+            ctypes.POINTER(ctypes.c_double),
+            ctypes.POINTER(ctypes.c_uint8), ctypes.c_longlong,
+        ]
+        mask.restype = ctypes.c_int
+
+    def _load_optional_cnr_candidates_u8_roi(self) -> None:
+        candidates = getattr(self._dll, "vf_cnr_candidates_u8_roi", None)
+        if candidates is None:
+            return
+        candidates.argtypes = [
+            ctypes.c_void_p, ctypes.c_uint64,
+            ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+            ctypes.POINTER(ctypes.c_int32), ctypes.c_int,
+            ctypes.POINTER(ctypes.c_double), ctypes.c_int,
+            ctypes.POINTER(ctypes.c_float), ctypes.POINTER(ctypes.c_float),
+            ctypes.POINTER(ctypes.c_double),
+            ctypes.POINTER(ctypes.c_int32), ctypes.POINTER(ctypes.c_float), ctypes.c_int,
+            ctypes.POINTER(ctypes.c_int), ctypes.POINTER(ctypes.c_int), ctypes.POINTER(ctypes.c_int),
+        ]
+        candidates.restype = ctypes.c_int
 
     @staticmethod
     def _native_plan_descriptor(plan, image: np.ndarray) -> tuple[_VfPlanDescV1, object]:
@@ -1016,19 +1890,78 @@ class GpuRuntime:
 
     def _context_stats_unlocked(self) -> dict:
         if self._context is None or self._dll is None:
-            return {"active": False, "reserved_bytes": 0, "allocation_count": 0}
+            return {
+                "active": False,
+                "reserved_bytes": 0,
+                "peak_reserved_bytes": 0,
+                "allocation_count": 0,
+                "accounting": "inactive",
+                "breakdown": {},
+            }
+        detailed = getattr(self._dll, "vf_context_memory_stats_v1", None)
+        if detailed is not None:
+            value = _VfCudaContextMemoryStatsV1()
+            value.struct_size = ctypes.sizeof(_VfCudaContextMemoryStatsV1)
+            value.version = 1
+            result = int(detailed(self._context, ctypes.byref(value)))
+            if result == 0:
+                breakdown = {
+                    "plan_bytes": int(value.plan_bytes),
+                    "resident_bytes": int(value.resident_bytes),
+                    "template_match_bytes": int(value.template_match_bytes),
+                    "contour_bytes": int(value.contour_bytes),
+                    "median_bytes": int(value.median_bytes),
+                    "gaussian_f32_bytes": int(value.gaussian_f32_bytes),
+                    "cnr_mask_bytes": int(value.cnr_mask_bytes),
+                    "cnr_candidate_bytes": int(value.cnr_candidate_bytes),
+                }
+                return {
+                    "active": True,
+                    "reserved_bytes": int(value.reserved_bytes),
+                    "peak_reserved_bytes": int(value.peak_reserved_bytes),
+                    "allocation_count": int(value.allocation_count),
+                    "accounting": "detailed_v1",
+                    "breakdown": breakdown,
+                }
+            return {
+                "active": True,
+                "reserved_bytes": None,
+                "peak_reserved_bytes": None,
+                "allocation_count": None,
+                "accounting": "detailed_v1_error",
+                "breakdown": {},
+                "error_code": result,
+            }
         stats = getattr(self._dll, "vf_context_stats", None)
         if stats is None:
-            return {"active": True, "reserved_bytes": None, "allocation_count": None}
+            return {
+                "active": True,
+                "reserved_bytes": None,
+                "peak_reserved_bytes": None,
+                "allocation_count": None,
+                "accounting": "unavailable",
+                "breakdown": {},
+            }
         reserved_bytes = ctypes.c_uint64()
         allocation_count = ctypes.c_uint64()
         result = int(stats(self._context, ctypes.byref(reserved_bytes), ctypes.byref(allocation_count)))
         if result != 0:
-            return {"active": True, "reserved_bytes": None, "allocation_count": None, "error_code": result}
+            return {
+                "active": True,
+                "reserved_bytes": None,
+                "peak_reserved_bytes": None,
+                "allocation_count": None,
+                "accounting": "legacy_error",
+                "breakdown": {},
+                "error_code": result,
+            }
         return {
             "active": True,
             "reserved_bytes": int(reserved_bytes.value),
+            "peak_reserved_bytes": None,
             "allocation_count": int(allocation_count.value),
+            "accounting": "legacy_total",
+            "breakdown": {},
         }
 
     def _native_timings_unlocked(self) -> dict | None:
@@ -1117,9 +2050,7 @@ class GpuRuntime:
                 lock_acquired - queued,
             )
         if result != 0:
-            raise GpuRuntimeError(
-                f"{function_name} failed with CUDA DLL error {result}: {self._error_message(result)}"
-            )
+            raise self._native_error(function_name, result)
 
     def _record_performance(
         self,
@@ -1132,6 +2063,21 @@ class GpuRuntime:
         self._performance_recorder.record(
             function_name, host_to_device_bytes, device_to_host_bytes, wall_sec, lock_wait_sec
         )
+
+    def _native_error(self, function_name: str, error_code: int) -> GpuRuntimeError:
+        message = f"{function_name} failed with CUDA DLL error {error_code}: {self._error_message(error_code)}"
+        self._mark_device_lost_if_sticky(error_code, message)
+        error = GpuRuntimeError(message)
+        # Callers that must restart a step on the CPU reference need the code, not the text.
+        error.error_code = int(error_code)
+        return error
+
+    def _mark_device_lost_if_sticky(self, error_code: int, message: str) -> None:
+        if int(error_code) - CUDA_RUNTIME_ERROR_BASE not in STICKY_CUDA_ERRORS or self.device_lost_reason:
+            return
+        # Retrying CUDA in this process only repeats the failure; later runs route to CPU.
+        self.device_lost_reason = f"CUDA context 已損毀，需重新啟動程式才能再使用 GPU：{message}"
+        self.unavailable_reason = self.device_lost_reason
 
     def _error_message(self, error_code: int) -> str:
         function = getattr(self._dll, "vf_gpu_error_message", None)
@@ -1149,15 +2095,26 @@ class GpuRuntime:
         if not self.fallback_to_cpu:
             raise exc
 
+    def clear_recoverable_error(self) -> None:
+        """Start a new inspection scope on a long-lived runtime.
+
+        ``last_error`` disables optional GPU steps for the rest of one run. A shared
+        session must not let one image's recovered failure mark later images as CPU.
+        """
+        with self._lock:
+            self.last_error = ""
+
     @staticmethod
-    def _u8_image(image: np.ndarray, channels: tuple[int, ...]) -> np.ndarray:
+    def _u8_image(
+        image: np.ndarray, channels: tuple[int, ...], *, contiguous: bool = True,
+    ) -> np.ndarray:
         array = np.asarray(image)
         count = 1 if array.ndim == 2 else array.shape[2] if array.ndim == 3 else 0
         if array.dtype != np.uint8 or count not in channels:
             raise GpuRuntimeError(f"CUDA DLL expects uint8 image with channels in {channels}; got {array.dtype}, {array.shape}")
         if array.shape[0] <= 0 or array.shape[1] <= 0:
             raise GpuRuntimeError(f"CUDA DLL does not accept empty images: {array.shape}")
-        return np.ascontiguousarray(array)
+        return np.ascontiguousarray(array) if contiguous else array
 
     @staticmethod
     def _resolve_path(path: str) -> Path:

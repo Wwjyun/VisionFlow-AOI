@@ -199,6 +199,24 @@ def _draw(name: str, painter: QPainter, scale: float) -> None:
         painter.drawLine(pt(2, 12), pt(6, 12))
         painter.drawLine(pt(18, 12), pt(22, 12))
 
+    elif name == "camera":
+        path = QPainterPath()
+        path.moveTo(pt(3, 9))
+        path.cubicTo(pt(3, 7.9), pt(3.9, 7), pt(5, 7))
+        path.lineTo(pt(7.5, 7))
+        path.lineTo(pt(9, 4.5))
+        path.lineTo(pt(15, 4.5))
+        path.lineTo(pt(16.5, 7))
+        path.lineTo(pt(19, 7))
+        path.cubicTo(pt(20.1, 7), pt(21, 7.9), pt(21, 9))
+        path.lineTo(pt(21, 17))
+        path.cubicTo(pt(21, 18.1), pt(20.1, 19), pt(19, 19))
+        path.lineTo(pt(5, 19))
+        path.cubicTo(pt(3.9, 19), pt(3, 18.1), pt(3, 17))
+        path.closeSubpath()
+        painter.drawPath(path)
+        painter.drawEllipse(pt(12, 13), 3.5 * s, 3.5 * s)
+
     elif name == "history":
         painter.drawEllipse(rect(3.5, 3.5, 17, 17))
         painter.drawLine(pt(12, 8), pt(12, 12.5))

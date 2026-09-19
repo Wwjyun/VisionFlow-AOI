@@ -19,6 +19,10 @@
   "nvcc": {
     "dll_optimization": "-O3",
     "test_optimization": "-O2",
-    "cudart": "static"
+    "cudart": "static",
+    "fmad": false,
+    "msvc_flags": [
+      "/Zc:preprocessor"
+    ]
   }
 }

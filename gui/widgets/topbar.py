@@ -12,6 +12,7 @@ from gui.widgets.common import Badge, Chip, ProgressBar, Segmented
 
 SCREEN_TITLES = {
     "monitor": "監控模式",
+    "ccd": "CCD 控制",
     "run": "執行檢測",
     "designer": "Recipe 設計",
     "results": "檢測結果",
@@ -106,6 +107,15 @@ class TopBar(QWidget):
             text = "CPU"
             kind = "neutral"
             tooltip = "目前使用 CPU"
+        if status.get("vram_total_bytes"):
+            from gui.performance_summary import VRAM_LOW_NOTICE, format_bytes
+
+            tooltip += (
+                f"\n整圖上傳前可用顯示卡記憶體：{format_bytes(status.get('vram_free_bytes'))}"
+                f"／{format_bytes(status.get('vram_total_bytes'))}"
+            )
+            if status.get("vram_low"):
+                tooltip += f"\n注意：{VRAM_LOW_NOTICE}"
         self.backend_badge.setText(text)
         self.backend_badge.set_kind(kind)
         self.backend_badge.setToolTip(tooltip)

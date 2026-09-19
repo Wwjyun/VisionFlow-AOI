@@ -207,18 +207,27 @@ class Detector202_1(Detector202):
     }
 
     def detect(self, image) -> list[dict]:
-        with self.measure_detection_stage("preprocess"):
-            gray = self._make_gray(image)
+        height, width = image.shape[:2]
+        device = None
+        if getattr(self, "_active_device_roi", None) is not None:
+            with self.measure_detection_stage("device_cnr_candidates"):
+                device = self._device_candidates(height, width)
 
-        with self.measure_detection_stage("automatic_cnr_mask"):
-            analysis = self._automatic_cnr_mask(gray)
+        if device is not None:
+            candidates, analysis = device
+        else:
+            with self.measure_detection_stage("preprocess"):
+                gray = self._make_gray(image)
 
-        with self.measure_detection_stage("connected_components_and_cnr"):
-            candidates = self._collect_candidates(
-                analysis["image_float"],
-                analysis["candidate_mask"],
-                analysis["inclusion_mask"],
-            )
+            with self.measure_detection_stage("automatic_cnr_mask"):
+                analysis = self._automatic_cnr_mask(gray)
+
+            with self.measure_detection_stage("connected_components_and_cnr"):
+                candidates = self._collect_candidates(
+                    analysis["image_float"],
+                    analysis["candidate_mask"],
+                    analysis["inclusion_mask"],
+                )
 
         geometry_started = time.perf_counter()
         defects = [
@@ -242,39 +251,213 @@ class Detector202_1(Detector202):
         self._record_debug_image("202-1_gray", gray)
         return gray
 
-    def _automatic_cnr_mask(self, gray: np.ndarray) -> dict:
-        image_float = gray.astype(np.float32)
-        height, width = gray.shape[:2]
-        background_kernel = self._background_kernel(height, width)
-        gaussian_sigma = float(self.params.get("gaussian_sigma", 0.0))
-        background = cv2.GaussianBlur(
-            image_float,
-            (background_kernel, background_kernel),
-            gaussian_sigma,
-        )
-        residual = image_float - background
-        residual_median = float(np.median(residual))
-        mad = float(np.median(np.abs(residual - residual_median)))
-        mad_scale = float(self.params.get("mad_scale", 1.4826))
-        noise_sigma_floor = float(self.params.get("noise_sigma_floor", 0.000001))
+    def _exact_median(self, values: np.ndarray) -> float:
+        """Median of a float32 array, matching `np.median` for float32 input.
+
+        Uses the optional CUDA exact-median export when the runtime offers it. The device result is
+        bit-exact against `np.median`, and anything else - a missing export, an older DLL, or a
+        device error - falls back to `np.median` for the whole call, so a failed GPU step never
+        produces a partially device-derived value.
+        """
+        runtime = getattr(self, "gpu_runtime", None)
+        source = np.ascontiguousarray(values, dtype=np.float32)
+        if (
+            runtime is not None
+            and getattr(runtime, "available", False)
+            and getattr(runtime, "supports_exact_median", False)
+            and self.use_gpu
+        ):
+            try:
+                return float(runtime.median_f32(source))
+            except Exception:
+                pass
+        if source is values and source.dtype == np.float32:
+            return float(np.median(values))
+        return float(np.median(source))
+
+    def _background_blur(
+        self,
+        image_float: np.ndarray,
+        kernel: int,
+        sigma: float,
+    ) -> tuple[np.ndarray, str]:
+        """Gaussian background, on the device when the runtime can honour ``sigma``.
+
+        Returns the background together with the backend that produced it, so the reports can say
+        which one was used instead of leaving the reader to infer it.
+
+        Uses the optional CUDA float32 Gaussian export.  The device filter is *not* bit-identical
+        to ``cv2.GaussianBlur`` - the summation order differs - so the caller must treat the result
+        as mathematically equivalent rather than byte-equal: the measured deviation is <= 4e-4 on a
+        [0, 255] float32 operand and the candidate mask it produces is bit-identical across the
+        whole 202 final-output matrix, while the four residual-derived diagnostics (``mad``,
+        ``residual_median``, ``residual_threshold``, ``robust_noise_sigma``) drift in their last
+        bits.
+
+        A missing export, an older DLL that ignores ``sigma``, or any device error falls back to
+        ``cv2.GaussianBlur`` for the whole call, so a failed GPU step never leaves the detector
+        with a background from a different filter.
+        """
+        runtime = getattr(self, "gpu_runtime", None)
+        if (
+            runtime is not None
+            and getattr(runtime, "available", False)
+            and getattr(runtime, "supports_gaussian_blur_f32", False)
+            and getattr(runtime, "supports_gaussian_f32_sigma", False)
+            and self.use_gpu
+        ):
+            try:
+                return runtime.gaussian_blur_f32(image_float, kernel, sigma), "cuda_f32"
+            except Exception:
+                pass
+        return cv2.GaussianBlur(image_float, (kernel, kernel), sigma), "opencv_cpu"
+
+    def _residual_statistics(
+        self,
+        image_float: np.ndarray,
+        background: np.ndarray,
+        residual: np.ndarray,
+        candidate_max_value: int,
+        mad_scale: float,
+        noise_sigma_floor: float,
+        residual_threshold_floor: float,
+        residual_sigma_multiplier: float,
+    ) -> tuple[np.ndarray, float, float, float, str]:
+        """Residual central-moment threshold and candidate mask, on the device when possible.
+
+        Returns ``(candidate_mask, residual_median, mad, residual_threshold, backend)``.
+
+        The device path is one additive export, ``vf_cnr_mask_f32``: it builds the
+        residual and its absolute deviation on the device from the image and background
+        planes, computes both medians with the same bit-exact machinery as
+        ``vf_median_f32``, evaluates the threshold in double exactly as the Python does,
+        and compares in float32 (which is what NumPy does against a Python float).
+        Measured agreement is exact on every compared field - ``residual_median`` and
+        ``mad`` bit-exact, ``threshold`` double-exact and the mask byte-exact across the
+        whole equivalence sweep - so unlike the Gaussian background this step adds no
+        drift of its own.
+
+        ``residual`` is passed in because the caller needs it for the debug overlay; the
+        device path does not upload it, it only uses it on the CPU fallback.
+
+        Any missing export or device error falls back to the NumPy reference for the
+        whole step, so a failed GPU step never produces a partially device-derived mask.
+        """
+
+        runtime = getattr(self, "gpu_runtime", None)
+        if (
+            runtime is not None
+            and getattr(runtime, "available", False)
+            and getattr(runtime, "supports_cnr_mask_f32", False)
+            and self.use_gpu
+        ):
+            try:
+                device = runtime.cnr_mask_f32(
+                    image_float,
+                    background,
+                    sigma_multiplier=residual_sigma_multiplier,
+                    threshold_floor=residual_threshold_floor,
+                    absolute_floor=noise_sigma_floor,
+                    mad_scale=mad_scale,
+                    candidate_value=candidate_max_value,
+                )
+                expected_shape = (image_float.shape[0], image_float.shape[1])
+                if device["mask"].shape == expected_shape:
+                    return (
+                        device["mask"],
+                        float(device["residual_median"]),
+                        float(device["mad"]),
+                        float(device["threshold"]),
+                        "cuda_f32",
+                    )
+            except Exception:
+                pass
+
+        residual_median = self._exact_median(residual)
+        mad = self._exact_median(np.abs(residual - residual_median))
         robust_noise_sigma = float(max(mad_scale * mad, noise_sigma_floor))
-        residual_threshold_floor = float(
-            self.params.get("residual_threshold_floor", 8.0)
-        )
-        residual_sigma_multiplier = float(
-            self.params.get("residual_sigma_multiplier", 3.0)
-        )
         residual_threshold = float(
             max(
                 residual_threshold_floor,
                 residual_sigma_multiplier * robust_noise_sigma,
             )
         )
-        candidate_max_value = int(self.params.get("candidate_max_value", 255))
         candidate_mask = (
             (np.abs(residual - residual_median) > residual_threshold).astype(np.uint8)
             * candidate_max_value
         )
+        return candidate_mask, residual_median, mad, residual_threshold, "numpy_cpu"
+
+    def _automatic_cnr_mask(self, gray: np.ndarray) -> dict:
+        image_float = gray.astype(np.float32)
+        height, width = gray.shape[:2]
+        background_kernel = self._background_kernel(height, width)
+        gaussian_sigma = float(self.params.get("gaussian_sigma", 0.0))
+        mad_scale = float(self.params.get("mad_scale", 1.4826))
+        noise_sigma_floor = float(self.params.get("noise_sigma_floor", 0.000001))
+        residual_threshold_floor = float(
+            self.params.get("residual_threshold_floor", 8.0)
+        )
+        residual_sigma_multiplier = float(
+            self.params.get("residual_sigma_multiplier", 3.0)
+        )
+        candidate_max_value = int(self.params.get("candidate_max_value", 255))
+        residual = None
+        resident_result = None
+        runtime = getattr(self, "gpu_runtime", None)
+        device_roi = getattr(self, "_active_device_roi", None)
+        if (
+            runtime is not None
+            and getattr(runtime, "available", False)
+            and getattr(runtime, "supports_cnr_mask_u8_roi", False)
+            and self.use_gpu
+            and not self.export_debug_images
+            and device_roi is not None
+            and (int(device_roi.height), int(device_roi.width)) == (height, width)
+        ):
+            try:
+                resident_result = runtime.cnr_mask_u8_roi(
+                    device_roi,
+                    kernel_size=background_kernel,
+                    sigma=gaussian_sigma,
+                    sigma_multiplier=residual_sigma_multiplier,
+                    threshold_floor=residual_threshold_floor,
+                    absolute_floor=noise_sigma_floor,
+                    mad_scale=mad_scale,
+                    candidate_value=candidate_max_value,
+                )
+            except Exception:
+                resident_result = None
+
+        if resident_result is not None and resident_result["mask"].shape == (height, width):
+            candidate_mask = resident_result["mask"]
+            residual_median = float(resident_result["residual_median"])
+            mad = float(resident_result["mad"])
+            residual_threshold = float(resident_result["threshold"])
+            background_backend = "cuda_resident_fused"
+            mask_backend = "cuda_resident_fused"
+        else:
+            background, background_backend = self._background_blur(
+                image_float, background_kernel, gaussian_sigma
+            )
+            residual = image_float - background
+            (
+                candidate_mask,
+                residual_median,
+                mad,
+                residual_threshold,
+                mask_backend,
+            ) = self._residual_statistics(
+                image_float,
+                background,
+                residual,
+                candidate_max_value,
+                mad_scale,
+                noise_sigma_floor,
+                residual_threshold_floor,
+                residual_sigma_multiplier,
+            )
+        robust_noise_sigma = float(max(mad_scale * mad, noise_sigma_floor))
         morph_operation = str(self.params.get("morph_operation", "open")).lower()
         morph_kernel = int(self.params.get("morph_kernel", 3))
         morph_iterations = int(self.params.get("morph_iterations", 1))
@@ -304,10 +487,11 @@ class Detector202_1(Detector202):
         )
         candidate_mask = cv2.bitwise_and(candidate_mask, inclusion_mask)
 
-        self._record_debug_image(
-            "202-1_residual_abs",
-            np.clip(np.abs(residual - residual_median), 0, 255).astype(np.uint8),
-        )
+        if residual is not None:
+            self._record_debug_image(
+                "202-1_residual_abs",
+                np.clip(np.abs(residual - residual_median), 0, 255).astype(np.uint8),
+            )
         self._record_debug_image("202-1_candidate_mask", candidate_mask)
         minimum_area, maximum_area = self._effective_component_area_limits(
             height, width
@@ -317,6 +501,8 @@ class Detector202_1(Detector202):
             "candidate_mask": candidate_mask,
             "inclusion_mask": inclusion_mask.astype(bool),
             "background_kernel": background_kernel,
+            "background_backend": background_backend,
+            "residual_backend": mask_backend,
             "gaussian_sigma": gaussian_sigma,
             "residual_median": residual_median,
             "mad": mad,
@@ -324,7 +510,136 @@ class Detector202_1(Detector202):
             "residual_threshold": residual_threshold,
             "min_area": minimum_area,
             "max_area": maximum_area,
+            "mask_shape": (height, width),
+            "component_backend": "opencv_cpu",
         }
+
+    _DEVICE_MORPHOLOGY_CODES = {"open": 0, "close": 1, "dilate": 2, "erode": 3}
+
+    def _device_candidate_parameters(self, height: int, width: int) -> tuple[list[int], list[float]]:
+        """Pack the host candidate semantics in the ``vf_cnr_candidates_u8_roi`` parameter layout."""
+        morph_operation = str(self.params.get("morph_operation", "open")).lower()
+        morph_kernel = int(self.params.get("morph_kernel", 3))
+        morph_iterations = int(self.params.get("morph_iterations", 1))
+        morph_code = self._DEVICE_MORPHOLOGY_CODES.get(morph_operation)
+        if morph_code is None or morph_iterations <= 0 or morph_kernel <= 1:
+            morph_code = -1
+        geometry = self._exclusion_geometry(width, height)
+        center = geometry["center"]
+        insets = geometry["insets"]
+        minimum_area, maximum_area = self._effective_component_area_limits(height, width)
+        maximum_area_enabled = (
+            int(self.params.get("max_component_area_px", 0)) > 0
+            or float(self.params.get("max_component_area_ratio", 0.05)) > 0
+        )
+        int_params = [
+            self._background_kernel(height, width),
+            int(self.params.get("candidate_max_value", 255)),
+            morph_code,
+            morph_kernel,
+            morph_iterations,
+            1 if center is not None else 0,
+            *(center if center is not None else (0, 0, 0, 0)),
+            insets["top"],
+            insets["bottom"],
+            insets["left"],
+            insets["right"],
+            int(self.params.get("connectivity", 8)),
+            minimum_area,
+            maximum_area,
+            1 if maximum_area_enabled else 0,
+            int(self.params.get("component_border_margin_px", 1)),
+            int(self.params.get("background_padding_min_px", 8)),
+            int(self.params.get("background_padding_max_px", 50)),
+            int(self.params.get("min_background_pixels", 20)),
+        ]
+        real_params = [
+            float(self.params.get("gaussian_sigma", 0.0)),
+            float(self.params.get("residual_sigma_multiplier", 3.0)),
+            float(self.params.get("residual_threshold_floor", 8.0)),
+            float(self.params.get("noise_sigma_floor", 0.000001)),
+            float(self.params.get("mad_scale", 1.4826)),
+            float(self.params.get("background_padding_scale", 1.5)),
+        ]
+        return int_params, real_params
+
+    def _device_candidates(self, height: int, width: int):
+        """Candidate extraction kept entirely on the device, or ``None`` to use the host path.
+
+        ``vf_cnr_candidates_u8_roi`` returns the component boxes and the float32 np.mean/np.std
+        values bit-exactly, so contrast, CNR and the ordering below are the host expressions applied
+        to identical inputs. Any missing export, unsupported parameter, ring that needs the whole
+        included image, or device error returns ``None`` and the unchanged host path runs instead.
+        """
+        runtime = getattr(self, "gpu_runtime", None)
+        device_roi = getattr(self, "_active_device_roi", None)
+        if (
+            runtime is None
+            or not getattr(runtime, "available", False)
+            or not getattr(runtime, "supports_cnr_candidates_u8_roi", False)
+            or not self.use_gpu
+            or self.export_debug_images
+            or device_roi is None
+            or (int(device_roi.height), int(device_roi.width)) != (height, width)
+        ):
+            return None
+        int_params, real_params = self._device_candidate_parameters(height, width)
+        try:
+            result = runtime.cnr_candidates_u8_roi(device_roi, int_params, real_params)
+        except Exception:
+            return None
+        records = np.asarray(result["records"], dtype=np.int32)
+        stats = np.asarray(result["stats"], dtype=np.float32)
+        if records.ndim != 2 or records.shape[1] != 7 or stats.shape != (records.shape[0], 3):
+            return None
+        cnr_noise_floor = float(self.params.get("cnr_noise_floor", 0.000001))
+        candidates = []
+        for record, values in zip(records, stats):
+            x, y, component_width, component_height, area, background_area, _status = (
+                int(value) for value in record
+            )
+            defect_mean = float(values[0])
+            background_mean = float(values[1])
+            background_std = float(values[2])
+            contrast = abs(defect_mean - background_mean)
+            cnr = contrast / max(background_std, cnr_noise_floor)
+            candidates.append(
+                _CnrCandidate(
+                    cnr=float(cnr),
+                    contrast=float(contrast),
+                    area=area,
+                    bbox=(x, y, component_width, component_height),
+                    defect_mean=defect_mean,
+                    background_mean=background_mean,
+                    background_std=background_std,
+                    background_area=background_area,
+                )
+            )
+        # Same total order as the host path. Components arrive in first-raster-pixel order; OpenCV
+        # numbers 8-connected components in its own scan order, which only matters for candidates
+        # equal in CNR and in bbox top-left, which the host ordering cannot separate either.
+        candidates.sort(
+            key=lambda candidate: (-candidate.cnr, candidate.bbox[1], candidate.bbox[0])
+        )
+        mad_scale = float(self.params.get("mad_scale", 1.4826))
+        noise_sigma_floor = float(self.params.get("noise_sigma_floor", 0.000001))
+        mad = float(result["mad"])
+        minimum_area, maximum_area = self._effective_component_area_limits(height, width)
+        analysis = {
+            "background_kernel": int_params[0],
+            "background_backend": "cuda_resident_fused",
+            "residual_backend": "cuda_resident_fused",
+            "component_backend": "cuda_resident",
+            "gaussian_sigma": float(self.params.get("gaussian_sigma", 0.0)),
+            "residual_median": float(result["residual_median"]),
+            "mad": mad,
+            "robust_noise_sigma": float(max(mad_scale * mad, noise_sigma_floor)),
+            "residual_threshold": float(result["threshold"]),
+            "min_area": minimum_area,
+            "max_area": maximum_area,
+            "mask_shape": (height, width),
+        }
+        return candidates, analysis
 
     def _collect_candidates(
         self,
@@ -332,6 +647,37 @@ class Detector202_1(Detector202):
         candidate_mask: np.ndarray,
         inclusion_mask: np.ndarray,
     ) -> list[_CnrCandidate]:
+        label_count, labels_raw, stats_raw, _ = cv2.connectedComponentsWithStats(
+            candidate_mask,
+            connectivity=int(self.params.get("connectivity", 8)),
+        )
+        return self._collect_candidates_with_labels(
+            image_float,
+            candidate_mask,
+            inclusion_mask,
+            np.asarray(labels_raw),
+            np.asarray(stats_raw),
+            int(label_count),
+        )
+
+    def _collect_candidates_with_labels(
+        self,
+        image_float: np.ndarray,
+        candidate_mask: np.ndarray,
+        inclusion_mask: np.ndarray,
+        labels: np.ndarray,
+        stats: np.ndarray | None = None,
+        label_count: int | None = None,
+    ) -> list[_CnrCandidate]:
+        """Collect ring-CNR candidates from a supplied component label map.
+
+        ``_collect_candidates`` computes the labels with
+        ``cv2.connectedComponentsWithStats`` and delegates here.  Accepting the label
+        map lets a caller supply labels produced by a different implementation - which
+        is how ``tools/cnr_label_order_impact.py`` measures whether OpenCV's label
+        *numbering* is observable in the detector output.
+        """
+
         height, width = candidate_mask.shape[:2]
         minimum_area, maximum_area = self._effective_component_area_limits(
             height, width
@@ -341,12 +687,16 @@ class Detector202_1(Detector202):
             or float(self.params.get("max_component_area_ratio", 0.05)) > 0
         )
         connectivity = int(self.params.get("connectivity", 8))
-        label_count, labels_raw, stats_raw, _ = cv2.connectedComponentsWithStats(
-            candidate_mask,
-            connectivity=connectivity,
-        )
-        labels = np.asarray(labels_raw)
-        stats = np.asarray(stats_raw)
+        if label_count is None or stats is None:
+            label_count, labels_raw, stats_raw, _ = cv2.connectedComponentsWithStats(
+                candidate_mask,
+                connectivity=connectivity,
+            )
+            labels = np.asarray(labels_raw)
+            stats = np.asarray(stats_raw)
+        else:
+            labels = np.asarray(labels)
+            stats = np.asarray(stats)
         candidates = []
 
         for label in range(1, label_count):
@@ -427,7 +777,23 @@ class Detector202_1(Detector202):
                 )
             )
 
-        candidates.sort(key=lambda candidate: candidate.cnr, reverse=True)
+        # Order by CNR descending, then by the component's bounding box in raster order.
+        #
+        # The tie-break used to be implicit: this is a stable sort, so candidates with an
+        # exactly equal CNR stayed in the order their component labels were visited, which
+        # tied the defect list order to OpenCV's label *numbering*.  A replacement
+        # connected-components implementation that produces the same components with a
+        # different numbering would then reorder the output.  Exact ties are real - a
+        # regular array of identical parts ties almost every candidate (measured 433/435)
+        # - so the tie-break is now explicit and depends only on geometry.  Bounding boxes
+        # are disjoint for connected components, so this is a total order and the sort is
+        # deterministic regardless of how components are numbered.
+        #
+        # Measured effect on production-shaped noisy surfaces: 0 of 121 candidates sit in
+        # a tie group, so this changes nothing there.
+        candidates.sort(
+            key=lambda candidate: (-candidate.cnr, candidate.bbox[1], candidate.bbox[0])
+        )
         return candidates
 
     def _candidate_to_defect(self, candidate: _CnrCandidate, analysis: dict) -> dict:
@@ -449,6 +815,19 @@ class Detector202_1(Detector202):
                 "mad": float(analysis["mad"]),
                 "residual_threshold": float(analysis["residual_threshold"]),
                 "background_kernel": int(analysis["background_kernel"]),
+                "background_backend": str(analysis["background_backend"]),
+                "residual_backend": str(analysis["residual_backend"]),
+                "background_precision_note": (
+                    "background_backend=opencv_cpu 時背景與 OpenCV 逐位相同；"
+                    "background_backend=cuda_f32 時 device 的加法順序與 OpenCV 不同，"
+                    "候選遮罩與 PASS/NG 判定已實測完全相同，但 mad／residual_median／"
+                    "residual_threshold／robust_noise_sigma 這四個殘差衍生診斷值會有"
+                    "尾位（約 1e-5）差異。residual_backend 則不引入任何額外差異："
+                    "cuda_f32（vf_cnr_mask_f32）的 residual_median／mad 逐位元相同、"
+                    "residual_threshold double 完全相同、候選遮罩逐位元組相同；"
+                    "cuda_resident_fused（vf_cnr_mask_u8_roi）與這條既有 GPU chain"
+                    "逐位元相同，且不再傳輸 gray/background operands。"
+                ),
                 "background_kernel_config": {
                     "configured_size": int(
                         self.params.get("background_kernel_size", 0)
@@ -516,9 +895,10 @@ class Detector202_1(Detector202):
                     self.params.get("edge_mask_enabled", True)
                 ),
                 "effective_edge_insets": self._effective_edge_insets(
-                    analysis["candidate_mask"].shape[1],
-                    analysis["candidate_mask"].shape[0],
+                    analysis["mask_shape"][1],
+                    analysis["mask_shape"][0],
                 ),
+                "component_backend": str(analysis["component_backend"]),
                 "mask_order": "automatic_cnr_mask_exclusion_components",
                 "reference_repository": self._REFERENCE_REPOSITORY,
                 "reference_commit": self._REFERENCE_COMMIT,

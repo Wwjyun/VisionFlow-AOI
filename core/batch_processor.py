@@ -5,6 +5,7 @@ import datetime
 import gc
 import os
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
@@ -65,6 +66,7 @@ class BatchInspectionProcessor(LogMixin):
         recursive: bool = False,
         progress_callback: BatchProgressCallback | None = None,
         max_workers: int | None = None,
+        gpu_session: GpuExecutionSession | None = None,
     ):
         self.input_dir = Path(input_dir)
         self.recipe_path = Path(recipe_path)
@@ -73,6 +75,8 @@ class BatchInspectionProcessor(LogMixin):
         self.recursive = recursive
         self.progress_callback = progress_callback
         self.max_workers = max_workers
+        # A GUI-owned session outlives this batch so its context, buffers and warm-up are reused.
+        self.gpu_session = gpu_session
         self._gc_interval = self._resolve_gc_interval()
         self._gc_lock = threading.Lock()
         self._gc_counter = 0
@@ -118,11 +122,21 @@ class BatchInspectionProcessor(LogMixin):
         results_by_index: dict[int, BatchImageResult] = {}
         completed = 0
         worker_count = self._worker_count(total)
-        self._progress(0, f"批量檢測執行中，使用 {worker_count} 個 worker")
-
-        with self._opencv_thread_budget(worker_count), GpuExecutionSession.from_recipe_path(
-            self.recipe_path, workload="throughput"
+        session_started = time.perf_counter()
+        with self._opencv_thread_budget(worker_count), GpuExecutionSession.scoped(
+            self.recipe_path, self.gpu_session
         ) as gpu_session:
+            # The DLL and CUDA context exist once the session is built, before any image is timed.
+            # No sample run: it would cost a full inspection to save a one-time allocation.
+            gpu_warmup = {
+                "session_ms": round((time.perf_counter() - session_started) * 1000.0, 1),
+                **gpu_session.warm_up_before_run(self.recipe_path),
+            }
+            self.logger.info("Batch GPU session ready: %s", gpu_warmup)
+            self._progress(
+                0,
+                f"{GpuExecutionSession.warm_up_notice(gpu_warmup)}批量檢測執行中，使用 {worker_count} 個 worker",
+            )
             with ThreadPoolExecutor(max_workers=worker_count) as executor:
                 futures = {
                     executor.submit(
@@ -152,11 +166,12 @@ class BatchInspectionProcessor(LogMixin):
                     completed += 1
                     self._progress(
                         int(completed / total * 100),
-                        f"Batch {completed}/{total}: finished {image_path.name}",
+                        f"批量 {completed}/{total}：已完成 {image_path.name}",
                     )
 
         results = [results_by_index[index] for index in range(total)]
         summary = self._build_summary(started_at, batch_output_dir, results)
+        summary["gpu_warmup"] = gpu_warmup
         csv_summary_path = CsvSummaryExporter.write_summary(batch_output_dir / "csv")
         if csv_summary_path is not None:
             summary["csv_summary"] = str(csv_summary_path)

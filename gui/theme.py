@@ -45,6 +45,7 @@ DEFECT_TYPE_LABELS = {
     "503_cs_sn_1_polygon_ng": "503-CS-SN-1 多邊形 NG",
     "505_as_sn_1_polygon_ng": "505-AS-SN-1 多邊形 NG",
     "506_cs_sn_1_polygon_ng": "506-CS-SN-1 多邊形 NG",
+    "999_flow_test_ng": "999-FLOW-TEST 流程驗證 NG",
     "blob": "Blob",
     "scratch": "Scratch",
     "uniformity": "Uniformity",
